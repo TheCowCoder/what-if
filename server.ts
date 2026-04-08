@@ -329,6 +329,30 @@ async function startServer() {
     followTargetId: string | null;
   }
 
+  interface BattleMapPlayerState {
+    id: string;
+    name: string;
+    locationId: string;
+    x: number;
+    y: number;
+  }
+
+  interface BattleMapNpcState {
+    id: string;
+    name: string;
+    role: string;
+    locationId: string;
+    x: number;
+    y: number;
+    followTargetId: string | null;
+  }
+
+  interface BattleMapState {
+    discoveredLocations: string[];
+    players: BattleMapPlayerState[];
+    npcs: BattleMapNpcState[];
+  }
+
   const emitExplorationPlayersUpdated = () => {
     io.to("exploration_world").emit(
       "explorationPlayersUpdated",
@@ -423,6 +447,83 @@ async function startServer() {
 
     emitExplorationNpcStatesUpdated();
     return true;
+  };
+
+  const getBattleSpawnLocations = () => {
+    const worldLocations = worldData?.locations || [];
+    const spawnLocations = (worldData?.meta?.spawnPoints || [])
+      .map((spawn: any) => worldLocations.find((loc: any) => loc.id === spawn.locationId))
+      .filter(Boolean);
+
+    if (spawnLocations.length > 0) {
+      return spawnLocations;
+    }
+
+    return worldLocations.slice(0, 4);
+  };
+
+  const expandBattleDiscoveredLocations = (locationIds: string[]) => {
+    const discovered = new Set<string>();
+
+    for (const locationId of locationIds) {
+      const location = worldData?.locations?.find((entry: any) => entry.id === locationId);
+      if (!location) continue;
+      discovered.add(location.id);
+      for (const connectionId of location.connections || []) {
+        discovered.add(connectionId);
+      }
+    }
+
+    return Array.from(discovered);
+  };
+
+  const buildArenaBattleMapState = (roomPlayers: Record<string, any>): BattleMapState => {
+    const spawnLocations = getBattleSpawnLocations();
+    const participantIds = Object.keys(roomPlayers);
+    const battlePlayers: BattleMapPlayerState[] = [];
+    const battleNpcs: BattleMapNpcState[] = [];
+
+    participantIds.forEach((participantId, index) => {
+      const participant = roomPlayers[participantId];
+      const spawnLocation = spawnLocations[index % Math.max(spawnLocations.length, 1)];
+      if (!participant || !spawnLocation) return;
+
+      if (participant.character?.isNpcAlly) {
+        battleNpcs.push({
+          id: participantId,
+          name: participant.character.name,
+          role: 'ally',
+          locationId: spawnLocation.id,
+          x: spawnLocation.x,
+          y: spawnLocation.y,
+          followTargetId: null,
+        });
+        return;
+      }
+
+      battlePlayers.push({
+        id: participantId,
+        name: participant.character?.name || 'Unknown',
+        locationId: spawnLocation.id,
+        x: spawnLocation.x,
+        y: spawnLocation.y,
+      });
+    });
+
+    return {
+      discoveredLocations: expandBattleDiscoveredLocations([
+        ...battlePlayers.map(player => player.locationId),
+        ...battleNpcs.map(npc => npc.locationId),
+      ]),
+      players: battlePlayers,
+      npcs: battleNpcs,
+    };
+  };
+
+  const emitBattleMapState = (roomId: string) => {
+    const room = rooms[roomId];
+    if (!room?.mapState) return;
+    io.to(roomId).emit("battleMapStateUpdated", room.mapState);
   };
 
   const startExplorationPvpBattle = (challengerId: string, targetId: string, ambushTargetId?: string, openingStrikeDamage?: number) => {
@@ -1237,6 +1338,33 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
       emitExplorationLockStatuses();
     });
 
+    socket.on("battleMoveToLocation", (data: { roomId?: string; locationId: string }) => {
+      const roomId = players[socket.id]?.room || data.roomId;
+      if (!roomId) return;
+
+      const room = rooms[roomId];
+      if (!room?.mapState) return;
+
+      const battlePlayer = room.mapState.players.find((player: BattleMapPlayerState) => player.id === socket.id);
+      if (!battlePlayer) return;
+
+      const currentLocation = worldData?.locations?.find((entry: any) => entry.id === battlePlayer.locationId);
+      if (!currentLocation?.connections?.includes(data.locationId)) return;
+
+      const nextLocation = worldData?.locations?.find((entry: any) => entry.id === data.locationId);
+      if (!nextLocation) return;
+
+      battlePlayer.locationId = nextLocation.id;
+      battlePlayer.x = nextLocation.x;
+      battlePlayer.y = nextLocation.y;
+      room.mapState.discoveredLocations = expandBattleDiscoveredLocations([
+        ...room.mapState.players.map((player: BattleMapPlayerState) => player.locationId),
+        ...room.mapState.npcs.map((npc: BattleMapNpcState) => npc.locationId),
+      ]);
+
+      emitBattleMapState(roomId);
+    });
+
     socket.on("syncExplorationState", (data: { explorationState?: any; character?: any }) => {
       const ep = explorationPlayers[socket.id] as any;
       if (!ep) return;
@@ -1570,6 +1698,7 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
         botDifficulty: difficulty,
         npcAllyIds: npcAllies.map((n: any) => `npc_ally_${n.id}`),
         players: roomPlayers,
+        mapState: buildArenaBattleMapState(roomPlayers),
         history: [],
       };
 
@@ -1579,6 +1708,7 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
       io.to(roomId).emit("matchFound", {
         roomId,
         players: rooms[roomId].players,
+        mapState: rooms[roomId].mapState,
         isBotMatch: true,
       });
       startRoomTimer(roomId);
@@ -1629,12 +1759,14 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
             players: roomPlayers,
             unlimitedTurnTime: queueList.some(p => p.unlimitedTurnTime),
             isBotMatch: false,
+            mapState: buildArenaBattleMapState(roomPlayers),
             history: []
           };
 
           io.to(roomId).emit("matchFound", {
             roomId,
             players: roomPlayers,
+            mapState: rooms[roomId].mapState,
             isBotMatch: false
           });
           startRoomTimer(roomId);

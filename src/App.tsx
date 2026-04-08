@@ -142,6 +142,12 @@ interface WorldNpc {
   followTargetId?: string | null;
 }
 
+interface BattleMapState {
+  discoveredLocations: string[];
+  players: WorldPlayer[];
+  npcs: WorldNpc[];
+}
+
 interface MapMarkerLayoutInput {
   id: string;
   anchorX: number;
@@ -166,6 +172,12 @@ const getLocationMarkerGlyph = (type: string) => {
   if (type === 'ruins') return '🏚️';
   if (type === 'cave') return '🕳️';
   return '·';
+};
+
+const EMPTY_BATTLE_MAP_STATE: BattleMapState = {
+  discoveredLocations: [],
+  players: [],
+  npcs: [],
 };
 
 const layoutRepelledMarkers = (
@@ -446,6 +458,14 @@ export default function App() {
     });
   }, []);
 
+  const syncBattleMapState = useCallback((nextState?: Partial<BattleMapState> | null) => {
+    setBattleMapState({
+      discoveredLocations: nextState?.discoveredLocations ?? [],
+      players: nextState?.players ?? [],
+      npcs: nextState?.npcs ?? [],
+    });
+  }, []);
+
   useEffect(() => {
     if (gameState !== 'exploration' || !character) return;
     socket.emit('syncExplorationState', {
@@ -463,6 +483,7 @@ export default function App() {
   // Battle state
   const [roomId, setRoomId] = useState<string | null>(null);
   const [players, setPlayers] = useState<Record<string, any>>({});
+  const [battleMapState, setBattleMapState] = useState<BattleMapState>(EMPTY_BATTLE_MAP_STATE);
   const [battleLogs, setBattleLogs] = useState<string[]>([]);
   const battleLogsRef = useRef<string[]>([]);
   const [battleInput, setBattleInput] = useState('');
@@ -675,6 +696,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     socket.on('matchFound', (data) => {
       setRoomId(data.roomId);
       setPlayers(data.players);
+      syncBattleMapState(data.mapState);
       setIsBotMatch(data.isBotMatch);
       setIsExplorationProcessing(false);
       setExplorationLockStatus([]);
@@ -690,6 +712,10 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       if (data.isBotMatch) {
         generateBotAction(data);
       }
+    });
+
+    socket.on('battleMapStateUpdated', (data: Partial<BattleMapState>) => {
+      syncBattleMapState(data);
     });
 
     socket.on('battleActionsSubmitted', (data: { log: string }) => {
@@ -1014,6 +1040,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       setOpponentTyping(false);
       setTurnTimerRemaining(null);
       setRoomId(null);
+      syncBattleMapState(null);
       setBattleInput('');
       setGameState('post_match');
     });
@@ -1367,6 +1394,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       socket.off('characterSaved');
       socket.off('waitingForOpponent');
       socket.off('matchFound');
+      socket.off('battleMapStateUpdated');
       socket.off('battleActionsSubmitted');
       socket.off('opponentTyping');
       socket.off('playerLockedIn');
@@ -1713,6 +1741,30 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       // Instant movement — just update log with a system message, no LLM call
       setExplorationLog(prev => [...prev, { role: 'system', text: `🗺️ Moved to **${location.name}**` }]);
     }
+  };
+
+  const handleBattleMapMove = (locationId: string) => {
+    if (!roomId) return;
+
+    const location = worldData?.locations?.find((entry: WorldLocation) => entry.id === locationId);
+    if (!location) return;
+
+    syncBattleMapState({
+      discoveredLocations: Array.from(new Set([
+        ...battleMapState.discoveredLocations,
+        location.id,
+        ...(location.connections || []),
+      ])),
+      players: battleMapState.players.map(player => player.id === socket.id ? {
+        ...player,
+        locationId: location.id,
+        x: location.x,
+        y: location.y,
+      } : player),
+      npcs: battleMapState.npcs,
+    });
+    setBattleLogs(prev => appendBattleLogIfMissing(prev, `🗺️ **You reposition to ${location.name}.**`));
+    socket.emit('battleMoveToLocation', { roomId, locationId });
   };
 
   // Exploration actions are now handled server-side via socket events
@@ -2757,7 +2809,15 @@ Be creative and concise.`;
 
   const renderMinimap = () => {
     if (!worldData) return null;
-    const currentLoc = getCurrentLocation();
+    const isBattleMap = gameState === 'battle' && (
+      battleMapState.discoveredLocations.length > 0 ||
+      battleMapState.players.length > 0 ||
+      battleMapState.npcs.length > 0
+    );
+    const activeLocationId = isBattleMap
+      ? battleMapState.players.find(player => player.id === socket.id)?.locationId ?? explorationState.locationId
+      : explorationState.locationId;
+    const currentLoc = worldData.locations.find((loc: WorldLocation) => loc.id === activeLocationId) ?? getCurrentLocation();
     const gridSize = worldData.meta.gridSize;
     const mapW = 140;
     const mapH = 140;
@@ -2773,9 +2833,13 @@ Be creative and concise.`;
     const miniOffsetX = mapW / 2 - playerPixelX;
     const miniOffsetY = mapH / 2 - playerPixelY;
 
-    const discoveredLocations = worldData.locations.filter((loc: WorldLocation) => explorationState.discoveredLocations.includes(loc.id));
-    const visibleNpcs = worldNpcs.filter(npc => explorationState.discoveredLocations.includes(npc.locationId) || npc.followTargetId === socket.id);
-    const visiblePlayers = worldPlayers.filter(p => p.id !== socket.id);
+    const discoveredLocationIds = isBattleMap ? battleMapState.discoveredLocations : explorationState.discoveredLocations;
+    const connectedLocationIds = new Set(currentLoc?.connections || []);
+    const discoveredLocations = worldData.locations.filter((loc: WorldLocation) => discoveredLocationIds.includes(loc.id));
+    const visibleNpcs = (isBattleMap ? battleMapState.npcs : worldNpcs)
+      .filter(npc => discoveredLocationIds.includes(npc.locationId) || npc.followTargetId === socket.id);
+    const visiblePlayers = (isBattleMap ? battleMapState.players : worldPlayers)
+      .filter(player => player.id !== socket.id);
 
     const miniMarkerLayouts = layoutRepelledMarkers([
       ...discoveredLocations.map((loc: WorldLocation) => ({
@@ -2856,7 +2920,7 @@ Be creative and concise.`;
             className="bg-blue-900/80 rounded-xl border-2 border-duo-gray overflow-hidden relative cursor-pointer"
             style={{ width: mapW, height: mapH }}
             onClick={() => {
-              const cl = getCurrentLocation();
+              const cl = currentLoc;
               if (cl && worldData?.meta?.gridSize) {
                 const gs = worldData.meta.gridSize;
                 const containerW = window.innerWidth - 32;
@@ -2883,7 +2947,7 @@ Be creative and concise.`;
               const anchorX = loc.x * miniScaleX;
               const anchorY = loc.y * miniScaleY;
               const layout = miniMarkerLayouts[`mini-loc-${loc.id}`] || { x: anchorX, y: anchorY };
-              const isCurrent = loc.id === explorationState.locationId;
+              const isCurrent = loc.id === activeLocationId;
               return (
                 <React.Fragment key={loc.id}>
                   {renderMarkerConnector(anchorX, anchorY, layout.x, layout.y, isCurrent ? 'rgba(34, 197, 94, 0.75)' : 'rgba(255, 255, 255, 0.45)')}
@@ -2997,7 +3061,7 @@ Be creative and concise.`;
                 <button onClick={() => setMapZoom(z => Math.min(5, z + 0.3))} className="bg-white/90 rounded-full w-7 h-7 text-sm font-black text-blue-900 shadow">+</button>
                 <button onClick={() => setMapZoom(z => Math.max(0.5, z - 0.3))} className="bg-white/90 rounded-full w-7 h-7 text-sm font-black text-blue-900 shadow">−</button>
                 <button onClick={() => {
-                  const cl = getCurrentLocation();
+                  const cl = currentLoc;
                   if (cl && gridSize) {
                     const containerW = window.innerWidth - 32;
                     const containerH = window.innerHeight - 32;
@@ -3028,8 +3092,8 @@ Be creative and concise.`;
                   const anchorX = loc.x * fullScaleX;
                   const anchorY = loc.y * fullScaleY;
                   const layout = fullMarkerLayouts[`full-loc-${loc.id}`] || { x: anchorX, y: anchorY };
-                  const isCurrent = loc.id === explorationState.locationId;
-                  const isConnected = getConnectedLocations().find(c => c.id === loc.id);
+                  const isCurrent = loc.id === activeLocationId;
+                  const isConnected = connectedLocationIds.has(loc.id);
                   return (
                     <React.Fragment key={loc.id}>
                       {renderMarkerConnector(anchorX, anchorY, layout.x, layout.y, isCurrent ? 'rgba(34, 197, 94, 0.8)' : 'rgba(255, 255, 255, 0.4)', 1.5)}
@@ -3042,7 +3106,11 @@ Be creative and concise.`;
                           style={{ width: isCurrent ? 12 : 8, height: isCurrent ? 12 : 8 }}
                           onClick={() => {
                             if (!isCurrent && isConnected) {
-                              handleExplorationMove(loc.id);
+                              if (isBattleMap) {
+                                handleBattleMapMove(loc.id);
+                              } else {
+                                handleExplorationMove(loc.id);
+                              }
                               setShowFullMap(false);
                             }
                           }}
@@ -3714,11 +3782,11 @@ Be creative and concise.`;
                       </div>
                       <button
                         onClick={() => setSettings({ ...settings, unlimitedTurnTime: !settings.unlimitedTurnTime })}
-                        className={`relative h-7 w-14 rounded-full transition-colors ${settings.unlimitedTurnTime ? 'bg-duo-green' : 'bg-duo-gray-dark/30'}`}
+                        className={`relative inline-flex h-8 w-14 items-center rounded-full p-1 transition-colors ${settings.unlimitedTurnTime ? 'bg-duo-green' : 'bg-duo-gray-dark/30'}`}
                         aria-pressed={settings.unlimitedTurnTime}
                       >
                         <span
-                          className={`absolute top-1 h-5 w-5 rounded-full bg-white shadow transition-transform ${settings.unlimitedTurnTime ? 'translate-x-8' : 'translate-x-1'}`}
+                          className={`block h-6 w-6 rounded-full bg-white shadow transition-transform ${settings.unlimitedTurnTime ? 'translate-x-6' : 'translate-x-0'}`}
                         />
                       </button>
                     </div>
