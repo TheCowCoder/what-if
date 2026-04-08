@@ -70,6 +70,7 @@ const DEFAULT_STARTING_GOLD = 25;
 const BATTLE_STREAM_THOUGHTS_PREFIX = 'STREAMING_THOUGHTS_';
 const BATTLE_STREAM_ANSWER_PREFIX = 'STREAMING_ANSWER_';
 const BATTLE_PLAYER_ACTIONS_PREFIX = 'PLAYER_ACTIONS_';
+const BATTLE_PENDING_ACTION_PREFIX = 'PENDING_PLAYER_ACTION_';
 
 const normalizeCharacter = (value: any): Character => ({
   ...value,
@@ -93,6 +94,15 @@ const buildBattleActionsLog = (roomPlayers: Record<string, any>): string => (
 const appendBattleLogIfMissing = (logs: string[], entry: string): string[] => (
   logs.includes(entry) ? logs : [...logs, entry]
 );
+
+const buildPendingBattleActionLog = (playerId: string, action: string): string => (
+  `${BATTLE_PENDING_ACTION_PREFIX}${playerId}::${action}`
+);
+
+const removePendingBattleActionLogs = (logs: string[], playerId?: string): string[] => {
+  const prefix = playerId ? `${BATTLE_PENDING_ACTION_PREFIX}${playerId}::` : BATTLE_PENDING_ACTION_PREFIX;
+  return logs.filter(log => !log.startsWith(prefix));
+};
 
 const ensureBattleStreamLog = (logs: string[], prefix: string): string[] => {
   const firstIndex = logs.findIndex(log => log.startsWith(prefix));
@@ -597,7 +607,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     });
 
     socket.on('battleActionsSubmitted', (data: { log: string }) => {
-      setBattleLogs(prev => appendBattleLogIfMissing(prev, data.log));
+      setBattleLogs(prev => appendBattleLogIfMissing(removePendingBattleActionLogs(prev), data.log));
     });
 
     socket.on('opponentTyping', (id) => {
@@ -619,6 +629,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         ...prev,
         [id]: { ...prev[id], lockedIn: false }
       }));
+      setBattleLogs(prev => removePendingBattleActionLogs(prev, id));
       if (id === socket.id) {
         setIsLockedIn(false);
       }
@@ -873,7 +884,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     socket.on('turnResolved', (data) => {
       setHasVisualizedThisTurn(false);
       setBattleLogs(prev => {
-        const filtered = removeBattleStreamPlaceholders(prev);
+        const filtered = removePendingBattleActionLogs(removeBattleStreamPlaceholders(prev));
         const thoughts = data.thoughts || "";
         return [...filtered, `> **Judge's Thoughts:**\n> ${thoughts.replace(/\n/g, '\n> ')}`, data.log];
       });
@@ -902,6 +913,23 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       if (isFirstPlayer) {
         setTimeout(() => handleGenerateBattleImageRef.current?.(), 500);
       }
+    });
+
+    socket.on('battleEndedByInactivity', (data: { log: string }) => {
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+        abortControllerRef.current = null;
+      }
+
+      setBattleLogs(prev => [...removePendingBattleActionLogs(removeBattleStreamPlaceholders(prev)), data.log]);
+      setBattleError(null);
+      setRetryAttempt(0);
+      setIsLockedIn(false);
+      setOpponentTyping(false);
+      setTurnTimerRemaining(null);
+      setRoomId(null);
+      setBattleInput('');
+      setGameState('post_match');
     });
 
     socket.on('streamTurnResolutionStart', () => {
@@ -1251,6 +1279,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       socket.off('playerLockedIn');
       socket.off('requestTurnResolution');
       socket.off('turnResolved');
+      socket.off('battleEndedByInactivity');
       socket.off('opponentDisconnected');
       socket.off('battleImageShared');
       socket.off('turnTimerTick');
@@ -1770,7 +1799,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       const aiClient = getAIClient();
       // Get the last few battle log entries for scene context
       const recentLogs = battleLogs
-        .filter(l => !l.startsWith('STREAMING_') && !l.startsWith('>') && !l.startsWith('PLAYER_ACTIONS_'))
+        .filter(l => !l.startsWith('STREAMING_') && !l.startsWith('>') && !l.startsWith('PLAYER_ACTIONS_') && !l.startsWith(BATTLE_PENDING_ACTION_PREFIX))
         .slice(-3)
         .join('\n')
         .substring(0, 500);
@@ -1840,8 +1869,15 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
   };
 
   const handleSendBattleAction = () => {
-    if (!battleInput.trim() || isLockedIn) return;
-    socket.emit('playerAction', battleInput);
+    const action = battleInput.trim();
+    if (!action || isLockedIn) return;
+
+    const socketId = socket.id;
+    if (socketId) {
+      setBattleLogs(prev => [...removePendingBattleActionLogs(prev, socketId), buildPendingBattleActionLog(socketId, action)]);
+    }
+
+    socket.emit('playerAction', action);
     setIsLockedIn(true);
     setBattleInput('');
     if (battleInputRef.current) battleInputRef.current.style.height = 'auto';
@@ -2387,12 +2423,14 @@ Be creative and concise.`;
             
             // Check if it's a Player Actions bubble
             const isPlayerActions = log.startsWith(BATTLE_PLAYER_ACTIONS_PREFIX);
+            const isPendingPlayerAction = log.startsWith(BATTLE_PENDING_ACTION_PREFIX);
             const isNpcAllyAction = log.startsWith('NPC_ALLY_ACTION_');
             
             let content = log;
             if (isStatusLog && !isImageUrl) content = log.replace(/^STATUS_[^:]+::/, '');
             if (isImageUrl) content = log.substring('STATUS_IMAGE_URL::'.length);
             if (isPlayerActions) content = log.substring(BATTLE_PLAYER_ACTIONS_PREFIX.length);
+            if (isPendingPlayerAction) content = log.substring(log.indexOf('::') + 2);
             if (isNpcAllyAction) content = log.substring('NPC_ALLY_ACTION_'.length);
             if (isStreamingThoughts) content = log.substring(BATTLE_STREAM_THOUGHTS_PREFIX.length);
             if (isStreamingAnswer) content = log.substring(BATTLE_STREAM_ANSWER_PREFIX.length);
@@ -2465,6 +2503,26 @@ Be creative and concise.`;
             }
 
             if (!content.trim() && (isStreamingAnswer || isStreamingThoughts)) return null;
+
+            if (isPendingPlayerAction) {
+              return (
+                <div key={i} className="flex justify-end">
+                  <div className="flex items-start gap-2 max-w-[80%] flex-row-reverse">
+                    <div className="w-7 h-7 rounded-full bg-duo-green flex items-center justify-center text-white text-[10px] font-black flex-shrink-0 overflow-hidden">
+                      {character?.imageUrl ? <img src={character.imageUrl} className="w-full h-full object-cover" /> : character?.name?.charAt(0).toUpperCase() || '?'}
+                    </div>
+                    <div>
+                      <span className="text-[10px] font-bold text-duo-gray-dark block text-right">Queued Action</span>
+                      <div className="chat-bubble-me">
+                        <div className="markdown-body text-sm">
+                          <Markdown rehypePlugins={[rehypeRaw]}>{content}</Markdown>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              );
+            }
 
             if (isPlayerActions) {
               // Parse individual player actions and render as chat bubbles
@@ -2878,6 +2936,10 @@ Be creative and concise.`;
   const renderExploration = () => {
     const currentLoc = getCurrentLocation();
     const connected = getConnectedLocations();
+    const activeExplorationStreamText = activeExplorationStreamIdRef.current
+      ? explorationLog.find(msg => msg.streamId === activeExplorationStreamIdRef.current)?.text || ''
+      : '';
+    const showExplorationThinking = isExplorationProcessing && !activeExplorationStreamText.trim();
 
     return (
       <div className="flex-1 flex flex-col bg-gray-50 overflow-hidden">
@@ -3031,7 +3093,7 @@ Be creative and concise.`;
             </div>
             );
           })}
-          {isExplorationProcessing && (
+          {showExplorationThinking && (
             <div className="flex justify-start">
               <div className="chat-bubble-them flex items-center gap-2">
                 <Loader2 className="w-4 h-4 animate-spin" />

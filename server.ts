@@ -250,6 +250,21 @@ async function startServer() {
     io.to(roomId).emit("battleActionsSubmitted", { log: `PLAYER_ACTIONS_${log}` });
   }
 
+  function endBattleDueToInactivity(roomId: string, room: { players: Record<string, any> }) {
+    clearRoomTimer(roomId);
+    io.to(roomId).emit("battleEndedByInactivity", {
+      log: "**BATTLE ENDED.** Both fighters missed the turn, so the duel is called off.",
+    });
+
+    for (const pid of Object.keys(room.players)) {
+      if (players[pid]) {
+        delete players[pid].room;
+      }
+    }
+
+    delete rooms[roomId];
+  }
+
   function autoLockIdlePlayers(roomId: string) {
     const room = rooms[roomId];
     if (!room) return;
@@ -260,6 +275,7 @@ async function startServer() {
     for (const pid of playerIds) {
       if (!room.players[pid].lockedIn) {
         room.players[pid].lockedIn = true;
+        room.players[pid].autoLockedThisTurn = true;
         room.players[pid].action = `${room.players[pid].character.name} hesitates and takes a defensive stance, bracing for impact.`;
         io.to(roomId).emit("playerLockedIn", pid);
         io.to(roomId).emit("turnTimerAutoLocked", { playerId: pid, playerName: room.players[pid].character.name });
@@ -271,6 +287,11 @@ async function startServer() {
       const allLockedIn = playerIds.every((id) => room.players[id].lockedIn);
       if (allLockedIn) {
         emitBattleActionsSubmitted(roomId, room);
+        const everyoneMissedTurn = playerIds.every((id) => room.players[id].autoLockedThisTurn);
+        if (everyoneMissedTurn) {
+          endBattleDueToInactivity(roomId, room);
+          return;
+        }
         io.to(room.host).emit("requestTurnResolution", room);
       }
     }
@@ -1635,6 +1656,7 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
 
       const botId = `bot_${socket.id}`;
       room.players[botId].lockedIn = true;
+      room.players[botId].autoLockedThisTurn = false;
       room.players[botId].action = data.action;
       io.to(roomId).emit("playerLockedIn", botId);
 
@@ -1644,6 +1666,7 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
         if (room.players[npcId] && !room.players[npcId].lockedIn) {
           const npcChar = room.players[npcId].character;
           room.players[npcId].lockedIn = true;
+          room.players[npcId].autoLockedThisTurn = false;
           room.players[npcId].action = data.npcActions?.[npcId] || `${npcChar.name} attacks the enemy with their signature ability.`;
           io.to(roomId).emit("playerLockedIn", npcId);
           io.to(roomId).emit("npcAllyAction", { npcId, npcName: npcChar.name, action: room.players[npcId].action });
@@ -1667,6 +1690,7 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
       if (!room) return;
 
       room.players[socket.id].lockedIn = true;
+  room.players[socket.id].autoLockedThisTurn = false;
       room.players[socket.id].action = actionText;
       io.to(roomId).emit("playerLockedIn", socket.id);
 
@@ -1688,6 +1712,7 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
       if (!room) return;
 
       room.players[socket.id].lockedIn = false;
+  room.players[socket.id].autoLockedThisTurn = false;
       io.to(roomId).emit("playerUnlocked", socket.id);
       startRoomTimer(roomId);
     });
@@ -1731,6 +1756,7 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
       // Reset locks
       for (const pid of Object.keys(room.players)) {
         room.players[pid].lockedIn = false;
+        room.players[pid].autoLockedThisTurn = false;
         room.players[pid].action = "";
       }
 
