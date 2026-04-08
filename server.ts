@@ -644,8 +644,8 @@ async function startServer() {
     }) || null;
   };
 
-  const emitExplorationResult = (socketId: string, requestId: string, text: string, toolCalls: any[] = []) => {
-    io.to(socketId).emit("explorationActionResult", { requestId, text, toolCalls });
+  const emitExplorationResult = (socketId: string, requestId: string, text: string, toolCalls: any[] = [], thoughts = "") => {
+    io.to(socketId).emit("explorationActionResult", { requestId, text, thoughts, toolCalls });
   };
 
   const findPendingOfferForTarget = (targetId: string, fromName?: string) => {
@@ -966,7 +966,37 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
 
       try {
         let fullText = "";
+        let fullThoughts = "";
         let toolCalls: any[] = [];
+
+        const appendExplorationPart = (part: any) => {
+          if (part.functionCall) {
+            toolCalls.push(part.functionCall);
+            return;
+          }
+
+          const text = typeof part.thought === 'string' ? part.thought : (part.text || "");
+          if (!text) {
+            return;
+          }
+
+          if (part.thought) {
+            fullThoughts += text;
+          } else {
+            fullText += text;
+          }
+        };
+
+        const emitExplorationStreamState = () => {
+          for (const pc of playerContexts) {
+            if (fullThoughts.trim()) {
+              io.to(pc.socketId).emit("explorationStreamChunk", { requestId, type: "thought", text: fullThoughts.trim() });
+            }
+            if (fullText.trim()) {
+              io.to(pc.socketId).emit("explorationStreamChunk", { requestId, type: "answer", text: fullText.trim() });
+            }
+          }
+        };
 
         try {
           const response = await aiClient.models.generateContentStream(apiConfig);
@@ -974,47 +1004,31 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
             if (abortSignal?.aborted) throw new Error("Aborted");
             const parts = chunk.candidates?.[0]?.content?.parts || [];
             for (const part of parts) {
-              if (part.functionCall) {
-                toolCalls.push(part.functionCall);
-              } else if (!(part as any).thought) {
-                fullText += (part as any).text || "";
-              }
+              appendExplorationPart(part as any);
             }
-            // Stream text chunks to all players
-            if (fullText.trim()) {
-              for (const pc of playerContexts) {
-                io.to(pc.socketId).emit("explorationStreamChunk", { requestId, text: fullText.trim() });
-              }
-            }
+            emitExplorationStreamState();
           }
         } catch (streamError: any) {
           if (abortSignal?.aborted) throw new Error("Aborted");
           // Fallback to non-streaming
           console.warn("Streaming failed, falling back to non-streaming:", streamError.message);
           fullText = "";
+          fullThoughts = "";
           toolCalls = [];
           const fallbackRes = await aiClient.models.generateContent(apiConfig);
           const parts = fallbackRes.candidates?.[0]?.content?.parts || [];
           for (const part of parts) {
-            if (part.functionCall) {
-              toolCalls.push(part.functionCall);
-            } else if (!(part as any).thought) {
-              fullText += (part as any).text || "";
-            }
+            appendExplorationPart(part as any);
           }
         }
 
         // Retry once if empty response
-        if (!fullText.trim() && toolCalls.length === 0) {
+        if (!fullText.trim() && !fullThoughts.trim() && toolCalls.length === 0) {
           console.warn("Empty response, retrying non-streaming...");
           const retryRes = await aiClient.models.generateContent(apiConfig);
           const retryParts = retryRes.candidates?.[0]?.content?.parts || [];
           for (const part of retryParts) {
-            if (part.functionCall) {
-              toolCalls.push(part.functionCall);
-            } else if (!(part as any).thought) {
-              fullText += (part as any).text || "";
-            }
+            appendExplorationPart(part as any);
           }
         }
 
@@ -1098,6 +1112,7 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
           io.to(pc.socketId).emit("explorationActionResult", {
             requestId,
             text: fullText.trim(),
+            thoughts: fullThoughts.trim(),
             toolCalls: processedToolCalls,
           });
         }

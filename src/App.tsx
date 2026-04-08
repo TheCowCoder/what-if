@@ -36,6 +36,7 @@ interface Message {
   imageUrl?: string;
   playerName?: string;
   streamId?: string;
+  kind?: 'thought' | 'answer';
 }
 
 interface WorldLocation {
@@ -231,21 +232,21 @@ export default function App() {
     return createAIClient(process.env.API_KEY || process.env.GEMINI_API_KEY);
   };
 
-  const upsertExplorationStreamMessage = useCallback((streamId: string, text: string) => {
+  const upsertExplorationStreamMessage = useCallback((streamId: string, text: string, kind: 'thought' | 'answer') => {
     setExplorationLog(prev => {
       const next = [...prev];
       for (let i = next.length - 1; i >= 0; i--) {
-        if (next[i].streamId === streamId) {
-          next[i] = { ...next[i], role: 'model', text, streamId };
+        if (next[i].streamId === streamId && next[i].kind === kind) {
+          next[i] = { ...next[i], role: 'model', text, streamId, kind };
           return next;
         }
       }
-      return [...prev, { role: 'model', text, streamId }];
+      return [...prev, { role: 'model', text, streamId, kind }];
     });
   }, []);
 
-  const clearExplorationStreamMessage = useCallback((streamId: string) => {
-    setExplorationLog(prev => prev.filter(message => message.streamId !== streamId));
+  const clearExplorationStreamMessage = useCallback((streamId: string, kind?: 'thought' | 'answer') => {
+    setExplorationLog(prev => prev.filter(message => message.streamId !== streamId || (kind ? message.kind !== kind : false)));
   }, []);
 
   const upsertChatStatusMessage = useCallback((statusId: string, text: string) => {
@@ -384,6 +385,7 @@ export default function App() {
   const [battleError, setBattleError] = useState<string | null>(null);
   const [retryAttempt, setRetryAttempt] = useState(0);
   const [expandedThoughts, setExpandedThoughts] = useState<Set<number>>(new Set());
+  const [expandedExplorationThoughts, setExpandedExplorationThoughts] = useState<Set<string>>(new Set());
   const abortControllerRef = useRef<AbortController | null>(null);
   const [isLockedIn, setIsLockedIn] = useState(false);
   const [opponentTyping, setOpponentTyping] = useState(false);
@@ -1067,16 +1069,16 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     // Server-side AI streaming events
     socket.on('explorationStreamStart', (data: { requestId: string }) => {
       activeExplorationStreamIdRef.current = data.requestId;
-      upsertExplorationStreamMessage(data.requestId, '');
+      upsertExplorationStreamMessage(data.requestId, '', 'thought');
     });
 
-    socket.on('explorationStreamChunk', (data: { requestId: string; text: string }) => {
+    socket.on('explorationStreamChunk', (data: { requestId: string; type: 'thought' | 'answer'; text: string }) => {
       if (activeExplorationStreamIdRef.current && activeExplorationStreamIdRef.current !== data.requestId) return;
       if (!data.text) return;
-      upsertExplorationStreamMessage(data.requestId, data.text);
+      upsertExplorationStreamMessage(data.requestId, data.text, data.type);
     });
 
-    socket.on('explorationActionResult', (data: { requestId: string; text: string; toolCalls: any[] }) => {
+    socket.on('explorationActionResult', (data: { requestId: string; text: string; thoughts?: string; toolCalls: any[] }) => {
       if (activeExplorationStreamIdRef.current && activeExplorationStreamIdRef.current !== data.requestId) return;
       activeExplorationStreamIdRef.current = null;
       console.log('[SERVER AI] Result received, text length:', data.text?.length, 'tools:', data.toolCalls?.length);
@@ -1087,10 +1089,16 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       clearExplorationStatusMessage('exploration-retry');
       socket.emit('explorationActing', { acting: false });
 
-      if (data.text) {
-        upsertExplorationStreamMessage(data.requestId, data.text);
+      if (data.thoughts?.trim()) {
+        upsertExplorationStreamMessage(data.requestId, data.thoughts, 'thought');
       } else {
-        clearExplorationStreamMessage(data.requestId);
+        clearExplorationStreamMessage(data.requestId, 'thought');
+      }
+
+      if (data.text) {
+        upsertExplorationStreamMessage(data.requestId, data.text, 'answer');
+      } else {
+        clearExplorationStreamMessage(data.requestId, 'answer');
       }
 
       // Process tool calls locally
@@ -1233,7 +1241,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       setExplorationRetryAttempt(data.attempt);
       setExplorationError(`${data.label}. Retrying in ${data.delay}s...`);
       upsertExplorationStatusMessage('exploration-retry', `⚠️ ${data.label}. Retrying in **${data.delay}s**. Attempt **#${data.attempt}**...`);
-      upsertExplorationStreamMessage(data.requestId, '');
+      upsertExplorationStreamMessage(data.requestId, '', 'thought');
     });
 
     socket.on('explorationActionError', (data: { requestId: string; message: string }) => {
@@ -2413,7 +2421,10 @@ Be creative and concise.`;
     return (
       <div className="flex-1 flex flex-col bg-gray-50 overflow-hidden">
         <div className="flex-1 overflow-y-auto p-4 space-y-4">
-          <h1 className="text-2xl font-black text-duo-text mb-2">{explorationCombatReturn && getCurrentLocation()?.name ? `⚔️ ${getCurrentLocation()?.name}` : 'The Battle'}</h1>
+          <div className="flex items-start justify-between gap-3 mb-2">
+            <h1 className="text-2xl font-black text-duo-text">{explorationCombatReturn && getCurrentLocation()?.name ? `⚔️ ${getCurrentLocation()?.name}` : 'The Battle'}</h1>
+            {renderMinimap()}
+          </div>
           {battleLogs.map((log, i) => {
             const isStreamingThoughts = log.startsWith(BATTLE_STREAM_THOUGHTS_PREFIX);
             const isStreamingAnswer = log.startsWith(BATTLE_STREAM_ANSWER_PREFIX);
@@ -2506,14 +2517,14 @@ Be creative and concise.`;
 
             if (isPendingPlayerAction) {
               return (
-                <div key={i} className="flex justify-end">
-                  <div className="flex items-start gap-2 max-w-[80%] flex-row-reverse">
+                <div key={i} className="flex justify-end w-full">
+                  <div className="flex items-start gap-2 w-full max-w-full flex-row-reverse">
                     <div className="w-7 h-7 rounded-full bg-duo-green flex items-center justify-center text-white text-[10px] font-black flex-shrink-0 overflow-hidden">
                       {character?.imageUrl ? <img src={character.imageUrl} className="w-full h-full object-cover" /> : character?.name?.charAt(0).toUpperCase() || '?'}
                     </div>
-                    <div>
+                    <div className="w-full">
                       <span className="text-[10px] font-bold text-duo-gray-dark block text-right">Queued Action</span>
-                      <div className="chat-bubble-me">
+                      <div className="chat-bubble-me w-full">
                         <div className="markdown-body text-sm">
                           <Markdown rehypePlugins={[rehypeRaw]}>{content}</Markdown>
                         </div>
@@ -2936,10 +2947,8 @@ Be creative and concise.`;
   const renderExploration = () => {
     const currentLoc = getCurrentLocation();
     const connected = getConnectedLocations();
-    const activeExplorationStreamText = activeExplorationStreamIdRef.current
-      ? explorationLog.find(msg => msg.streamId === activeExplorationStreamIdRef.current)?.text || ''
-      : '';
-    const showExplorationThinking = isExplorationProcessing && !activeExplorationStreamText.trim();
+    const activeExplorationThoughtId = activeExplorationStreamIdRef.current;
+    const explorationEntries = explorationLog.filter(msg => msg.text.trim() !== '' || (msg.kind === 'thought' && msg.streamId === activeExplorationThoughtId));
 
     return (
       <div className="flex-1 flex flex-col bg-gray-50 overflow-hidden">
@@ -3042,12 +3051,36 @@ Be creative and concise.`;
 
         {/* Exploration log */}
         <div className="flex-1 overflow-y-auto p-3 space-y-3">
-          {explorationLog.filter(msg => msg.text.trim() !== '').map((msg, i) => {
+          {explorationEntries.map((msg, i) => {
             const isOtherPlayer = msg.role === 'user' && msg.playerName;
             const isMe = msg.role === 'user' && !msg.playerName;
+            const isThought = msg.kind === 'thought';
+            const thoughtId = msg.streamId || `explore-thought-${i}`;
+            const isStreamingThought = isThought && msg.streamId === activeExplorationThoughtId && isExplorationProcessing;
             return (
             <div key={i} className={`flex ${isMe ? 'justify-end' : 'justify-start'}`}>
-              {msg.role === 'system' ? (
+              {isThought ? (
+                <div className="duo-card p-3 bg-duo-gray/20 border-dashed text-xs text-duo-text w-full">
+                  <div
+                    className="flex items-center gap-2 cursor-pointer select-none"
+                    onClick={() => {
+                      const next = new Set(expandedExplorationThoughts);
+                      if (next.has(thoughtId)) next.delete(thoughtId);
+                      else next.add(thoughtId);
+                      setExpandedExplorationThoughts(next);
+                    }}
+                  >
+                    <Loader2 className={`w-3 h-3 flex-shrink-0 ${isStreamingThought ? 'animate-spin' : ''}`} />
+                    <span className="font-bold text-duo-gray-dark flex-1">{getThoughtTitle(msg.text)}</span>
+                    <ChevronDown className={`w-3 h-3 transition-transform ${expandedExplorationThoughts.has(thoughtId) ? 'rotate-180' : ''}`} />
+                  </div>
+                  {expandedExplorationThoughts.has(thoughtId) && msg.text.trim() && (
+                    <div className="markdown-body mt-2 pt-2 border-t border-duo-gray/30">
+                      <Markdown rehypePlugins={[rehypeRaw]}>{msg.text}</Markdown>
+                    </div>
+                  )}
+                </div>
+              ) : msg.role === 'system' ? (
                 <div className="w-full">
                   <div className="text-center text-sm font-bold text-duo-blue bg-duo-blue/5 border border-duo-blue/10 rounded-lg py-2 px-4 my-1 markdown-body">
                     <Markdown rehypePlugins={[rehypeRaw]}>{msg.text}</Markdown>
@@ -3093,14 +3126,6 @@ Be creative and concise.`;
             </div>
             );
           })}
-          {showExplorationThinking && (
-            <div className="flex justify-start">
-              <div className="chat-bubble-them flex items-center gap-2">
-                <Loader2 className="w-4 h-4 animate-spin" />
-                <span className="font-bold text-sm">Thinking...</span>
-              </div>
-            </div>
-          )}
           <div ref={explorationEndRef} />
         </div>
 
@@ -3294,18 +3319,20 @@ Be creative and concise.`;
       </div>
 
       <div className="flex flex-col gap-4 w-full max-w-xs">
-        <button 
-          onClick={() => {
-            // Reset character stats
-            if (character) {
-              setCharacter({ ...character, hp: 100, mana: 100 });
-            }
-            handleEnterArena();
-          }}
-          className="duo-btn duo-btn-green w-full py-4 text-lg"
-        >
-          New Opponent
-        </button>
+        {!explorationCombatReturn && (
+          <button 
+            onClick={() => {
+              // Reset character stats
+              if (character) {
+                setCharacter({ ...character, hp: 100, mana: 100 });
+              }
+              handleEnterArena();
+            }}
+            className="duo-btn duo-btn-green w-full py-4 text-lg"
+          >
+            New Opponent
+          </button>
+        )}
         
         <button 
           onClick={() => {
