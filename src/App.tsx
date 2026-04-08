@@ -194,6 +194,7 @@ interface ArenaPreparationState {
   stage: 'preview' | 'tweak';
   remaining: number;
   isBotMatch: boolean;
+  skipVotes: string[];
 }
 
 interface MapMarkerLayoutInput {
@@ -906,6 +907,16 @@ export default function App() {
   }, [arenaPreparation]);
 
   useEffect(() => {
+    const lockedInIds = Object.entries(players)
+      .filter(([, player]) => !!player?.lockedIn)
+      .map(([id]) => id);
+
+    if (lockedInIds.length === 0) return;
+
+    setLocalRoomTypingIds(prev => prev.filter(id => !lockedInIds.includes(id)));
+  }, [players]);
+
+  useEffect(() => {
     if (arenaPreparation?.stage !== 'tweak' || !arenaPreparation.isBotMatch || !roomId) return;
 
     const botId = Object.keys(players).find(id => id.startsWith('bot_'));
@@ -918,6 +929,7 @@ export default function App() {
     setLocalRoomTypingIds(prev => prev.includes(botId) ? prev : [...prev, botId]);
 
     let cancelled = false;
+    let rewriteSubmitted = false;
 
     const rewriteBotProfile = async () => {
       try {
@@ -936,14 +948,20 @@ export default function App() {
 
         const rewrittenProfile = response.text?.trim();
         if (!cancelled && rewrittenProfile) {
+          rewriteSubmitted = true;
           socket.emit('updateBotPreparationProfile', { roomId, botId, profileMarkdown: rewrittenProfile });
         }
       } catch (error) {
         console.error('Failed to rewrite bot preparation profile', error);
-      } finally {
-        if (!cancelled) {
-          setLocalRoomTypingIds(prev => prev.filter(id => id !== botId));
-        }
+      }
+
+      if (!cancelled && !rewriteSubmitted) {
+        rewriteSubmitted = true;
+        socket.emit('updateBotPreparationProfile', {
+          roomId,
+          botId,
+          profileMarkdown: botPlayer.character.profileMarkdown,
+        });
       }
     };
 
@@ -1072,7 +1090,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       setGameState('matchmaking');
     });
 
-    socket.on('arenaPreparationState', (data: { roomId: string; players: Record<string, any>; isBotMatch: boolean; stage: 'preview' | 'tweak'; remaining: number }) => {
+    socket.on('arenaPreparationState', (data: { roomId: string; players: Record<string, any>; isBotMatch: boolean; stage: 'preview' | 'tweak'; remaining: number; skipVotes?: string[] }) => {
       setRoomId(data.roomId);
       setPlayers(data.players);
       setIsBotMatch(data.isBotMatch);
@@ -1080,6 +1098,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         stage: data.stage,
         remaining: data.remaining,
         isBotMatch: data.isBotMatch,
+        skipVotes: data.skipVotes || [],
       });
       setBattleLogs([]);
       setBattleInput('');
@@ -3079,6 +3098,9 @@ Be creative and concise.`;
     const timerLabel = `${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, '0')}`;
     const isTweakStage = arenaPreparation?.stage === 'tweak';
     const isPrepLockedIn = !!(socket.id && players[socket.id]?.lockedIn);
+    const previewSkipVotes = arenaPreparation?.skipVotes ?? [];
+    const previewParticipantCount = prepPlayers.filter(([, player]) => !player.character?.isNpcAlly).length;
+    const hasRequestedPreviewSkip = !!socket.id && previewSkipVotes.includes(socket.id);
 
     return (
       <div className="flex-1 flex flex-col bg-gray-50 overflow-hidden">
@@ -3092,7 +3114,7 @@ Be creative and concise.`;
               <p className="text-xs font-bold text-duo-gray-dark mt-1 max-w-[18rem]">
                 {isTweakStage
                   ? 'You have one pass to refine your legend before the duel begins.'
-                  : 'Inspect every legend now. The rewrite window opens automatically after the preview countdown.'}
+                  : 'Inspect every legend now. The rewrite window opens after the 15 second preview countdown or once everyone skips ahead.'}
               </p>
             </div>
             <div className={`rounded-2xl px-3 py-2 border text-center min-w-[88px] ${isTweakStage ? 'bg-yellow-50 text-yellow-700 border-yellow-200' : 'bg-blue-50 text-duo-blue border-blue-200'}`}>
@@ -3154,6 +3176,18 @@ Be creative and concise.`;
             <h3 className="text-xl font-black text-duo-text">Avatar Review Phase</h3>
             <p className="text-sm font-bold max-w-[22rem] mt-2">
               Open every profile, compare strengths, and decide what needs changing before the rewrite phase begins.
+            </p>
+            <button
+              onClick={() => socket.emit('skipArenaPreparationPreview')}
+              disabled={hasRequestedPreviewSkip}
+              className="duo-btn duo-btn-blue mt-5 px-5 py-3 disabled:opacity-60"
+            >
+              {hasRequestedPreviewSkip
+                ? `Waiting to skip (${previewSkipVotes.length}/${previewParticipantCount})`
+                : `Skip to rewrite (${previewSkipVotes.length}/${previewParticipantCount})`}
+            </button>
+            <p className="text-[11px] font-bold max-w-[22rem] mt-2">
+              The rewrite phase starts immediately once every human player votes to skip the rest of preview.
             </p>
           </div>
         ) : (

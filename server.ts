@@ -252,12 +252,12 @@ async function startServer() {
   let matchmakingQueue: Record<string, QueuePlayer> = {};
   const rooms: Record<string, any> = {};
   const roomTimers: Record<string, { interval: NodeJS.Timeout; remaining: number }> = {};
-  const arenaPreparationTimers: Record<string, { interval: NodeJS.Timeout; stage: 'preview' | 'tweak'; remaining: number }> = {};
+  const arenaPreparationTimers: Record<string, { interval: NodeJS.Timeout; stage: 'preview' | 'tweak'; remaining: number; skipVotes: string[] }> = {};
   const typingChannelMembers: Record<string, Set<string>> = {};
   const typingChannelBySocket: Record<string, string> = {};
   const typingTimeouts: Record<string, NodeJS.Timeout> = {};
   const TURN_TIMER_SECONDS = 60;
-  const ARENA_PREVIEW_SECONDS = 30;
+  const ARENA_PREVIEW_SECONDS = 15;
   const ARENA_TWEAK_SECONDS = 120;
 
   function startRoomTimer(roomId: string) {
@@ -761,6 +761,7 @@ async function startServer() {
       isBotMatch: !!room.isBotMatch,
       stage: timer.stage,
       remaining: timer.remaining,
+      skipVotes: timer.skipVotes,
     });
   };
 
@@ -790,6 +791,23 @@ async function startServer() {
     room.players[playerId].lockedIn = true;
     emitRoomPlayersUpdated(roomId);
     maybeAdvanceArenaPreparation(roomId);
+  };
+
+  const startArenaPreparationTweakStage = (roomId: string) => {
+    const room = rooms[roomId];
+    const timer = arenaPreparationTimers[roomId];
+    if (!room || !timer) return;
+
+    timer.stage = 'tweak';
+    timer.remaining = ARENA_TWEAK_SECONDS;
+    timer.skipVotes = [];
+    room.phase = 'tweak';
+    for (const playerId of Object.keys(room.players)) {
+      room.players[playerId].lockedIn = !!room.players[playerId]?.character?.isNpcAlly;
+    }
+    emitRoomPlayersUpdated(roomId);
+    maybeAdvanceArenaPreparation(roomId);
+    emitArenaPreparationState(roomId);
   };
 
   const startBattleRoom = (roomId: string) => {
@@ -829,6 +847,7 @@ async function startServer() {
       interval: null as any,
       stage: 'preview',
       remaining: ARENA_PREVIEW_SECONDS,
+      skipVotes: [],
     };
 
     emitArenaPreparationState(roomId);
@@ -842,15 +861,7 @@ async function startServer() {
 
       if (timer.remaining <= 0) {
         if (timer.stage === 'preview') {
-          timer.stage = 'tweak';
-          timer.remaining = ARENA_TWEAK_SECONDS;
-          activeRoom.phase = 'tweak';
-          for (const playerId of Object.keys(activeRoom.players)) {
-            activeRoom.players[playerId].lockedIn = !!activeRoom.players[playerId]?.character?.isNpcAlly;
-          }
-          emitRoomPlayersUpdated(roomId);
-          maybeAdvanceArenaPreparation(roomId);
-          emitArenaPreparationState(roomId);
+          startArenaPreparationTweakStage(roomId);
           return;
         }
 
@@ -2160,6 +2171,30 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
 
       clearTypingForSocket(socket.id);
       lockArenaPreparationPlayer(roomId, socket.id);
+    });
+
+    socket.on("skipArenaPreparationPreview", () => {
+      const roomId = players[socket.id]?.room;
+      if (!roomId) return;
+
+      const room = rooms[roomId];
+      const timer = arenaPreparationTimers[roomId];
+      if (!room || !timer || room.phase !== 'preview' || timer.stage !== 'preview' || !room.players[socket.id]) return;
+
+      const participantIds = getArenaPreparationParticipantIds(room);
+      if (!participantIds.includes(socket.id)) return;
+
+      if (!timer.skipVotes.includes(socket.id)) {
+        timer.skipVotes.push(socket.id);
+      }
+
+      const allReadyToSkip = participantIds.length > 0 && participantIds.every(playerId => timer.skipVotes.includes(playerId));
+      if (allReadyToSkip) {
+        startArenaPreparationTweakStage(roomId);
+        return;
+      }
+
+      emitArenaPreparationState(roomId);
     });
 
     socket.on("updateBotPreparationProfile", (data: { roomId?: string; botId: string; profileMarkdown: string }) => {
