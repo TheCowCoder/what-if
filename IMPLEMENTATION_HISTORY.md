@@ -52,6 +52,9 @@ This file summarizes the most recent implemented changes so test planning can ta
 48. Bot prep rewrite now falls back to locking in the existing profile if rewrite generation fails or returns empty.
 49. Local bot typing state now stays visible until the bot actually locks in.
 50. Exploration presence updates now merge authoritative server state back into the local exploration state.
+51. Avatar generation chat messages can now render inline multi-frame previews when the image model returns progressive frames.
+52. The active selected character is now persisted by name so reloads prefer the user’s last explicit legend choice.
+53. Character switching no longer rewrites the full character list when the selected legend data is unchanged.
 
 Suggested high-priority test areas:
 

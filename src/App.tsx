@@ -34,6 +34,8 @@ interface Message {
   role: 'user' | 'model' | 'system';
   text: string;
   imageUrl?: string;
+  imageFrames?: string[];
+  imageFrameFps?: number;
   playerName?: string;
   streamId?: string;
   kind?: 'thought' | 'answer';
@@ -86,6 +88,17 @@ const normalizeCharacter = (value: any): Character => ({
 
 const normalizeCharacters = (values: any[]): Character[] => Array.isArray(values) ? values.map(normalizeCharacter) : [];
 
+const pickPreferredCharacter = (values: Character[], preferredName?: string | null, fallbackIndex = 0): Character | null => {
+  if (!values.length) return null;
+
+  if (preferredName) {
+    const preferredCharacter = values.find(character => character.name === preferredName);
+    if (preferredCharacter) return preferredCharacter;
+  }
+
+  return values[fallbackIndex] || values[0] || null;
+};
+
 const stripCharacterImageForSync = (value: Character | null) => {
   if (!value) return null;
   const { imageUrl, ...rest } = value;
@@ -127,6 +140,12 @@ const optimizeCharacterAvatar = async (imageUrl: string) => {
   });
 };
 
+const extractInlineImageFrames = (parts: any[]): string[] => parts.flatMap(part => {
+  if (!(part as any).inlineData) return [];
+  const imageData = (part as any).inlineData;
+  return [`data:${imageData.mimeType};base64,${imageData.data}`];
+});
+
 const buildBattleActionsLog = (roomPlayers: Record<string, any>): string => (
   BATTLE_PLAYER_ACTIONS_PREFIX + Object.keys(roomPlayers)
     .map(pid => `**${roomPlayers[pid].character.name}:** ${roomPlayers[pid].action}`)
@@ -163,6 +182,56 @@ const ensureBattleStreamPlaceholders = (logs: string[]): string[] => {
 const removeBattleStreamPlaceholders = (logs: string[]): string[] => (
   logs.filter(log => !log.startsWith(BATTLE_STREAM_THOUGHTS_PREFIX) && !log.startsWith(BATTLE_STREAM_ANSWER_PREFIX))
 );
+
+const ImageSequencePreview = ({ frames, fps = 60, alt }: { frames: string[]; fps?: number; alt: string }) => {
+  const [frameIndex, setFrameIndex] = useState(0);
+
+  useEffect(() => {
+    if (frames.length <= 1) {
+      setFrameIndex(0);
+      return;
+    }
+
+    let animationFrame = 0;
+    let lastTimestamp = 0;
+    const frameDuration = 1000 / Math.max(1, fps);
+
+    const tick = (timestamp: number) => {
+      if (!lastTimestamp || timestamp - lastTimestamp >= frameDuration) {
+        setFrameIndex(previous => (previous + 1) % frames.length);
+        lastTimestamp = timestamp;
+      }
+      animationFrame = window.requestAnimationFrame(tick);
+    };
+
+    animationFrame = window.requestAnimationFrame(tick);
+    return () => window.cancelAnimationFrame(animationFrame);
+  }, [frames, fps]);
+
+  if (!frames.length) return null;
+
+  return <img src={frames[frameIndex] || frames[0]} alt={alt} className="w-full" />;
+};
+
+const InlineMessageMedia = ({ message, alt }: { message: Message; alt: string }) => {
+  const frames = message.imageFrames?.length ? message.imageFrames : message.imageUrl ? [message.imageUrl] : [];
+  if (!frames.length) return null;
+
+  return (
+    <div className="mt-2 rounded-lg overflow-hidden border-2 border-duo-gray bg-white">
+      {frames.length > 1 ? (
+        <>
+          <ImageSequencePreview frames={frames} fps={message.imageFrameFps || 60} alt={alt} />
+          <div className="px-3 py-2 text-[10px] font-black uppercase tracking-[0.16em] text-duo-blue bg-duo-blue/5 border-t border-duo-blue/10">
+            {frames.length} frame preview at {message.imageFrameFps || 60} FPS
+          </div>
+        </>
+      ) : (
+        <img src={frames[0]} alt={alt} className="w-full" />
+      )}
+    </div>
+  );
+};
 
 interface WorldPlayer {
   id: string;
@@ -447,11 +516,16 @@ export default function App() {
     return saved ? normalizeCharacters(JSON.parse(saved)) : [];
   });
   const [character, setCharacter] = useState<Character | null>(() => {
+    const savedCharacters = normalizeCharacters(JSON.parse(localStorage.getItem('duo_characters') || '[]'));
+    const preferredCharacter = pickPreferredCharacter(savedCharacters, localStorage.getItem('duo_active_character_name'));
+    if (preferredCharacter) return preferredCharacter;
+
     const saved = localStorage.getItem('duo_character');
     return saved ? normalizeCharacter(JSON.parse(saved)) : null;
   });
   const charactersRef = useRef<Character[]>([]);
   const characterRef = useRef<Character | null>(null);
+  const activeCharacterNameRef = useRef<string | null>(localStorage.getItem('duo_active_character_name'));
   
   const [settings, setSettings] = useState(() => {
     const defaultSettings = {
@@ -493,10 +567,17 @@ export default function App() {
   useEffect(() => {
     if (character) {
       localStorage.setItem('duo_character', JSON.stringify(character));
+      localStorage.setItem('duo_active_character_name', character.name);
+      activeCharacterNameRef.current = character.name;
       setCharacters(prev => {
         const index = prev.findIndex(c => c.name === character.name);
-        let newChars;
+        let newChars = prev;
         if (index >= 0) {
+          const previousCharacter = prev[index];
+          if (JSON.stringify(previousCharacter) === JSON.stringify(character)) {
+            localStorage.setItem('duo_characters', JSON.stringify(prev));
+            return prev;
+          }
           newChars = [...prev];
           newChars[index] = character;
         } else {
@@ -1048,9 +1129,10 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         // Auto-generate character portrait
         if (!normalizedState.imageUrl && gameStateRef.current !== 'arena_prep') {
           setTimeout(async () => {
+            const generationMessageId = `avatar-generation-${state.name}-${Date.now()}`;
             try {
               console.log("[Portrait Auto] Starting generation for:", state.name);
-              setMessages(prev => [...prev, { role: 'system', text: '🎨 Generating portrait...' }]);
+              setMessages(prev => [...prev, { role: 'system', text: '🎨 Generating portrait...', streamId: generationMessageId }]);
               const aiClient = getAIClient();
               const prompt = `Generate a fantasy character portrait for: ${state.name}. ${state.profileMarkdown.substring(0, 500)}. Style: detailed digital art, fantasy RPG character portrait, vibrant colors.`;
               const imgRes = await aiClient.models.generateContent({
@@ -1059,23 +1141,28 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
                 config: { responseModalities: ['IMAGE', 'TEXT'] },
               });
               const imgParts = imgRes.candidates?.[0]?.content?.parts || [];
-              for (const p of imgParts) {
-                if ((p as any).inlineData) {
-                  const imgData = (p as any).inlineData;
-                  const imgUrl = `data:${imgData.mimeType};base64,${imgData.data}`;
-                  const optimizedImageUrl = await optimizeCharacterAvatar(imgUrl);
-                  setCharacter(prev => prev ? { ...prev, imageUrl: optimizedImageUrl } : prev);
-                  setMessages(prev => {
-                    const filtered = prev.filter(m => m.text !== '🎨 Generating portrait...');
-                    return [...filtered, { role: 'system', text: '🎨 Portrait generated!' }];
-                  });
-                  console.log("[Portrait Auto] Success!");
-                  return;
-                }
+              const imageFrames = extractInlineImageFrames(imgParts);
+              if (imageFrames.length > 0) {
+                const optimizedImageUrl = await optimizeCharacterAvatar(imageFrames[imageFrames.length - 1]);
+                setCharacter(prev => prev ? { ...prev, imageUrl: optimizedImageUrl } : prev);
+                setMessages(prev => {
+                  const filtered = prev.filter(message => message.streamId !== generationMessageId);
+                  return [...filtered, {
+                    role: 'system',
+                    text: '🎨 Portrait generated!',
+                    imageUrl: optimizedImageUrl,
+                    imageFrames: imageFrames.length > 1 ? imageFrames : undefined,
+                    imageFrameFps: imageFrames.length > 1 ? 60 : undefined,
+                  }];
+                });
+                console.log("[Portrait Auto] Success!");
+                return;
               }
               console.warn("[Portrait Auto] No image in response");
             } catch (err: any) {
               console.error("[Portrait Auto] Error:", err.message);
+            } finally {
+              setMessages(prev => prev.filter(message => message.streamId !== generationMessageId));
             }
           }, 500);
         }
@@ -1951,8 +2038,13 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         .then(data => {
           if (data.characters?.length > 0) {
             const normalizedCharacters = normalizeCharacters(data.characters);
+            const preferredCharacter = pickPreferredCharacter(
+              normalizedCharacters,
+              activeCharacterNameRef.current,
+              data.activeCharacterIndex || 0,
+            );
             setCharacters(normalizedCharacters);
-            setCharacter(normalizedCharacters[data.activeCharacterIndex || 0] || normalizedCharacters[0]);
+            setCharacter(preferredCharacter);
           }
         })
         .catch(() => {
@@ -1988,8 +2080,13 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       // If server returned characters, load them
       if (data.characters?.length > 0) {
         const normalizedCharacters = normalizeCharacters(data.characters);
+        const preferredCharacter = pickPreferredCharacter(
+          normalizedCharacters,
+          activeCharacterNameRef.current,
+          data.activeCharacterIndex || 0,
+        );
         setCharacters(normalizedCharacters);
-        setCharacter(normalizedCharacters[data.activeCharacterIndex || 0] || normalizedCharacters[0]);
+        setCharacter(preferredCharacter);
       }
     } catch (e: any) {
       setAuthError(e.message);
@@ -2393,7 +2490,8 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     if (!character || isGeneratingCharImage) return;
     setIsGeneratingCharImage(true);
     console.log("[Portrait] Starting generation for:", character.name);
-    setMessages(prev => [...prev, { role: 'system', text: '🎨 Generating portrait... this may take a moment.' }]);
+    const generationMessageId = `avatar-generation-${character.name}-${Date.now()}`;
+    setMessages(prev => [...prev, { role: 'system', text: '🎨 Generating portrait... this may take a moment.', streamId: generationMessageId }]);
     try {
       const aiClient = getAIClient();
       const prompt = `Generate a fantasy character portrait for: ${character.name}. ${character.profileMarkdown.substring(0, 500)}. Style: detailed digital art, fantasy RPG character portrait, vibrant colors.`;
@@ -2410,20 +2508,22 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       console.log("[Portrait] Response received, checking parts...");
       const parts = response.candidates?.[0]?.content?.parts || [];
       console.log("[Portrait] Parts count:", parts.length);
-      for (const part of parts) {
-        if ((part as any).inlineData) {
-          const imageData = (part as any).inlineData;
-          const imageUrl = `data:${imageData.mimeType};base64,${imageData.data}`;
-          const optimizedImageUrl = await optimizeCharacterAvatar(imageUrl);
-          setCharacter(prev => prev ? { ...prev, imageUrl: optimizedImageUrl } : prev);
-          // Remove the "generating" message and add success
-          setMessages(prev => {
-            const filtered = prev.filter(m => m.text !== '🎨 Generating portrait... this may take a moment.');
-            return [...filtered, { role: 'system', text: '🎨 Portrait generated!', imageUrl: optimizedImageUrl }];
-          });
-          console.log("[Portrait] Success! Image generated.");
-          return;
-        }
+      const imageFrames = extractInlineImageFrames(parts);
+      if (imageFrames.length > 0) {
+        const optimizedImageUrl = await optimizeCharacterAvatar(imageFrames[imageFrames.length - 1]);
+        setCharacter(prev => prev ? { ...prev, imageUrl: optimizedImageUrl } : prev);
+        setMessages(prev => {
+          const filtered = prev.filter(message => message.streamId !== generationMessageId);
+          return [...filtered, {
+            role: 'system',
+            text: '🎨 Portrait generated!',
+            imageUrl: optimizedImageUrl,
+            imageFrames: imageFrames.length > 1 ? imageFrames : undefined,
+            imageFrameFps: imageFrames.length > 1 ? 60 : undefined,
+          }];
+        });
+        console.log("[Portrait] Success! Image generated.");
+        return;
       }
       console.warn("[Portrait] No image data in response parts:", parts.map(p => Object.keys(p)));
       setMessages(prev => [...prev, { role: 'system', text: '⚠️ No image was generated. Try again.' }]);
@@ -2431,6 +2531,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       console.error("[Portrait] Generation error:", error);
       setMessages(prev => [...prev, { role: 'system', text: `⚠️ Image generation failed: ${error.message}` }]);
     } finally {
+      setMessages(prev => prev.filter(message => message.streamId !== generationMessageId));
       setIsGeneratingCharImage(false);
     }
   };
@@ -2537,6 +2638,8 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
   };
 
   const handleNewCharacter = () => {
+    activeCharacterNameRef.current = null;
+    localStorage.removeItem('duo_active_character_name');
     setCharacter(null);
     setMessages([{ role: 'model', text: "Let's build a new legend. What kind of character do you want to create?" }]);
     setGameState('char_creation');
@@ -2546,6 +2649,8 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
   const handleSelectCharacter = (name: string) => {
     const selected = characters.find(c => c.name === name);
     if (selected) {
+      activeCharacterNameRef.current = selected.name;
+      localStorage.setItem('duo_active_character_name', selected.name);
       setCharacter(selected);
       setMessages([{ role: 'model', text: `Switched to ${selected.name}. Ready for action!` }]);
     }
@@ -2993,8 +3098,11 @@ Be creative and concise.`;
           return (
             <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
               {msg.role === 'system' ? (
-                <div className="w-full text-center text-sm font-bold text-red-500 bg-red-50 border border-red-100 rounded-lg py-2 px-4 my-2">
-                  {msg.text}
+                <div className="w-full">
+                  <div className="text-center text-sm font-bold text-red-500 bg-red-50 border border-red-100 rounded-lg py-2 px-4 my-2 markdown-body">
+                    <Markdown rehypePlugins={[rehypeRaw]}>{msg.text}</Markdown>
+                  </div>
+                  <InlineMessageMedia message={msg} alt="Portrait generation" />
                 </div>
               ) : (
                 <div className={msg.role === 'user' ? 'chat-bubble-me' : 'chat-bubble-them'}>
@@ -3202,8 +3310,11 @@ Be creative and concise.`;
                 return (
                   <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                     {msg.role === 'system' ? (
-                      <div className="w-full text-center text-sm font-bold text-red-500 bg-red-50 border border-red-100 rounded-lg py-2 px-4 my-2">
-                        {msg.text}
+                      <div className="w-full">
+                        <div className="text-center text-sm font-bold text-red-500 bg-red-50 border border-red-100 rounded-lg py-2 px-4 my-2 markdown-body">
+                          <Markdown rehypePlugins={[rehypeRaw]}>{msg.text}</Markdown>
+                        </div>
+                        <InlineMessageMedia message={msg} alt="Portrait generation" />
                       </div>
                     ) : (
                       <div className={msg.role === 'user' ? 'chat-bubble-me' : 'chat-bubble-them'}>
@@ -4107,11 +4218,7 @@ Be creative and concise.`;
                   <div className="text-center text-sm font-bold text-duo-blue bg-duo-blue/5 border border-duo-blue/10 rounded-lg py-2 px-4 my-1 markdown-body">
                     <Markdown rehypePlugins={[rehypeRaw]}>{msg.text}</Markdown>
                   </div>
-                  {msg.imageUrl && (
-                    <div className="mt-2 rounded-lg overflow-hidden border-2 border-duo-gray">
-                      <img src={msg.imageUrl} alt="Scene" className="w-full" />
-                    </div>
-                  )}
+                  <InlineMessageMedia message={msg} alt="Inline scene" />
                 </div>
               ) : isOtherPlayer ? (
                 <div className="flex items-start gap-2 max-w-[80%]">
