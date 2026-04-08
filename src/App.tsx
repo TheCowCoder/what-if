@@ -86,6 +86,17 @@ const normalizeCharacter = (value: any): Character => ({
 
 const normalizeCharacters = (values: any[]): Character[] => Array.isArray(values) ? values.map(normalizeCharacter) : [];
 
+const stripCharacterImageForSync = (value: Character | null) => {
+  if (!value) return null;
+  const { imageUrl, ...rest } = value;
+  return rest;
+};
+
+const stripCharacterImagesForCloud = (values: Character[]) => values.map(character => {
+  const { imageUrl, ...rest } = character;
+  return rest;
+});
+
 const buildBattleActionsLog = (roomPlayers: Record<string, any>): string => (
   BATTLE_PLAYER_ACTIONS_PREFIX + Object.keys(roomPlayers)
     .map(pid => `**${roomPlayers[pid].character.name}:** ${roomPlayers[pid].action}`)
@@ -334,7 +345,7 @@ export default function App() {
     }
   }, [character]);
 
-  const getAIClient = () => {
+  const getAIClient = useCallback(() => {
     const customKey = settingsRef.current.apiKey?.trim();
     if (customKey) {
       console.log(`Using custom API key ending in ...${customKey.slice(-4)}`);
@@ -345,7 +356,7 @@ export default function App() {
     // We create a new instance to ensure we pick up any dynamically injected keys
     console.log("Using platform-provided API key");
     return createAIClient(process.env.API_KEY || process.env.GEMINI_API_KEY);
-  };
+  }, []);
 
   const upsertExplorationStreamMessage = useCallback((streamId: string, text: string, kind: 'thought' | 'answer') => {
     setExplorationLog(prev => {
@@ -603,9 +614,10 @@ export default function App() {
 
   useEffect(() => {
     const sync = () => {
-      const charStr = JSON.stringify(character);
-      if (character && charStr !== lastSyncedCharRef.current) {
-        socket.emit('characterCreated', character);
+      const syncCharacter = stripCharacterImageForSync(character);
+      const charStr = JSON.stringify(syncCharacter);
+      if (syncCharacter && charStr !== lastSyncedCharRef.current) {
+        socket.emit('characterCreated', syncCharacter);
         lastSyncedCharRef.current = charStr;
       }
     };
@@ -659,6 +671,7 @@ export default function App() {
   const botDifficultyRef = useRef(botDifficulty);
   useEffect(() => { botDifficultyRef.current = botDifficulty; }, [botDifficulty]);
   const arenaPreparationStageRef = useRef<ArenaPreparationState['stage'] | null>(null);
+  const botPreparationRewriteRoomRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (gameState !== 'arena_prep' || !arenaPreparation) return;
@@ -677,6 +690,7 @@ export default function App() {
       return;
     }
 
+    setShowProfileModal(false);
     setMessages([{ role: 'model', text: 'You have one rewrite window before the duel. Refine your legend now.' }]);
     setInputText('');
     setCharCreatorError(null);
@@ -687,8 +701,59 @@ export default function App() {
   useEffect(() => {
     if (!arenaPreparation) {
       arenaPreparationStageRef.current = null;
+      botPreparationRewriteRoomRef.current = null;
     }
   }, [arenaPreparation]);
+
+  useEffect(() => {
+    if (arenaPreparation?.stage !== 'tweak' || !arenaPreparation.isBotMatch || !roomId) return;
+
+    const botId = Object.keys(players).find(id => id.startsWith('bot_'));
+    if (!botId || botPreparationRewriteRoomRef.current === roomId) return;
+
+    const botPlayer = players[botId];
+    if (!botPlayer?.character) return;
+
+    botPreparationRewriteRoomRef.current = roomId;
+    setLocalRoomTypingIds(prev => prev.includes(botId) ? prev : [...prev, botId]);
+
+    let cancelled = false;
+
+    const rewriteBotProfile = async () => {
+      try {
+        const aiClient = getAIClient();
+        const opponents = Object.entries(players)
+          .filter(([id]) => id !== botId)
+          .map(([, player]) => `Opponent: ${player.character.name}\n${player.character.profileMarkdown}`)
+          .join('\n\n');
+        const response = await aiClient.models.generateContent({
+          model: settingsRef.current.botModel,
+          contents: `You are revising your dueling profile before the arena begins. Keep the same name and return markdown only.\n\nCurrent profile:\n${botPlayer.character.profileMarkdown}\n\nOpponents:\n${opponents}\n\nRefine the profile to better prepare for this duel while preserving identity and formatting.`,
+          config: {
+            temperature: 0.8,
+          },
+        });
+
+        const rewrittenProfile = response.text?.trim();
+        if (!cancelled && rewrittenProfile) {
+          socket.emit('updateBotPreparationProfile', { roomId, botId, profileMarkdown: rewrittenProfile });
+        }
+      } catch (error) {
+        console.error('Failed to rewrite bot preparation profile', error);
+      } finally {
+        if (!cancelled) {
+          setLocalRoomTypingIds(prev => prev.filter(id => id !== botId));
+        }
+      }
+    };
+
+    rewriteBotProfile();
+
+    return () => {
+      cancelled = true;
+      setLocalRoomTypingIds(prev => prev.filter(id => id !== botId));
+    };
+  }, [arenaPreparation?.isBotMatch, arenaPreparation?.stage, getAIClient, players, roomId]);
 
   const generateBotAction = async (currentRoom: any) => {
     if (!currentRoom || !currentRoom.isBotMatch) return;
@@ -1642,7 +1707,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       const res = await fetch('/api/account/characters', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` },
-        body: JSON.stringify({ characters, activeCharacterIndex: Math.max(0, activeIndex) })
+        body: JSON.stringify({ characters: stripCharacterImagesForCloud(characters), activeCharacterIndex: Math.max(0, activeIndex) })
       });
       if (!res.ok) console.error("[Sync] Failed:", res.status, await res.text());
       else console.log("[Sync] Characters synced to cloud successfully");
@@ -2725,18 +2790,20 @@ Be creative and concise.`;
             {prepPlayers.map(([id, player]) => {
               const isMe = id === socket.id;
               const isTyping = !isMe && activeTypingIds.has(id);
+              const canInspect = !isTweakStage || isMe;
               return (
                 <button
                   key={id}
                   onClick={() => {
+                    if (!canInspect) return;
                     setProfileToView(player.character.profileMarkdown);
                     setShowProfileModal(true);
                   }}
-                  className="flex flex-col items-center gap-2 min-w-[84px]"
+                  className={`flex flex-col items-center gap-2 min-w-[84px] ${canInspect ? '' : 'opacity-80 cursor-default'}`}
                 >
                   <div className={`relative w-20 h-20 rounded-full border-4 shadow-lg overflow-hidden ${isMe ? 'border-duo-green bg-duo-green/10' : 'border-duo-blue bg-duo-blue/10'}`}>
-                    {player.character.imageUrl ? (
-                      <img src={player.character.imageUrl} alt={player.character.name} className="w-full h-full object-cover" />
+                    {(isMe ? character?.imageUrl : player.character.imageUrl) ? (
+                      <img src={isMe ? character?.imageUrl : player.character.imageUrl} alt={player.character.name} className="w-full h-full object-cover" />
                     ) : (
                       <div className={`w-full h-full flex items-center justify-center text-2xl font-black ${isMe ? 'text-duo-green-dark' : 'text-duo-blue'}`}>
                         {player.character.name.charAt(0).toUpperCase()}

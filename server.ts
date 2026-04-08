@@ -1947,6 +1947,20 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
       setTypingForSocket(socket.id, data?.isTyping !== false);
     });
 
+    socket.on("updateBotPreparationProfile", (data: { roomId?: string; botId: string; profileMarkdown: string }) => {
+      const roomId = players[socket.id]?.room || data.roomId;
+      if (!roomId) return;
+
+      const room = rooms[roomId];
+      if (!room?.isBotMatch || room.phase !== 'tweak') return;
+
+      const botPlayer = room.players[data.botId];
+      if (!botPlayer?.character || typeof data.profileMarkdown !== 'string' || !data.profileMarkdown.trim()) return;
+
+      botPlayer.character.profileMarkdown = data.profileMarkdown.trim();
+      emitRoomPlayersUpdated(roomId);
+    });
+
     socket.on("botAction", (data) => {
       const roomId = players[socket.id]?.room;
       if (!roomId) return;
