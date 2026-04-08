@@ -209,7 +209,13 @@ async function startServer() {
   let matchmakingQueue: Record<string, QueuePlayer> = {};
   const rooms: Record<string, any> = {};
   const roomTimers: Record<string, { interval: NodeJS.Timeout; remaining: number }> = {};
+  const arenaPreparationTimers: Record<string, { interval: NodeJS.Timeout; stage: 'preview' | 'tweak'; remaining: number }> = {};
+  const typingChannelMembers: Record<string, Set<string>> = {};
+  const typingChannelBySocket: Record<string, string> = {};
+  const typingTimeouts: Record<string, NodeJS.Timeout> = {};
   const TURN_TIMER_SECONDS = 60;
+  const ARENA_PREVIEW_SECONDS = 30;
+  const ARENA_TWEAK_SECONDS = 120;
 
   function startRoomTimer(roomId: string) {
     clearRoomTimer(roomId);
@@ -526,6 +532,159 @@ async function startServer() {
     io.to(roomId).emit("battleMapStateUpdated", room.mapState);
   };
 
+  const getTypingChannel = (socketId: string) => {
+    const roomId = players[socketId]?.room;
+    if (roomId && rooms[roomId]) {
+      return `room:${roomId}`;
+    }
+    if (explorationPlayers[socketId]) {
+      return 'exploration_world';
+    }
+    return null;
+  };
+
+  const emitTypingStatus = (channel: string) => {
+    const typingIds = Array.from(typingChannelMembers[channel] || []);
+    if (channel.startsWith('room:')) {
+      io.to(channel.slice('room:'.length)).emit('typingStatusUpdated', { context: 'room', typingIds });
+      return;
+    }
+    if (channel === 'exploration_world') {
+      io.to('exploration_world').emit('typingStatusUpdated', { context: 'exploration', typingIds });
+    }
+  };
+
+  const clearTypingForSocket = (socketId: string) => {
+    if (typingTimeouts[socketId]) {
+      clearTimeout(typingTimeouts[socketId]);
+      delete typingTimeouts[socketId];
+    }
+
+    const currentChannel = typingChannelBySocket[socketId];
+    if (!currentChannel) return;
+
+    typingChannelMembers[currentChannel]?.delete(socketId);
+    if (typingChannelMembers[currentChannel]?.size === 0) {
+      delete typingChannelMembers[currentChannel];
+    }
+    delete typingChannelBySocket[socketId];
+    emitTypingStatus(currentChannel);
+  };
+
+  const setTypingForSocket = (socketId: string, isTyping: boolean) => {
+    const nextChannel = getTypingChannel(socketId);
+    const currentChannel = typingChannelBySocket[socketId];
+
+    if (currentChannel && currentChannel !== nextChannel) {
+      clearTypingForSocket(socketId);
+    }
+
+    if (!isTyping || !nextChannel) {
+      clearTypingForSocket(socketId);
+      return;
+    }
+
+    if (!typingChannelMembers[nextChannel]) {
+      typingChannelMembers[nextChannel] = new Set<string>();
+    }
+    typingChannelMembers[nextChannel].add(socketId);
+    typingChannelBySocket[socketId] = nextChannel;
+
+    if (typingTimeouts[socketId]) {
+      clearTimeout(typingTimeouts[socketId]);
+    }
+    typingTimeouts[socketId] = setTimeout(() => {
+      clearTypingForSocket(socketId);
+    }, 1800);
+
+    emitTypingStatus(nextChannel);
+  };
+
+  const clearArenaPreparationTimer = (roomId: string) => {
+    const timer = arenaPreparationTimers[roomId];
+    if (!timer) return;
+    clearInterval(timer.interval);
+    delete arenaPreparationTimers[roomId];
+  };
+
+  const emitRoomPlayersUpdated = (roomId: string) => {
+    const room = rooms[roomId];
+    if (!room) return;
+    io.to(roomId).emit('roomPlayersUpdated', {
+      players: room.players,
+      phase: room.phase || 'battle',
+    });
+  };
+
+  const emitArenaPreparationState = (roomId: string) => {
+    const room = rooms[roomId];
+    const timer = arenaPreparationTimers[roomId];
+    if (!room || !timer) return;
+
+    io.to(roomId).emit('arenaPreparationState', {
+      roomId,
+      players: room.players,
+      isBotMatch: !!room.isBotMatch,
+      stage: timer.stage,
+      remaining: timer.remaining,
+    });
+  };
+
+  const startBattleRoom = (roomId: string) => {
+    const room = rooms[roomId];
+    if (!room) return;
+
+    clearArenaPreparationTimer(roomId);
+    room.phase = 'battle';
+    emitTypingStatus(`room:${roomId}`);
+    io.to(roomId).emit('matchFound', {
+      roomId,
+      players: room.players,
+      mapState: room.mapState,
+      isBotMatch: !!room.isBotMatch,
+      isPvpExploration: !!room.isPvpExploration,
+    });
+    startRoomTimer(roomId);
+  };
+
+  const startArenaPreparation = (roomId: string) => {
+    const room = rooms[roomId];
+    if (!room) return;
+
+    clearArenaPreparationTimer(roomId);
+    room.phase = 'preview';
+    arenaPreparationTimers[roomId] = {
+      interval: null as any,
+      stage: 'preview',
+      remaining: ARENA_PREVIEW_SECONDS,
+    };
+
+    emitArenaPreparationState(roomId);
+
+    arenaPreparationTimers[roomId].interval = setInterval(() => {
+      const timer = arenaPreparationTimers[roomId];
+      const activeRoom = rooms[roomId];
+      if (!timer || !activeRoom) return;
+
+      timer.remaining -= 1;
+
+      if (timer.remaining <= 0) {
+        if (timer.stage === 'preview') {
+          timer.stage = 'tweak';
+          timer.remaining = ARENA_TWEAK_SECONDS;
+          activeRoom.phase = 'tweak';
+          emitArenaPreparationState(roomId);
+          return;
+        }
+
+        startBattleRoom(roomId);
+        return;
+      }
+
+      emitArenaPreparationState(roomId);
+    }, 1000);
+  };
+
   const startExplorationPvpBattle = (challengerId: string, targetId: string, ambushTargetId?: string, openingStrikeDamage?: number) => {
     if (challengerId === targetId) return null;
 
@@ -537,6 +696,8 @@ async function startServer() {
     delete explorationPlayers[targetId];
     delete explorationLockedActions[challengerId];
     delete explorationLockedActions[targetId];
+    clearTypingForSocket(challengerId);
+    clearTypingForSocket(targetId);
     emitExplorationPlayersUpdated();
 
     const challengerCharacter = { ...challenger.character };
@@ -1246,6 +1407,11 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
     socket.on("characterCreated", (state) => {
       const normalizedState = { ...state, gold: typeof state?.gold === 'number' ? state.gold : 25 };
       players[socket.id] = { ...players[socket.id], character: normalizedState };
+      const roomId = players[socket.id]?.room;
+      if (roomId && rooms[roomId]?.players?.[socket.id] && rooms[roomId].phase !== 'battle') {
+        rooms[roomId].players[socket.id].character = normalizedState;
+        emitRoomPlayersUpdated(roomId);
+      }
       socket.emit("characterSaved", normalizedState);
       socket.emit("characterSynced");
     });
@@ -1605,6 +1771,8 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
       // Remove both from exploration temporarily
       delete explorationPlayers[socket.id];
       delete explorationPlayers[data.challengerId];
+      clearTypingForSocket(socket.id);
+      clearTypingForSocket(data.challengerId);
 
       const roomId = `pvp_room_${socket.id}_${data.challengerId}`;
       
@@ -1699,19 +1867,14 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
         npcAllyIds: npcAllies.map((n: any) => `npc_ally_${n.id}`),
         players: roomPlayers,
         mapState: buildArenaBattleMapState(roomPlayers),
+        phase: 'preview',
         history: [],
       };
 
       socket.join(roomId);
       players[socket.id].room = roomId;
 
-      io.to(roomId).emit("matchFound", {
-        roomId,
-        players: rooms[roomId].players,
-        mapState: rooms[roomId].mapState,
-        isBotMatch: true,
-      });
-      startRoomTimer(roomId);
+      startArenaPreparation(roomId);
     });
 
     socket.on("enterArena", (data?: { unlimitedTurnTime?: boolean }) => {
@@ -1760,16 +1923,11 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
             unlimitedTurnTime: queueList.some(p => p.unlimitedTurnTime),
             isBotMatch: false,
             mapState: buildArenaBattleMapState(roomPlayers),
+            phase: 'preview',
             history: []
           };
 
-          io.to(roomId).emit("matchFound", {
-            roomId,
-            players: roomPlayers,
-            mapState: rooms[roomId].mapState,
-            isBotMatch: false
-          });
-          startRoomTimer(roomId);
+          startArenaPreparation(roomId);
 
           matchmakingQueue = {}; // Clear queue
         }
@@ -1777,6 +1935,7 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
     });
 
     socket.on("leaveQueue", () => {
+      clearTypingForSocket(socket.id);
       if (matchmakingQueue[socket.id]) {
         delete matchmakingQueue[socket.id];
         socket.leave("matchmaking_lobby");
@@ -1784,11 +1943,8 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
       }
     });
 
-    socket.on("typing", () => {
-      const roomId = players[socket.id]?.room;
-      if (roomId) {
-        socket.to(roomId).emit("opponentTyping", socket.id);
-      }
+    socket.on("typing", (data?: { isTyping?: boolean }) => {
+      setTypingForSocket(socket.id, data?.isTyping !== false);
     });
 
     socket.on("botAction", (data) => {
@@ -1832,6 +1988,7 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
       const room = rooms[roomId];
       if (!room) return;
 
+      clearTypingForSocket(socket.id);
       room.players[socket.id].lockedIn = true;
   room.players[socket.id].autoLockedThisTurn = false;
       room.players[socket.id].action = actionText;
@@ -1942,6 +2099,7 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
 
     socket.on("disconnect", () => {
       console.log("User disconnected:", socket.id);
+      clearTypingForSocket(socket.id);
       
       if (matchmakingQueue[socket.id]) {
         delete matchmakingQueue[socket.id];
@@ -1969,6 +2127,7 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
       const roomId = players[socket.id]?.room;
       if (roomId) {
         clearRoomTimer(roomId);
+        clearArenaPreparationTimer(roomId);
         socket.to(roomId).emit("opponentDisconnected");
         delete rooms[roomId];
       }

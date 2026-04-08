@@ -17,7 +17,7 @@ declare global {
 const socket: Socket = io();
 
 type Tab = 'home' | 'profile' | 'social';
-type GameState = 'menu' | 'char_creation' | 'matchmaking' | 'battle' | 'post_match' | 'exploration' | 'level_select';
+type GameState = 'menu' | 'char_creation' | 'matchmaking' | 'arena_prep' | 'battle' | 'post_match' | 'exploration' | 'level_select';
 
 interface Character {
   name: string;
@@ -130,6 +130,7 @@ interface WorldPlayer {
   x: number;
   y: number;
   acting?: boolean;
+  typing?: boolean;
 }
 
 interface WorldNpc {
@@ -146,6 +147,12 @@ interface BattleMapState {
   discoveredLocations: string[];
   players: WorldPlayer[];
   npcs: WorldNpc[];
+}
+
+interface ArenaPreparationState {
+  stage: 'preview' | 'tweak';
+  remaining: number;
+  isBotMatch: boolean;
 }
 
 interface MapMarkerLayoutInput {
@@ -179,6 +186,18 @@ const EMPTY_BATTLE_MAP_STATE: BattleMapState = {
   players: [],
   npcs: [],
 };
+
+const TypingDots = ({ className = '', dotClassName = 'h-1.5 w-1.5' }: { className?: string; dotClassName?: string }) => (
+  <span className={`inline-flex items-end gap-1 text-current ${className}`} aria-label="Typing">
+    {[0, 160, 320].map(delay => (
+      <span
+        key={delay}
+        className={`${dotClassName} rounded-full bg-current animate-bounce`}
+        style={{ animationDelay: `${delay}ms`, animationDuration: '0.9s' }}
+      />
+    ))}
+  </span>
+);
 
 const layoutRepelledMarkers = (
   markers: MapMarkerLayoutInput[],
@@ -484,6 +503,7 @@ export default function App() {
   const [roomId, setRoomId] = useState<string | null>(null);
   const [players, setPlayers] = useState<Record<string, any>>({});
   const [battleMapState, setBattleMapState] = useState<BattleMapState>(EMPTY_BATTLE_MAP_STATE);
+  const [arenaPreparation, setArenaPreparation] = useState<ArenaPreparationState | null>(null);
   const [battleLogs, setBattleLogs] = useState<string[]>([]);
   const battleLogsRef = useRef<string[]>([]);
   const [battleInput, setBattleInput] = useState('');
@@ -493,7 +513,9 @@ export default function App() {
   const [expandedExplorationThoughts, setExpandedExplorationThoughts] = useState<Set<string>>(new Set());
   const abortControllerRef = useRef<AbortController | null>(null);
   const [isLockedIn, setIsLockedIn] = useState(false);
-  const [opponentTyping, setOpponentTyping] = useState(false);
+  const [roomTypingIds, setRoomTypingIds] = useState<string[]>([]);
+  const [localRoomTypingIds, setLocalRoomTypingIds] = useState<string[]>([]);
+  const typingStopTimeoutsRef = useRef<Record<string, number>>({});
   const battleEndRef = useRef<HTMLDivElement>(null);
   const charInputRef = useRef<HTMLTextAreaElement>(null);
   const battleInputRef = useRef<HTMLTextAreaElement>(null);
@@ -517,6 +539,58 @@ export default function App() {
   const [profileToView, setProfileToView] = useState<string | null>(null);
   useEffect(() => { isBotMatchRef.current = isBotMatch; }, [isBotMatch]);
   const difficultyLabels = ['Easy', 'Medium', 'Hard', 'Superintelligent'];
+
+  const mergeWorldPlayers = useCallback((nextPlayers: WorldPlayer[]) => {
+    setWorldPlayers(prev => {
+      const previousById = new globalThis.Map(prev.map(player => [player.id, player]));
+      return (nextPlayers || []).map(player => {
+        const previous = previousById.get(player.id);
+        return {
+          ...previous,
+          ...player,
+          acting: player.acting ?? previous?.acting,
+          typing: player.typing ?? previous?.typing,
+        };
+      });
+    });
+  }, []);
+
+  const setExplorationTypingIds = useCallback((typingIds: string[]) => {
+    const typingSet = new Set(typingIds);
+    setWorldPlayers(prev => prev.map(player => ({
+      ...player,
+      typing: typingSet.has(player.id),
+    })));
+  }, []);
+
+  const updateTypingPresence = useCallback((channel: 'character' | 'battle' | 'exploration', value: string) => {
+    const timeoutId = typingStopTimeoutsRef.current[channel];
+    if (timeoutId) {
+      window.clearTimeout(timeoutId);
+      delete typingStopTimeoutsRef.current[channel];
+    }
+
+    const isTyping = value.trim().length > 0;
+    socket.emit('typing', { isTyping });
+
+    if (!isTyping) {
+      return;
+    }
+
+    typingStopTimeoutsRef.current[channel] = window.setTimeout(() => {
+      socket.emit('typing', { isTyping: false });
+      delete typingStopTimeoutsRef.current[channel];
+    }, 1100);
+  }, []);
+
+  const clearTypingPresence = useCallback((channel: 'character' | 'battle' | 'exploration') => {
+    const timeoutId = typingStopTimeoutsRef.current[channel];
+    if (timeoutId) {
+      window.clearTimeout(timeoutId);
+      delete typingStopTimeoutsRef.current[channel];
+    }
+    socket.emit('typing', { isTyping: false });
+  }, []);
 
   useEffect(() => {
     socket.on('characterSynced', () => setIsSynced(true));
@@ -584,6 +658,37 @@ export default function App() {
   useEffect(() => { roomIdRef.current = roomId; }, [roomId]);
   const botDifficultyRef = useRef(botDifficulty);
   useEffect(() => { botDifficultyRef.current = botDifficulty; }, [botDifficulty]);
+  const arenaPreparationStageRef = useRef<ArenaPreparationState['stage'] | null>(null);
+
+  useEffect(() => {
+    if (gameState !== 'arena_prep' || !arenaPreparation) return;
+
+    if (arenaPreparation.stage === arenaPreparationStageRef.current) return;
+    arenaPreparationStageRef.current = arenaPreparation.stage;
+
+    if (arenaPreparation.stage === 'preview') {
+      setMessages([]);
+      setInputText('');
+      setIsWaitingForChar(false);
+      setCharCreatorError(null);
+      setCharCreatorRetryAttempt(0);
+      clearChatStatusMessage('char-creator-retry');
+      clearTypingPresence('character');
+      return;
+    }
+
+    setMessages([{ role: 'model', text: 'You have one rewrite window before the duel. Refine your legend now.' }]);
+    setInputText('');
+    setCharCreatorError(null);
+    setCharCreatorRetryAttempt(0);
+    clearChatStatusMessage('char-creator-retry');
+  }, [arenaPreparation, clearChatStatusMessage, clearTypingPresence, gameState]);
+
+  useEffect(() => {
+    if (!arenaPreparation) {
+      arenaPreparationStageRef.current = null;
+    }
+  }, [arenaPreparation]);
 
   const generateBotAction = async (currentRoom: any) => {
     if (!currentRoom || !currentRoom.isBotMatch) return;
@@ -599,7 +704,7 @@ export default function App() {
 
     if (p2Data.lockedIn) return;
 
-    setOpponentTyping(true);
+    setLocalRoomTypingIds(prev => prev.includes(botId) ? prev : [...prev, botId]);
     try {
       const aiClient = getAIClient();
       const botPromptRes = await fetch('/api/prompts/bot_player.txt');
@@ -636,7 +741,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       // Fallback: send a generic attack so the battle doesn't stall
       socket.emit('botAction', { action: `${currentRoom.players[botId!]?.character?.name || 'The enemy'} attacks with a basic strike!` });
     } finally {
-      setOpponentTyping(false);
+      setLocalRoomTypingIds(prev => prev.filter(id => id !== botId));
     }
   };
 
@@ -693,10 +798,34 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       setGameState('matchmaking');
     });
 
+    socket.on('arenaPreparationState', (data: { roomId: string; players: Record<string, any>; isBotMatch: boolean; stage: 'preview' | 'tweak'; remaining: number }) => {
+      setRoomId(data.roomId);
+      setPlayers(data.players);
+      setIsBotMatch(data.isBotMatch);
+      setArenaPreparation({
+        stage: data.stage,
+        remaining: data.remaining,
+        isBotMatch: data.isBotMatch,
+      });
+      setBattleLogs([]);
+      setBattleInput('');
+      setGameState('arena_prep');
+    });
+
+    socket.on('roomPlayersUpdated', (data: { players: Record<string, any>; phase: string }) => {
+      setPlayers(data.players);
+      if (data.phase === 'preview' || data.phase === 'tweak') {
+        setArenaPreparation(prev => prev ? { ...prev, stage: data.phase as ArenaPreparationState['stage'] } : prev);
+      }
+    });
+
     socket.on('matchFound', (data) => {
       setRoomId(data.roomId);
       setPlayers(data.players);
       syncBattleMapState(data.mapState);
+      setArenaPreparation(null);
+      setRoomTypingIds([]);
+      setLocalRoomTypingIds([]);
       setIsBotMatch(data.isBotMatch);
       setIsExplorationProcessing(false);
       setExplorationLockStatus([]);
@@ -718,15 +847,17 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       syncBattleMapState(data);
     });
 
-    socket.on('battleActionsSubmitted', (data: { log: string }) => {
-      setBattleLogs(prev => appendBattleLogIfMissing(removePendingBattleActionLogs(prev), data.log));
+    socket.on('typingStatusUpdated', (data: { context: 'room' | 'exploration'; typingIds: string[] }) => {
+      if (data.context === 'room') {
+        setRoomTypingIds(data.typingIds || []);
+        return;
+      }
+
+      setExplorationTypingIds(data.typingIds || []);
     });
 
-    socket.on('opponentTyping', (id) => {
-      if (id !== socket.id) {
-        setOpponentTyping(true);
-        setTimeout(() => setOpponentTyping(false), 3000);
-      }
+    socket.on('battleActionsSubmitted', (data: { log: string }) => {
+      setBattleLogs(prev => appendBattleLogIfMissing(removePendingBattleActionLogs(prev), data.log));
     });
 
     socket.on('playerLockedIn', (id) => {
@@ -1018,7 +1149,6 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         }
       }
       setIsLockedIn(false);
-      setOpponentTyping(false);
       // Auto-generate battle scene image after turn resolution (only resolver generates)
       const playerIds = Object.keys(data.players);
       const isFirstPlayer = playerIds[0] === socket.id;
@@ -1037,10 +1167,12 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       setBattleError(null);
       setRetryAttempt(0);
       setIsLockedIn(false);
-      setOpponentTyping(false);
       setTurnTimerRemaining(null);
       setRoomId(null);
       syncBattleMapState(null);
+      setArenaPreparation(null);
+      setRoomTypingIds([]);
+      setLocalRoomTypingIds([]);
       setBattleInput('');
       setGameState('post_match');
     });
@@ -1100,6 +1232,9 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       if (abortControllerRef.current) {
         abortControllerRef.current.abort();
       }
+      setArenaPreparation(null);
+      setRoomTypingIds([]);
+      setLocalRoomTypingIds([]);
     });
 
     socket.on('npcAllyAction', (data: { npcId: string; npcName: string; action: string }) => {
@@ -1129,7 +1264,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
           discoveredLocations: newDiscovered,
         };
       });
-      setWorldPlayers(data.worldPlayers || []);
+      mergeWorldPlayers(data.worldPlayers || []);
       setWorldNpcs(data.npcStates || []);
     });
 
@@ -1138,7 +1273,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     });
 
     socket.on('explorationPlayersUpdated', (players) => {
-      setWorldPlayers(players);
+      mergeWorldPlayers(players || []);
     });
 
     socket.on('explorationNpcStatesUpdated', (npcs) => {
@@ -1393,10 +1528,12 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     return () => {
       socket.off('characterSaved');
       socket.off('waitingForOpponent');
+      socket.off('arenaPreparationState');
+      socket.off('roomPlayersUpdated');
       socket.off('matchFound');
       socket.off('battleMapStateUpdated');
       socket.off('battleActionsSubmitted');
-      socket.off('opponentTyping');
+      socket.off('typingStatusUpdated');
       socket.off('playerLockedIn');
       socket.off('requestTurnResolution');
       socket.off('turnResolved');
@@ -1526,6 +1663,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     if (!inputText.trim() || isWaitingForChar) return;
     
     const sentText = inputText.trim();
+    clearTypingPresence('character');
     const newMessages = [...messages, { role: 'user' as const, text: sentText }];
     setMessages(newMessages);
     setInputText('');
@@ -1789,6 +1927,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
   const handleExplorationSend = () => {
     const action = explorationInput.trim();
     if (!action || isExplorationProcessing || isExplorationLockedIn) return;
+    clearTypingPresence('exploration');
     
     // Detect chat messages — bypass LLM and broadcast directly
     const chatMatch = action.match(/^(?:i\s+(?:say|chat|tell|shout|whisper|yell|call\s+out)|".*"$|'.*'$)/i);
@@ -1836,6 +1975,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
   };
 
   const handleExplorationUnlock = () => {
+    clearTypingPresence('exploration');
     setIsExplorationLockedIn(false);
     socket.emit('explorationUnlock');
     // Remove the last locked-in user message
@@ -1982,6 +2122,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
   handleGenerateBattleImageRef.current = handleGenerateBattleImage;
 
   const handleBattleUnlock = () => {
+    clearTypingPresence('battle');
     socket.emit('playerUnlock');
     setIsLockedIn(false);
   };
@@ -2016,6 +2157,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
   const handleSendBattleAction = () => {
     const action = battleInput.trim();
     if (!action || isLockedIn) return;
+    clearTypingPresence('battle');
 
     const socketId = socket.id;
     if (socketId) {
@@ -2026,10 +2168,6 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     setIsLockedIn(true);
     setBattleInput('');
     if (battleInputRef.current) battleInputRef.current.style.height = 'auto';
-  };
-
-  const handleTyping = () => {
-    socket.emit('typing');
   };
 
   const getThoughtTitle = (content: string) => {
@@ -2056,7 +2194,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     let charName = 'No Character';
     const currentBattlePlayer = socket.id ? players[socket.id] : undefined;
 
-    if (gameState === 'battle' && currentBattlePlayer) {
+    if ((gameState === 'battle' || gameState === 'arena_prep') && currentBattlePlayer) {
       hp = currentBattlePlayer.character.hp;
       mana = currentBattlePlayer.character.mana;
       gold = currentBattlePlayer.character.gold ?? character?.gold ?? DEFAULT_STARTING_GOLD;
@@ -2143,7 +2281,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
   };
 
   const renderBottomBar = () => {
-    if (gameState === 'battle' || gameState === 'matchmaking' || gameState === 'exploration' || gameState === 'level_select') return null;
+    if (gameState === 'battle' || gameState === 'arena_prep' || gameState === 'matchmaking' || gameState === 'exploration' || gameState === 'level_select') return null;
 
     return (
       <div className="w-full max-w-md bg-white border-t-2 border-duo-gray flex justify-around py-3 pb-safe mt-auto">
@@ -2487,6 +2625,7 @@ Be creative and concise.`;
           value={inputText}
           onChange={(e) => {
             setInputText(e.target.value);
+            updateTypingPresence('character', e.target.value);
             e.target.style.height = 'auto';
             e.target.style.height = Math.min(e.target.scrollHeight, window.innerHeight / 2) + 'px';
           }}
@@ -2554,6 +2693,147 @@ Be creative and concise.`;
       </div>
     </div>
   );
+
+  const renderArenaPreparation = () => {
+    const prepPlayers = Object.entries(players);
+    const activeTypingIds = new Set([...roomTypingIds, ...localRoomTypingIds]);
+    const remaining = arenaPreparation?.remaining ?? 0;
+    const timerLabel = `${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, '0')}`;
+    const isTweakStage = arenaPreparation?.stage === 'tweak';
+
+    return (
+      <div className="flex-1 flex flex-col bg-gray-50 overflow-hidden">
+        <div className="p-4 bg-white border-b-2 border-duo-gray space-y-3">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <div className="text-[10px] font-black uppercase tracking-[0.2em] text-duo-blue">Arena Preparation</div>
+              <h2 className="text-xl font-black text-duo-text mt-1">
+                {isTweakStage ? 'Final Rewrite Window' : 'Study The Opponents'}
+              </h2>
+              <p className="text-xs font-bold text-duo-gray-dark mt-1 max-w-[18rem]">
+                {isTweakStage
+                  ? 'You have one pass to refine your legend before the duel begins.'
+                  : 'Inspect every legend now. The rewrite window opens automatically after the preview countdown.'}
+              </p>
+            </div>
+            <div className={`rounded-2xl px-3 py-2 border text-center min-w-[88px] ${isTweakStage ? 'bg-yellow-50 text-yellow-700 border-yellow-200' : 'bg-blue-50 text-duo-blue border-blue-200'}`}>
+              <div className="text-[9px] font-black uppercase">{isTweakStage ? 'Tweak' : 'Preview'}</div>
+              <div className="text-lg font-black leading-none mt-1">{timerLabel}</div>
+            </div>
+          </div>
+          <div className="flex flex-wrap justify-center gap-5 pt-1">
+            {prepPlayers.map(([id, player]) => {
+              const isMe = id === socket.id;
+              const isTyping = !isMe && activeTypingIds.has(id);
+              return (
+                <button
+                  key={id}
+                  onClick={() => {
+                    setProfileToView(player.character.profileMarkdown);
+                    setShowProfileModal(true);
+                  }}
+                  className="flex flex-col items-center gap-2 min-w-[84px]"
+                >
+                  <div className={`relative w-20 h-20 rounded-full border-4 shadow-lg overflow-hidden ${isMe ? 'border-duo-green bg-duo-green/10' : 'border-duo-blue bg-duo-blue/10'}`}>
+                    {player.character.imageUrl ? (
+                      <img src={player.character.imageUrl} alt={player.character.name} className="w-full h-full object-cover" />
+                    ) : (
+                      <div className={`w-full h-full flex items-center justify-center text-2xl font-black ${isMe ? 'text-duo-green-dark' : 'text-duo-blue'}`}>
+                        {player.character.name.charAt(0).toUpperCase()}
+                      </div>
+                    )}
+                    {isTyping && (
+                      <div className="absolute -bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-white/95 px-2 py-1 text-duo-blue shadow-md border border-duo-blue/20">
+                        <TypingDots dotClassName="h-1.5 w-1.5" />
+                      </div>
+                    )}
+                  </div>
+                  <div className="text-center">
+                    <div className="text-xs font-black text-duo-text truncate max-w-[90px]">{isMe ? 'You' : player.character.name}</div>
+                    <div className="text-[10px] font-bold text-duo-gray-dark">Tap to inspect</div>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {!isTweakStage ? (
+          <div className="flex-1 flex flex-col items-center justify-center px-8 text-center text-duo-gray-dark">
+            <div className="w-24 h-24 rounded-full bg-duo-blue/10 text-duo-blue flex items-center justify-center mb-5">
+              <Users className="w-12 h-12" />
+            </div>
+            <h3 className="text-xl font-black text-duo-text">Avatar Review Phase</h3>
+            <p className="text-sm font-bold max-w-[22rem] mt-2">
+              Open every profile, compare strengths, and decide what needs changing before the rewrite phase begins.
+            </p>
+          </div>
+        ) : (
+          <>
+            <div className="flex-1 overflow-y-auto p-4 space-y-4">
+              {messages.map((msg, i) => {
+                if (!msg.text && msg.role === 'model') return null;
+                return (
+                  <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                    {msg.role === 'system' ? (
+                      <div className="w-full text-center text-sm font-bold text-red-500 bg-red-50 border border-red-100 rounded-lg py-2 px-4 my-2">
+                        {msg.text}
+                      </div>
+                    ) : (
+                      <div className={msg.role === 'user' ? 'chat-bubble-me' : 'chat-bubble-them'}>
+                        <div className="markdown-body">
+                          <Markdown rehypePlugins={[rehypeRaw]}>{msg.text}</Markdown>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+              {isWaitingForChar && (messages.length === 0 || messages[messages.length - 1].role === 'user' || !messages[messages.length - 1].text) && (
+                <div className="flex justify-start">
+                  <div className="chat-bubble-them flex items-center gap-2">
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    <span className="font-bold text-sm">Rewriting your legend...</span>
+                  </div>
+                </div>
+              )}
+              <div ref={chatEndRef} />
+            </div>
+            <div className="p-4 bg-white border-t-2 border-duo-gray flex gap-2">
+              <textarea
+                ref={charInputRef}
+                value={inputText}
+                onChange={(e) => {
+                  setInputText(e.target.value);
+                  updateTypingPresence('character', e.target.value);
+                  e.target.style.height = 'auto';
+                  e.target.style.height = Math.min(e.target.scrollHeight, window.innerHeight / 2) + 'px';
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    handleSendCharMessage();
+                  }
+                }}
+                placeholder="Describe exactly what you want to change before the duel starts..."
+                className="flex-1 bg-duo-gray rounded-2xl px-4 py-3 font-bold text-duo-text focus:outline-none focus:ring-2 focus:ring-duo-blue resize-none overflow-y-auto"
+                rows={1}
+                style={{ minHeight: '48px', maxHeight: '50vh' }}
+                disabled={isWaitingForChar}
+              />
+              <button
+                onClick={handleSendCharMessage}
+                disabled={isWaitingForChar || !inputText.trim()}
+                className="duo-btn duo-btn-blue px-6 flex items-center justify-center disabled:opacity-50"
+              >
+                <Send className="w-5 h-5" />
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    );
+  };
 
   const renderBattle = () => {
     return (
@@ -2728,9 +3008,10 @@ Be creative and concise.`;
             const p = players[id];
             const isMe = id === socket.id;
             const isLocked = p.lockedIn;
+            const isTyping = !isLocked && id !== socket.id && (roomTypingIds.includes(id) || localRoomTypingIds.includes(id));
             return (
               <span key={id} className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${isLocked ? 'bg-green-100 text-green-700 border-green-200' : 'bg-gray-100 text-gray-500 border-gray-200'}`}>
-                {isLocked ? '🔒' : (id !== socket.id && opponentTyping) ? '✍️' : '⏳'} {isMe ? 'You' : p.character.name}
+                {isLocked ? '🔒' : isTyping ? <TypingDots className="mx-0.5 align-middle" dotClassName="h-1.5 w-1.5" /> : '⏳'} {isMe ? 'You' : p.character.name}
               </span>
             );
           })}
@@ -2760,7 +3041,7 @@ Be creative and concise.`;
             value={battleInput}
             onChange={(e) => {
               setBattleInput(e.target.value);
-              handleTyping();
+              updateTypingPresence('battle', e.target.value);
               e.target.style.height = 'auto';
               e.target.style.height = Math.min(e.target.scrollHeight, window.innerHeight / 2) + 'px';
             }}
@@ -3278,6 +3559,7 @@ Be creative and concise.`;
                   onClick={() => {
                     const draftedAction = `attack ${p.name}`;
                     setExplorationInput(draftedAction);
+                    updateTypingPresence('exploration', draftedAction);
                     requestAnimationFrame(() => {
                       if (explorationInputRef.current) {
                         explorationInputRef.current.focus();
@@ -3289,6 +3571,7 @@ Be creative and concise.`;
                   className="text-[10px] font-bold bg-red-50 text-red-600 border border-red-200 rounded-lg px-2 py-1 hover:bg-red-100 transition-colors flex items-center gap-1"
                 >
                   ⚔️ Target {p.name}
+                  {p.typing && <TypingDots dotClassName="h-1.5 w-1.5" />}
                   {p.acting && <span className="inline-block w-1.5 h-1.5 rounded-full bg-yellow-500 animate-pulse" title="Acting..." />}
                 </button>
               ))}
@@ -3413,6 +3696,7 @@ Be creative and concise.`;
             value={explorationInput}
             onChange={(e) => {
               setExplorationInput(e.target.value);
+              updateTypingPresence('exploration', e.target.value);
               e.target.style.height = 'auto';
               e.target.style.height = Math.min(e.target.scrollHeight, window.innerHeight / 2) + 'px';
             }}
@@ -3636,6 +3920,7 @@ Be creative and concise.`;
         {gameState === 'menu' && renderMenu()}
         {gameState === 'char_creation' && renderCharCreation()}
         {gameState === 'matchmaking' && renderMatchmaking()}
+        {gameState === 'arena_prep' && renderArenaPreparation()}
         {gameState === 'battle' && renderBattle()}
         {gameState === 'post_match' && renderPostMatch()}
         {gameState === 'exploration' && renderExploration()}
