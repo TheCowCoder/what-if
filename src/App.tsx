@@ -1679,9 +1679,9 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     setExplorationInput('');
     if (explorationInputRef.current) explorationInputRef.current.style.height = 'auto';
     
-    const othersHere = worldPlayers.filter(p => p.id !== socket.id && p.locationId === explorationState.locationId);
+    const othersInWorld = worldPlayers.filter(p => p.id !== socket.id);
     const isImmediateAction = isImmediateExplorationAction(action);
-    if (othersHere.length > 0 && !isImmediateAction) {
+    if (othersInWorld.length > 0 && !isImmediateAction) {
       // Multiplayer: lock in action and wait for others
       setIsExplorationLockedIn(true);
       setExplorationLog(prev => [...prev, { role: 'user', text: `🔒 ${action}` }]);

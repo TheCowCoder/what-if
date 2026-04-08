@@ -336,38 +336,21 @@ async function startServer() {
     );
   };
 
-  const getExplorationCohort = (locationId: string) => (
-    Object.entries(explorationPlayers).filter(([, player]) => player.locationId === locationId)
-  );
-
-  const clearOrphanedExplorationLocks = () => {
-    for (const [id, player] of Object.entries(explorationPlayers)) {
-      const cohort = getExplorationCohort(player.locationId);
-      if (cohort.length <= 1) {
-        delete explorationLockedActions[id];
-      }
-    }
-  };
-
   const emitExplorationLockStatuses = () => {
-    clearOrphanedExplorationLocks();
-
-    for (const [id, player] of Object.entries(explorationPlayers)) {
-      const cohort = getExplorationCohort(player.locationId);
-      if (cohort.length <= 1) {
-        io.to(id).emit("explorationLockStatus", []);
-        continue;
-      }
-
-      io.to(id).emit(
-        "explorationLockStatus",
-        cohort.map(([peerId, peer]) => ({
-          id: peerId,
-          name: peer.character?.name || 'Unknown',
-          lockedIn: !!explorationLockedActions[peerId],
-        }))
-      );
+    const allPlayers = Object.entries(explorationPlayers);
+    if (allPlayers.length <= 1) {
+      io.to("exploration_world").emit("explorationLockStatus", []);
+      return;
     }
+
+    io.to("exploration_world").emit(
+      "explorationLockStatus",
+      allPlayers.map(([id, player]) => ({
+        id,
+        name: player.character?.name || 'Unknown',
+        lockedIn: !!explorationLockedActions[id],
+      }))
+    );
   };
 
   const getNpcOffset = (npcId: string) => {
@@ -1334,7 +1317,7 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
         recentLog: data.recentLog
       };
       
-      const allPlayers = getExplorationCohort(ep.locationId);
+      const allPlayers = Object.entries(explorationPlayers);
       emitExplorationLockStatuses();
 
       const allLockedIn = allPlayers.every(([id]) => !!explorationLockedActions[id]);
