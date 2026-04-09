@@ -990,6 +990,25 @@ export default function App() {
 
   const arenaPreparationStageRef = useRef<ArenaPreparationState['stage'] | null>(null);
   const botPreparationRewriteRoomRef = useRef<string | null>(null);
+  const headStartEnteredRef = useRef(false);
+
+  // Detect head-start entry (player skipped preview early) and show initial message
+  useEffect(() => {
+    if (gameState !== 'arena_prep' || !arenaPreparation) {
+      headStartEnteredRef.current = false;
+      return;
+    }
+    const myId = socket.id || '';
+    const isHeadStart = arenaPreparation.stage === 'preview' && !!players[myId]?.prepSkippedPreview;
+    if (isHeadStart && !headStartEnteredRef.current) {
+      headStartEnteredRef.current = true;
+      const remaining = arenaPreparation.remaining;
+      setMessages([{ role: 'model', text: `You have a ${remaining} second head start before the rewrite phase. Refine your legend now.` }]);
+    }
+    if (arenaPreparation.stage === 'tweak') {
+      headStartEnteredRef.current = false;
+    }
+  }, [gameState, arenaPreparation, players]);
 
   useEffect(() => {
     if (gameState !== 'arena_prep' || !arenaPreparation) return;
@@ -1009,9 +1028,8 @@ export default function App() {
     }
 
     setShowProfileModal(false);
-    // Only show intro message if the user wasn't already in head-start rewrite mode
+    // Preserve chat from head-start rewrite; only show intro if no messages yet
     setMessages(prev => prev.length > 0 ? prev : [{ role: 'model', text: 'You have one rewrite window before the duel. Refine your legend now.' }]);
-    setInputText('');
     setCharCreatorError(null);
     setCharCreatorRetryAttempt(0);
     clearChatStatusMessage('char-creator-retry');
@@ -1059,32 +1077,46 @@ export default function App() {
     }, 2500);
 
     const rewriteBotProfile = async () => {
-      try {
-        const aiClient = getAIClient();
-        const opponents = Object.entries(roomPlayers)
-          .filter(([id]) => id !== botId)
-          .map(([, player]) => `Opponent: ${player.character.name}\n${player.character.profileMarkdown}`)
-          .join('\n\n');
-        const response = await aiClient.models.generateContent({
-          model: settingsRef.current.botModel,
-          contents: `You are revising your dueling profile before the arena begins. Keep the same name and return markdown only.\n\nCurrent profile:\n${botPlayer.character.profileMarkdown}\n\nOpponents:\n${opponents}\n\nRefine the profile to better prepare for this duel while preserving identity and formatting.`,
-          config: {
-            temperature: 0.8,
-          },
-        });
-
-        const rewrittenProfile = response.text?.trim();
-        if (!cancelled && rewrittenProfile) {
-          rewriteSubmitted = true;
-          window.clearTimeout(previewFallbackTimeout);
-          socket.emit('characterCreated', {
-            playerId: botId,
-            ...botPlayer.character,
-            profileMarkdown: rewrittenProfile,
+      const maxRetries = 3;
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        if (cancelled || rewriteSubmitted) return;
+        try {
+          const aiClient = getAIClient();
+          const opponents = Object.entries(roomPlayers)
+            .filter(([id]) => id !== botId)
+            .map(([, player]) => `Opponent: ${player.character.name}\n${player.character.profileMarkdown}`)
+            .join('\n\n');
+          const response = await aiClient.models.generateContent({
+            model: settingsRef.current.botModel,
+            contents: `You are revising your dueling profile before the arena begins. Keep the same name and return markdown only.\n\nCurrent profile:\n${botPlayer.character.profileMarkdown}\n\nOpponents:\n${opponents}\n\nRefine the profile to better prepare for this duel while preserving identity and formatting.`,
+            config: {
+              temperature: 0.8,
+            },
           });
+
+          const rewrittenProfile = response.text?.trim();
+          if (!cancelled && !rewriteSubmitted && rewrittenProfile) {
+            rewriteSubmitted = true;
+            window.clearTimeout(previewFallbackTimeout);
+            socket.emit('characterCreated', {
+              playerId: botId,
+              ...botPlayer.character,
+              profileMarkdown: rewrittenProfile,
+            });
+          }
+          return;
+        } catch (error: any) {
+          if (cancelled || rewriteSubmitted) return;
+          const isRetryable = error?.status === 503 || error?.status === 429 || error?.message?.includes('503') || error?.message?.includes('429');
+          if (isRetryable && attempt < maxRetries) {
+            await new Promise(resolve => setTimeout(resolve, (attempt + 1) * 2000));
+            continue;
+          }
+          // Only log if we haven't already submitted via fallback
+          if (!rewriteSubmitted) {
+            console.error('Failed to rewrite bot preparation profile', error);
+          }
         }
-      } catch (error) {
-        console.error('Failed to rewrite bot preparation profile', error);
       }
 
       if (!cancelled && !rewriteSubmitted) {
@@ -2940,7 +2972,7 @@ Be creative and concise.`;
   const renderMenu = () => (
     <div className="flex-1 flex flex-col items-center p-6 gap-8 overflow-y-auto">
       <div className="text-center space-y-2">
-        <h1 className="text-3xl font-black text-duo-text tracking-tight">Arena Clash</h1>
+        <h1 className="text-3xl font-black text-duo-text tracking-tight">What If</h1>
         <p className="text-duo-gray-dark font-bold">Learn to fight. Forever.</p>
       </div>
 
@@ -3397,7 +3429,12 @@ Be creative and concise.`;
               Open every profile, find weaknesses, decide what needs changing in your profile. The 2 minute write period begins in {timerLabel}.
             </p>
             <button
-              onClick={() => socket.emit('skipArenaPreparationPreview')}
+              onClick={() => {
+                socket.emit('skipArenaPreparationPreview');
+                headStartEnteredRef.current = true;
+                setMessages([{ role: 'model', text: `You have a ${remaining} second head start before the rewrite phase. Refine your legend now.` }]);
+                setInputText('');
+              }}
               className="duo-btn duo-btn-blue mt-5 px-5 py-3"
             >
               Start rewrite now
@@ -3411,6 +3448,15 @@ Be creative and concise.`;
         ) : (
           <>
             <div className="flex-1 overflow-y-auto p-4 space-y-4">
+              {messages.length === 0 && (
+                <div className="flex justify-start">
+                  <div className="chat-bubble-them">
+                    <div className="markdown-body">
+                      <p>{isHeadStartRewrite ? 'You have a head start before the rewrite phase. Refine your legend now.' : 'You have one rewrite window before the duel. Refine your legend now.'}</p>
+                    </div>
+                  </div>
+                </div>
+              )}
               {messages.map((msg, i) => {
                 if (!msg.text && msg.role === 'model') return null;
                 return (

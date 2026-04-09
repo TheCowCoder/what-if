@@ -893,7 +893,7 @@ async function startServer() {
     if (!room?.players?.[playerId] || room.phase === 'battle') return;
 
     room.players[playerId].character = normalizedState;
-    if (room.phase === 'tweak' || room.players[playerId].prepSkippedPreview) {
+    if (room.phase === 'tweak') {
       clearTypingForSocket(playerId);
       lockArenaPreparationPlayer(roomId, playerId);
       return;
@@ -943,7 +943,7 @@ async function startServer() {
     timer.playerBonusSeconds = {};
     room.phase = 'tweak';
     for (const playerId of Object.keys(room.players)) {
-      room.players[playerId].lockedIn = !!room.players[playerId].lockedIn || !!room.players[playerId]?.character?.isNpcAlly;
+      room.players[playerId].lockedIn = !!room.players[playerId]?.character?.isNpcAlly;
       room.players[playerId].prepSkippedPreview = true;
     }
     emitRoomPlayersUpdated(roomId);
