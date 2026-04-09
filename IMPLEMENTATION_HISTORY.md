@@ -58,6 +58,7 @@ This file summarizes the most recent implemented changes so test planning can ta
 54. Incoming character sync now dedupes against stripped payload data so portrait preservation does not create an infinite selection snap-back loop.
 55. Early head-start prep lock-ins now persist when the room later enters the shared tweak phase.
 56. Bot matches now grant the bot instant rewrite access during preview so bot typing and bot lock-in can begin immediately.
+57. Bot prep typing now survives per-second prep-state refreshes instead of dropping blank before locked-in state arrives.
 
 Suggested high-priority test areas:
 

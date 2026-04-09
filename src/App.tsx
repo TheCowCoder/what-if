@@ -765,6 +765,7 @@ export default function App() {
   // Battle state
   const [roomId, setRoomId] = useState<string | null>(null);
   const [players, setPlayers] = useState<Record<string, any>>({});
+  const playersRef = useRef<Record<string, any>>({});
   const [battleMapState, setBattleMapState] = useState<BattleMapState>(EMPTY_BATTLE_MAP_STATE);
   const [arenaPreparation, setArenaPreparation] = useState<ArenaPreparationState | null>(null);
   const [battleLogs, setBattleLogs] = useState<string[]>([]);
@@ -803,6 +804,10 @@ export default function App() {
   useEffect(() => { isBotMatchRef.current = isBotMatch; }, [isBotMatch]);
   const difficultyLabels = ['Easy', 'Medium', 'Hard', 'Superintelligent'];
   const avatarSyncKeysRef = useRef<Record<string, string>>({});
+
+  useEffect(() => {
+    playersRef.current = players;
+  }, [players]);
 
   useEffect(() => {
     gameStateRef.current = gameState;
@@ -998,8 +1003,9 @@ export default function App() {
   }, [players]);
 
   useEffect(() => {
-    const botId = Object.keys(players).find(id => id.startsWith('bot_'));
-    const botPlayer = botId ? players[botId] : null;
+    const roomPlayers = playersRef.current;
+    const botId = Object.keys(roomPlayers).find(id => id.startsWith('bot_'));
+    const botPlayer = botId ? roomPlayers[botId] : null;
     const botHasRewriteAccess = !!botPlayer?.prepSkippedPreview || arenaPreparation?.stage === 'tweak';
     if (!arenaPreparation?.isBotMatch || !roomId || !botId || !botHasRewriteAccess || botPreparationRewriteRoomRef.current === roomId) return;
 
@@ -1014,7 +1020,7 @@ export default function App() {
     const rewriteBotProfile = async () => {
       try {
         const aiClient = getAIClient();
-        const opponents = Object.entries(players)
+        const opponents = Object.entries(roomPlayers)
           .filter(([id]) => id !== botId)
           .map(([, player]) => `Opponent: ${player.character.name}\n${player.character.profileMarkdown}`)
           .join('\n\n');
@@ -1051,7 +1057,7 @@ export default function App() {
       cancelled = true;
       setLocalRoomTypingIds(prev => prev.filter(id => id !== botId));
     };
-  }, [arenaPreparation?.isBotMatch, arenaPreparation?.stage, getAIClient, players, roomId]);
+  }, [arenaPreparation?.isBotMatch, arenaPreparation?.stage, getAIClient, roomId]);
 
   const generateBotAction = async (currentRoom: any) => {
     if (!currentRoom || !currentRoom.isBotMatch) return;
