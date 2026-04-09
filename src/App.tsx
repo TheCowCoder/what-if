@@ -1057,7 +1057,7 @@ export default function App() {
       cancelled = true;
       setLocalRoomTypingIds(prev => prev.filter(id => id !== botId));
     };
-  }, [arenaPreparation?.isBotMatch, arenaPreparation?.stage, getAIClient, roomId]);
+  }, [arenaPreparation?.isBotMatch, getAIClient, roomId]);
 
   const generateBotAction = async (currentRoom: any) => {
     if (!currentRoom || !currentRoom.isBotMatch) return;

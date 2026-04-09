@@ -59,6 +59,7 @@ This file summarizes the most recent implemented changes so test planning can ta
 55. Early head-start prep lock-ins now persist when the room later enters the shared tweak phase.
 56. Bot matches now grant the bot instant rewrite access during preview so bot typing and bot lock-in can begin immediately.
 57. Bot prep typing now survives per-second prep-state refreshes instead of dropping blank before locked-in state arrives.
+58. Bot prep rewrites now continue across the preview-to-tweak transition instead of getting cancelled mid-generation.
 
 Suggested high-priority test areas:
 
