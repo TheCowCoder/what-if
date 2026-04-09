@@ -23,6 +23,11 @@ body {
   font-size: 0.875rem; /* Decrease text size globally */
 }
 
+.h-safe-screen {
+  height: 100vh;
+  height: 100dvh;
+}
+
 .duo-btn {
   @apply relative rounded-2xl font-bold uppercase tracking-wider text-white transition-transform active:translate-y-1;
 }

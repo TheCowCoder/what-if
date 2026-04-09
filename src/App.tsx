@@ -530,9 +530,9 @@ export default function App() {
   const [settings, setSettings] = useState(() => {
     const defaultSettings = {
       apiKey: '',
-      charModel: 'gemini-2.5-flash',
+      charModel: 'gemini-3-flash-preview',
       explorationModel: 'gemini-3-flash-preview',
-      battleModel: 'gemini-2.5-pro',
+      battleModel: 'gemini-3-flash-preview',
       botModel: 'gemini-2.5-flash',
       unlimitedTurnTime: false,
       arenaPreviewSeconds: 15,
@@ -4531,7 +4531,7 @@ Be creative and concise.`;
   );
 
   return (
-    <div className="h-screen bg-duo-bg flex justify-center overflow-hidden">
+    <div className="h-safe-screen bg-duo-bg flex justify-center overflow-hidden">
       <div className="w-full max-w-md bg-white h-full flex flex-col relative shadow-2xl">
         {renderTopBar()}
         
