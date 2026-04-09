@@ -998,12 +998,11 @@ export default function App() {
   }, [players]);
 
   useEffect(() => {
-    if (arenaPreparation?.stage !== 'tweak' || !arenaPreparation.isBotMatch || !roomId) return;
-
     const botId = Object.keys(players).find(id => id.startsWith('bot_'));
-    if (!botId || botPreparationRewriteRoomRef.current === roomId) return;
+    const botPlayer = botId ? players[botId] : null;
+    const botHasRewriteAccess = !!botPlayer?.prepSkippedPreview || arenaPreparation?.stage === 'tweak';
+    if (!arenaPreparation?.isBotMatch || !roomId || !botId || !botHasRewriteAccess || botPreparationRewriteRoomRef.current === roomId) return;
 
-    const botPlayer = players[botId];
     if (!botPlayer?.character) return;
 
     botPreparationRewriteRoomRef.current = roomId;
@@ -3210,7 +3209,7 @@ Be creative and concise.`;
     const isPrepLockedIn = !!(socket.id && players[socket.id]?.lockedIn);
     const previewSkipVotes = arenaPreparation?.skipVotes ?? [];
     const previewParticipantCount = prepPlayers.filter(([, player]) => !player.character?.isNpcAlly).length;
-    const hasRequestedPreviewSkip = !!socket.id && previewSkipVotes.includes(socket.id);
+    const previewSkippers = previewSkipVotes.length;
 
     return (
       <div className="flex-1 flex flex-col bg-gray-50 overflow-hidden">
@@ -3291,16 +3290,18 @@ Be creative and concise.`;
             </p>
             <button
               onClick={() => socket.emit('skipArenaPreparationPreview')}
-              disabled={hasRequestedPreviewSkip}
-              className="duo-btn duo-btn-blue mt-5 px-5 py-3 disabled:opacity-60"
+              className="duo-btn duo-btn-blue mt-5 px-5 py-3"
             >
-              {hasRequestedPreviewSkip
-                ? `Rewrite unlocked (${previewSkipVotes.length}/${previewParticipantCount})`
-                : `Start rewrite now (${previewSkipVotes.length}/${previewParticipantCount})`}
+              Start rewrite now
             </button>
             <p className="text-[11px] font-bold max-w-[22rem] mt-2">
               Skipping opens your rewrite phase immediately. Once every human player has skipped, the whole room advances to the shared write stage.
             </p>
+            {previewParticipantCount > 1 && previewSkippers > 0 && (
+              <p className="text-[11px] font-bold max-w-[22rem] mt-1 text-duo-blue">
+                {previewSkippers} of {previewParticipantCount} human players already started rewriting.
+              </p>
+            )}
           </div>
         ) : (
           <>

@@ -56,6 +56,8 @@ This file summarizes the most recent implemented changes so test planning can ta
 52. The active selected character is now persisted by name so reloads prefer the user’s last explicit legend choice.
 53. Character switching no longer rewrites the full character list when the selected legend data is unchanged.
 54. Incoming character sync now dedupes against stripped payload data so portrait preservation does not create an infinite selection snap-back loop.
+55. Early head-start prep lock-ins now persist when the room later enters the shared tweak phase.
+56. Bot matches now grant the bot instant rewrite access during preview so bot typing and bot lock-in can begin immediately.
 
 Suggested high-priority test areas:
 

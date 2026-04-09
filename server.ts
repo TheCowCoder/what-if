@@ -803,7 +803,7 @@ async function startServer() {
     timer.skipVotes = [];
     room.phase = 'tweak';
     for (const playerId of Object.keys(room.players)) {
-      room.players[playerId].lockedIn = !!room.players[playerId]?.character?.isNpcAlly;
+      room.players[playerId].lockedIn = !!room.players[playerId].lockedIn || !!room.players[playerId]?.character?.isNpcAlly;
       room.players[playerId].prepSkippedPreview = true;
     }
     emitRoomPlayersUpdated(roomId);
@@ -844,7 +844,7 @@ async function startServer() {
       room.players[playerId].lockedIn = false;
       room.players[playerId].action = "";
       room.players[playerId].autoLockedThisTurn = false;
-      room.players[playerId].prepSkippedPreview = false;
+      room.players[playerId].prepSkippedPreview = !!room.isBotMatch && playerId.startsWith('bot_');
     }
     arenaPreparationTimers[roomId] = {
       interval: null as any,
@@ -2208,7 +2208,7 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
       if (!roomId) return;
 
       const room = rooms[roomId];
-      if (!room?.isBotMatch || room.phase !== 'tweak') return;
+      if (!room?.isBotMatch || (room.phase !== 'tweak' && !room.players?.[data.botId]?.prepSkippedPreview)) return;
 
       const botPlayer = room.players[data.botId];
       if (!botPlayer?.character || typeof data.profileMarkdown !== 'string' || !data.profileMarkdown.trim()) return;
