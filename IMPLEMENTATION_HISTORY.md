@@ -62,6 +62,7 @@ This file summarizes the most recent implemented changes so test planning can ta
 58. Bot prep rewrites now continue across the preview-to-tweak transition instead of getting cancelled mid-generation.
 59. Bot prep now uses a short preview-phase fallback timeout so slow rewrites still lock in during preview.
 60. Arena prep now starts the match immediately once every rewrite-capable participant is locked in, even if the room is still in preview.
+61. Bot prep saves and bot combat actions now route through the same shared prep-save and player-action helpers used by human PvP flows.
 
 Suggested high-priority test areas:
 

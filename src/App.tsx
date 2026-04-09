@@ -1019,9 +1019,9 @@ export default function App() {
     const previewFallbackTimeout = window.setTimeout(() => {
       if (cancelled || rewriteSubmitted) return;
       rewriteSubmitted = true;
-      socket.emit('updateBotPreparationProfile', {
-        roomId,
-        botId,
+      socket.emit('characterCreated', {
+        playerId: botId,
+        ...botPlayer.character,
         profileMarkdown: botPlayer.character.profileMarkdown,
       });
     }, 2500);
@@ -1045,7 +1045,11 @@ export default function App() {
         if (!cancelled && rewrittenProfile) {
           rewriteSubmitted = true;
           window.clearTimeout(previewFallbackTimeout);
-          socket.emit('updateBotPreparationProfile', { roomId, botId, profileMarkdown: rewrittenProfile });
+          socket.emit('characterCreated', {
+            playerId: botId,
+            ...botPlayer.character,
+            profileMarkdown: rewrittenProfile,
+          });
         }
       } catch (error) {
         console.error('Failed to rewrite bot preparation profile', error);
@@ -1054,9 +1058,9 @@ export default function App() {
       if (!cancelled && !rewriteSubmitted) {
         rewriteSubmitted = true;
         window.clearTimeout(previewFallbackTimeout);
-        socket.emit('updateBotPreparationProfile', {
-          roomId,
-          botId,
+        socket.emit('characterCreated', {
+          playerId: botId,
+          ...botPlayer.character,
           profileMarkdown: botPlayer.character.profileMarkdown,
         });
       }
@@ -1118,11 +1122,14 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       });
       
       const action = botRes.text || "I do nothing.";
-      socket.emit('botAction', { action });
+      socket.emit('playerAction', { playerId: botId, action });
     } catch (error) {
       console.error("Error generating bot action:", error);
       // Fallback: send a generic attack so the battle doesn't stall
-      socket.emit('botAction', { action: `${currentRoom.players[botId!]?.character?.name || 'The enemy'} attacks with a basic strike!` });
+      socket.emit('playerAction', {
+        playerId: botId,
+        action: `${currentRoom.players[botId!]?.character?.name || 'The enemy'} attacks with a basic strike!`,
+      });
     } finally {
       setLocalRoomTypingIds(prev => prev.filter(id => id !== botId));
     }

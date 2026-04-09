@@ -794,6 +794,54 @@ async function startServer() {
     maybeAdvanceArenaPreparation(roomId);
   };
 
+  const resolveControlledRoomPlayerId = (room: any, requesterId: string, requestedPlayerId?: string) => {
+    if (!requestedPlayerId || requestedPlayerId === requesterId) return requesterId;
+    if (!room?.isBotMatch || room.host !== requesterId || !room.players?.[requestedPlayerId]) return null;
+    if (requestedPlayerId.startsWith('bot_')) return requestedPlayerId;
+    return null;
+  };
+
+  const applyPreparationCharacterUpdate = (roomId: string, playerId: string, normalizedState: any) => {
+    const room = rooms[roomId];
+    if (!room?.players?.[playerId] || room.phase === 'battle') return;
+
+    room.players[playerId].character = normalizedState;
+    if (room.phase === 'tweak' || room.players[playerId].prepSkippedPreview) {
+      clearTypingForSocket(playerId);
+      lockArenaPreparationPlayer(roomId, playerId);
+      return;
+    }
+
+    emitRoomPlayersUpdated(roomId);
+  };
+
+  const applyPlayerLockedAction = (roomId: string, playerId: string, actionText: string, options?: { emitNpcAction?: boolean }) => {
+    const room = rooms[roomId];
+    if (!room?.players?.[playerId]) return;
+
+    clearTypingForSocket(playerId);
+    room.players[playerId].lockedIn = true;
+    room.players[playerId].autoLockedThisTurn = false;
+    room.players[playerId].action = actionText;
+    io.to(roomId).emit("playerLockedIn", playerId);
+
+    if (options?.emitNpcAction) {
+      io.to(roomId).emit("npcAllyAction", {
+        npcId: playerId,
+        npcName: room.players[playerId].character?.name || 'NPC Ally',
+        action: actionText,
+      });
+    }
+
+    const playerIds = Object.keys(room.players);
+    const allLockedIn = playerIds.every((id) => room.players[id].lockedIn);
+    if (allLockedIn) {
+      clearRoomTimer(roomId);
+      emitBattleActionsSubmitted(roomId, room);
+      io.to(room.host).emit("requestTurnResolution", room);
+    }
+  };
+
   const startArenaPreparationTweakStage = (roomId: string) => {
     const room = rooms[roomId];
     const timer = arenaPreparationTimers[roomId];
@@ -1597,24 +1645,35 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
     console.log("User connected:", socket.id);
 
     socket.on("characterCreated", (state) => {
-      const normalizedState = { ...state, gold: typeof state?.gold === 'number' ? state.gold : 25 };
-      players[socket.id] = { ...players[socket.id], character: normalizedState };
-      if (explorationPlayers[socket.id]) {
-        explorationPlayers[socket.id].character = normalizedState;
-        emitExplorationPlayersUpdated();
-      }
       const roomId = players[socket.id]?.room;
-      if (roomId && rooms[roomId]?.players?.[socket.id] && rooms[roomId].phase !== 'battle') {
-        rooms[roomId].players[socket.id].character = normalizedState;
-        if (rooms[roomId].phase === 'tweak' || rooms[roomId].players[socket.id].prepSkippedPreview) {
-          clearTypingForSocket(socket.id);
-          lockArenaPreparationPlayer(roomId, socket.id);
-        } else {
-          emitRoomPlayersUpdated(roomId);
+      const requestedPlayerId = typeof state?.playerId === 'string' ? state.playerId : socket.id;
+      const normalizedState = { ...state, gold: typeof state?.gold === 'number' ? state.gold : 25 };
+      delete normalizedState.playerId;
+
+      const room = roomId ? rooms[roomId] : null;
+      const targetPlayerId = room
+        ? resolveControlledRoomPlayerId(room, socket.id, requestedPlayerId)
+        : requestedPlayerId === socket.id
+          ? socket.id
+          : null;
+      if (!targetPlayerId) return;
+
+      if (targetPlayerId === socket.id) {
+        players[socket.id] = { ...players[socket.id], character: normalizedState };
+        if (explorationPlayers[socket.id]) {
+          explorationPlayers[socket.id].character = normalizedState;
+          emitExplorationPlayersUpdated();
         }
       }
-      socket.emit("characterSaved", normalizedState);
-      socket.emit("characterSynced");
+
+      if (roomId && rooms[roomId]?.players?.[targetPlayerId]) {
+        applyPreparationCharacterUpdate(roomId, targetPlayerId, normalizedState);
+      }
+
+      if (targetPlayerId === socket.id) {
+        socket.emit("characterSaved", normalizedState);
+        socket.emit("characterSynced");
+      }
     });
 
     // Exploration events
@@ -2214,8 +2273,10 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
       const botPlayer = room.players[data.botId];
       if (!botPlayer?.character || typeof data.profileMarkdown !== 'string' || !data.profileMarkdown.trim()) return;
 
-      botPlayer.character.profileMarkdown = data.profileMarkdown.trim();
-      lockArenaPreparationPlayer(roomId, data.botId);
+      applyPreparationCharacterUpdate(roomId, data.botId, {
+        ...botPlayer.character,
+        profileMarkdown: data.profileMarkdown.trim(),
+      });
     });
 
     socket.on("botAction", (data) => {
@@ -2225,54 +2286,54 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
       if (!room || !room.isBotMatch) return;
 
       const botId = `bot_${socket.id}`;
-      room.players[botId].lockedIn = true;
-      room.players[botId].autoLockedThisTurn = false;
-      room.players[botId].action = data.action;
-      io.to(roomId).emit("playerLockedIn", botId);
+      applyPlayerLockedAction(roomId, botId, data.action);
 
       // Auto-lock NPC allies with auto-generated actions
       const npcAllyIds = room.npcAllyIds || [];
       for (const npcId of npcAllyIds) {
         if (room.players[npcId] && !room.players[npcId].lockedIn) {
           const npcChar = room.players[npcId].character;
-          room.players[npcId].lockedIn = true;
-          room.players[npcId].autoLockedThisTurn = false;
-          room.players[npcId].action = data.npcActions?.[npcId] || `${npcChar.name} attacks the enemy with their signature ability.`;
-          io.to(roomId).emit("playerLockedIn", npcId);
-          io.to(roomId).emit("npcAllyAction", { npcId, npcName: npcChar.name, action: room.players[npcId].action });
+          applyPlayerLockedAction(
+            roomId,
+            npcId,
+            data.npcActions?.[npcId] || `${npcChar.name} attacks the enemy with their signature ability.`,
+            { emitNpcAction: true }
+          );
         }
-      }
-
-      const playerIds = Object.keys(room.players);
-      const allLockedIn = playerIds.every((id) => room.players[id].lockedIn);
-      if (allLockedIn) {
-        clearRoomTimer(roomId);
-        emitBattleActionsSubmitted(roomId, room);
-        io.to(room.host).emit("requestTurnResolution", room);
       }
     });
 
-    socket.on("playerAction", (actionText) => {
+    socket.on("playerAction", (payload) => {
       const roomId = players[socket.id]?.room;
       if (!roomId) return;
 
       const room = rooms[roomId];
       if (!room) return;
 
-      clearTypingForSocket(socket.id);
-      room.players[socket.id].lockedIn = true;
-  room.players[socket.id].autoLockedThisTurn = false;
-      room.players[socket.id].action = actionText;
-      io.to(roomId).emit("playerLockedIn", socket.id);
+      const actionText = typeof payload === 'string' ? payload : payload?.action;
+      if (typeof actionText !== 'string' || !actionText.trim()) return;
 
-      const playerIds = Object.keys(room.players);
-      const allLockedIn = playerIds.every((id) => room.players[id].lockedIn);
+      const requestedPlayerId = typeof payload === 'object' && typeof payload?.playerId === 'string'
+        ? payload.playerId
+        : socket.id;
+      const targetPlayerId = resolveControlledRoomPlayerId(room, socket.id, requestedPlayerId);
+      if (!targetPlayerId) return;
 
-      if (allLockedIn) {
-        clearRoomTimer(roomId);
-        // Delegate turn resolution to the host client
-        emitBattleActionsSubmitted(roomId, room);
-        io.to(room.host).emit("requestTurnResolution", room);
+      applyPlayerLockedAction(roomId, targetPlayerId, actionText.trim());
+
+      if (room.isBotMatch && targetPlayerId.startsWith('bot_')) {
+        const npcAllyIds = room.npcAllyIds || [];
+        for (const npcId of npcAllyIds) {
+          if (room.players[npcId] && !room.players[npcId].lockedIn) {
+            const npcChar = room.players[npcId].character;
+            applyPlayerLockedAction(
+              roomId,
+              npcId,
+              payload?.npcActions?.[npcId] || `${npcChar.name} attacks the enemy with their signature ability.`,
+              { emitNpcAction: true }
+            );
+          }
+        }
       }
     });
 
