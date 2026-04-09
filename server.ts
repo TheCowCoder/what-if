@@ -771,7 +771,7 @@ async function startServer() {
 
   const maybeAdvanceArenaPreparation = (roomId: string) => {
     const room = rooms[roomId];
-    if (!room || room.phase !== 'tweak') return;
+    if (!room || (room.phase !== 'preview' && room.phase !== 'tweak')) return;
 
     const participantIds = getArenaPreparationParticipantIds(room);
     if (participantIds.length === 0) {
@@ -779,8 +779,9 @@ async function startServer() {
       return;
     }
 
+    const allHaveRewriteAccess = participantIds.every(playerId => room.phase === 'tweak' || !!room.players[playerId]?.prepSkippedPreview);
     const allLockedIn = participantIds.every(playerId => !!room.players[playerId]?.lockedIn);
-    if (allLockedIn) {
+    if (allHaveRewriteAccess && allLockedIn) {
       startBattleRoom(roomId);
     }
   };
