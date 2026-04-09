@@ -249,6 +249,36 @@ async function startServer() {
     }
   });
 
+  // Global game settings (shared across all players)
+  app.get("/api/settings", async (req, res) => {
+    if (!db) return res.json({});
+    try {
+      const settings = await db.collection("settings").findOne({ _id: "global" as any });
+      res.json(settings?.data || {});
+    } catch (e) {
+      res.json({});
+    }
+  });
+
+  app.post("/api/settings", authenticateToken, async (req: any, res) => {
+    if (!db) return res.status(503).json({ error: "Database not available" });
+    try {
+      const allowedKeys = ['unlimitedTurnTime', 'arenaPreviewSeconds', 'arenaTweakSeconds'];
+      const data: Record<string, any> = {};
+      for (const key of allowedKeys) {
+        if (req.body[key] !== undefined) data[key] = req.body[key];
+      }
+      await db.collection("settings").updateOne(
+        { _id: "global" as any },
+        { $set: { data, updatedAt: new Date() } },
+        { upsert: true }
+      );
+      res.json({ success: true });
+    } catch (e) {
+      res.status(500).json({ error: "Failed to save settings" });
+    }
+  });
+
   // Socket.io logic
   interface QueuePlayer {
     id: string;

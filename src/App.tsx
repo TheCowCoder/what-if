@@ -565,6 +565,18 @@ export default function App() {
     // Only persist non-model settings to localStorage — models always use current defaults
     const { charModel, explorationModel, battleModel, botModel, ...persistedSettings } = settings;
     localStorage.setItem('duo_settings', JSON.stringify(persistedSettings));
+    // Sync debug settings to server for all players
+    if (authToken) {
+      fetch(`${BACKEND_URL}/api/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` },
+        body: JSON.stringify({
+          unlimitedTurnTime: settings.unlimitedTurnTime,
+          arenaPreviewSeconds: settings.arenaPreviewSeconds,
+          arenaTweakSeconds: settings.arenaTweakSeconds,
+        }),
+      }).catch(() => {});
+    }
   }, [settings]);
 
   useEffect(() => {
@@ -2053,9 +2065,20 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     };
   }, []);
 
-  // Check DB availability and load cloud characters on auth
+  // Check DB availability and load global settings + cloud characters on auth
   useEffect(() => {
     fetch(`${BACKEND_URL}/api/health`).then(r => r.json()).then(d => setDbAvailable(!!d.dbConnected)).catch(() => {});
+    // Load shared debug settings from server
+    fetch(`${BACKEND_URL}/api/settings`).then(r => r.json()).then(data => {
+      if (data && typeof data === 'object') {
+        setSettings(prev => ({
+          ...prev,
+          ...(typeof data.unlimitedTurnTime === 'boolean' ? { unlimitedTurnTime: data.unlimitedTurnTime } : {}),
+          ...(typeof data.arenaPreviewSeconds === 'number' ? { arenaPreviewSeconds: data.arenaPreviewSeconds } : {}),
+          ...(typeof data.arenaTweakSeconds === 'number' ? { arenaTweakSeconds: data.arenaTweakSeconds } : {}),
+        }));
+      }
+    }).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -3973,13 +3996,24 @@ Be creative and concise.`;
               }}
               onTouchMove={(e) => {
                 if (e.touches.length === 2) {
+                  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                  const centerX = (e.touches[0].clientX + e.touches[1].clientX) / 2 - rect.left;
+                  const centerY = (e.touches[0].clientY + e.touches[1].clientY) / 2 - rect.top;
                   const dx = e.touches[0].clientX - e.touches[1].clientX;
                   const dy = e.touches[0].clientY - e.touches[1].clientY;
                   const newDist = Math.hypot(dx, dy);
                   const oldDist = mapPinchRef.current.distance;
                   if (oldDist > 0) {
-                    const scale = newDist / oldDist;
-                    setMapZoom(z => Math.min(5, Math.max(0.5, z * scale)));
+                    const scaleFactor = newDist / oldDist;
+                    setMapZoom(z => {
+                      const newZoom = Math.min(5, Math.max(0.5, z * scaleFactor));
+                      const actualScale = newZoom / z;
+                      setMapPan(p => ({
+                        x: centerX - actualScale * (centerX - p.x),
+                        y: centerY - actualScale * (centerY - p.y)
+                      }));
+                      return newZoom;
+                    });
                   }
                   mapPinchRef.current.distance = newDist;
                 }
