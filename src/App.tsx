@@ -1016,6 +1016,15 @@ export default function App() {
 
     let cancelled = false;
     let rewriteSubmitted = false;
+    const previewFallbackTimeout = window.setTimeout(() => {
+      if (cancelled || rewriteSubmitted) return;
+      rewriteSubmitted = true;
+      socket.emit('updateBotPreparationProfile', {
+        roomId,
+        botId,
+        profileMarkdown: botPlayer.character.profileMarkdown,
+      });
+    }, 2500);
 
     const rewriteBotProfile = async () => {
       try {
@@ -1035,6 +1044,7 @@ export default function App() {
         const rewrittenProfile = response.text?.trim();
         if (!cancelled && rewrittenProfile) {
           rewriteSubmitted = true;
+          window.clearTimeout(previewFallbackTimeout);
           socket.emit('updateBotPreparationProfile', { roomId, botId, profileMarkdown: rewrittenProfile });
         }
       } catch (error) {
@@ -1043,6 +1053,7 @@ export default function App() {
 
       if (!cancelled && !rewriteSubmitted) {
         rewriteSubmitted = true;
+        window.clearTimeout(previewFallbackTimeout);
         socket.emit('updateBotPreparationProfile', {
           roomId,
           botId,
@@ -1055,6 +1066,7 @@ export default function App() {
 
     return () => {
       cancelled = true;
+      window.clearTimeout(previewFallbackTimeout);
       setLocalRoomTypingIds(prev => prev.filter(id => id !== botId));
     };
   }, [arenaPreparation?.isBotMatch, getAIClient, roomId]);
