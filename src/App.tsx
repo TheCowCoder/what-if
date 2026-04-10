@@ -578,6 +578,8 @@ export default function App() {
   const characterRef = useRef<Character | null>(null);
   const activeCharacterNameRef = useRef<string | null>(localStorage.getItem('duo_active_character_name'));
   
+  // Track whether localStorage had saved debug durations — if so, skip server overwrite
+  const hadLocalDurations = useRef(false);
   const [settings, setSettings] = useState(() => {
     const defaultSettings = {
       apiKey: '',
@@ -599,7 +601,10 @@ export default function App() {
         delete parsed.explorationModel;
         delete parsed.battleModel;
         delete parsed.botModel;
-        
+        // If localStorage has any duration keys, mark as authoritative
+        if (parsed.arenaPreviewSeconds !== undefined || parsed.arenaTweakSeconds !== undefined || parsed.battleTurnSeconds !== undefined || parsed.unlimitedTurnTime !== undefined) {
+          hadLocalDurations.current = true;
+        }
         return { ...defaultSettings, ...parsed };
       } catch (e) {
         return defaultSettings;
@@ -2468,9 +2473,10 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
   // Check DB availability and load global settings + cloud characters on auth
   useEffect(() => {
     fetch(`${BACKEND_URL}/api/health`).then(r => r.json()).then(d => setDbAvailable(!!d.dbConnected)).catch(() => {});
-    // Load shared debug settings from server
+    // Load shared debug settings from server — only if localStorage didn't already have durations
+    // (localStorage is authoritative when present; server is just a cross-device sync fallback)
     fetch(`${BACKEND_URL}/api/settings`).then(r => r.json()).then(data => {
-      if (data && typeof data === 'object') {
+      if (data && typeof data === 'object' && !hadLocalDurations.current) {
         setSettings(prev => ({
           ...prev,
           ...(typeof data.unlimitedTurnTime === 'boolean' ? { unlimitedTurnTime: data.unlimitedTurnTime } : {}),
