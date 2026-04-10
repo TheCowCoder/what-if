@@ -777,8 +777,8 @@ export default function App() {
   const [showFullMap, setShowFullMap] = useState(false);
   const [mapZoom, setMapZoom] = useState(1);
   const [mapPan, setMapPan] = useState({ x: 0, y: 0 });
-  const mapDragRef = useRef<{ dragging: boolean; lastX: number; lastY: number }>({ dragging: false, lastX: 0, lastY: 0 });
-  const mapPinchRef = useRef<{ distance: number }>({ distance: 0 });
+  const mapDragRef = useRef<{ dragging: boolean; pointerId: number; lastX: number; lastY: number }>({ dragging: false, pointerId: -1, lastX: 0, lastY: 0 });
+  const mapPinchRef = useRef<{ distance: number; centerX: number; centerY: number }>({ distance: 0, centerX: 0, centerY: 0 });
   const [showInventory, setShowInventory] = useState(false);
   const [showCharImage, setShowCharImage] = useState(false);
   const [isGeneratingCharImage, setIsGeneratingCharImage] = useState(false);
@@ -4777,47 +4777,62 @@ Be creative and concise.`;
                 }));
               }}
               onPointerDown={(e) => {
-                mapDragRef.current = { dragging: true, lastX: e.clientX, lastY: e.clientY };
+                if (mapDragRef.current.dragging) return; // ignore second finger
+                mapDragRef.current = { dragging: true, pointerId: e.pointerId, lastX: e.clientX, lastY: e.clientY };
                 (e.target as HTMLElement).setPointerCapture(e.pointerId);
               }}
               onPointerMove={(e) => {
-                if (!mapDragRef.current.dragging) return;
+                if (!mapDragRef.current.dragging || e.pointerId !== mapDragRef.current.pointerId) return;
                 const dx = e.clientX - mapDragRef.current.lastX;
                 const dy = e.clientY - mapDragRef.current.lastY;
                 mapDragRef.current.lastX = e.clientX;
                 mapDragRef.current.lastY = e.clientY;
                 setMapPan(p => ({ x: p.x + dx, y: p.y + dy }));
               }}
-              onPointerUp={() => { mapDragRef.current.dragging = false; }}
+              onPointerUp={(e) => {
+                if (e.pointerId === mapDragRef.current.pointerId) {
+                  mapDragRef.current.dragging = false;
+                  mapDragRef.current.pointerId = -1;
+                }
+              }}
               onTouchStart={(e) => {
                 if (e.touches.length === 2) {
+                  // Stop single-finger drag when pinch starts
+                  mapDragRef.current.dragging = false;
+                  mapDragRef.current.pointerId = -1;
                   const dx = e.touches[0].clientX - e.touches[1].clientX;
                   const dy = e.touches[0].clientY - e.touches[1].clientY;
-                  mapPinchRef.current.distance = Math.hypot(dx, dy);
+                  const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+                  const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+                  mapPinchRef.current = { distance: Math.hypot(dx, dy), centerX: cx, centerY: cy };
                 }
               }}
               onTouchMove={(e) => {
                 if (e.touches.length === 2) {
                   const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                  const centerX = (e.touches[0].clientX + e.touches[1].clientX) / 2 - rect.left;
-                  const centerY = (e.touches[0].clientY + e.touches[1].clientY) / 2 - rect.top;
+                  const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+                  const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+                  const centerX = cx - rect.left;
+                  const centerY = cy - rect.top;
                   const dx = e.touches[0].clientX - e.touches[1].clientX;
                   const dy = e.touches[0].clientY - e.touches[1].clientY;
                   const newDist = Math.hypot(dx, dy);
                   const oldDist = mapPinchRef.current.distance;
+                  const panDx = cx - mapPinchRef.current.centerX;
+                  const panDy = cy - mapPinchRef.current.centerY;
                   if (oldDist > 0) {
                     const scaleFactor = newDist / oldDist;
                     setMapZoom(z => {
                       const newZoom = Math.min(5, Math.max(0.5, z * scaleFactor));
                       const actualScale = newZoom / z;
                       setMapPan(p => ({
-                        x: centerX - actualScale * (centerX - p.x),
-                        y: centerY - actualScale * (centerY - p.y)
+                        x: centerX - actualScale * (centerX - p.x) + panDx,
+                        y: centerY - actualScale * (centerY - p.y) + panDy,
                       }));
                       return newZoom;
                     });
                   }
-                  mapPinchRef.current.distance = newDist;
+                  mapPinchRef.current = { distance: newDist, centerX: cx, centerY: cy };
                 }
               }}
             >
