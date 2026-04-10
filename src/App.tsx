@@ -746,6 +746,7 @@ export default function App() {
   const [charCreatorRetryAttempt, setCharCreatorRetryAttempt] = useState(0);
   const [charCreatorError, setCharCreatorError] = useState<string | null>(null);
   const charAbortRef = useRef<AbortController | null>(null);
+  const charGenerationIdRef = useRef(0);
   const chatEndRef = useRef<HTMLDivElement>(null);
 
   // World & Exploration state
@@ -1114,6 +1115,7 @@ export default function App() {
       setMessages([]);
       setInputText('');
       setIsWaitingForChar(false);
+      charGenerationIdRef.current++;
       if (charAbortRef.current) { charAbortRef.current.abort(); charAbortRef.current = null; }
       setCharCreatorError(null);
       setCharCreatorRetryAttempt(0);
@@ -1126,6 +1128,7 @@ export default function App() {
     // Preserve chat from head-start rewrite; only show intro if no messages yet
     setMessages(prev => prev.length > 0 ? prev : [{ role: 'model', text: 'You have one rewrite window before the duel. Refine your legend now.' }]);
     setIsWaitingForChar(false);
+    charGenerationIdRef.current++;
     if (charAbortRef.current) { charAbortRef.current.abort(); charAbortRef.current = null; }
     setCharCreatorError(null);
     setCharCreatorRetryAttempt(0);
@@ -1398,6 +1401,12 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       setExplorationRetryAttempt(0);
       setExplorationError(null);
       activeExplorationStreamIdRef.current = null;
+      // Cancel any lingering char creator request from the prep phase
+      charGenerationIdRef.current++;
+      if (charAbortRef.current) { charAbortRef.current.abort(); charAbortRef.current = null; }
+      setIsWaitingForChar(false);
+      setCharCreatorError(null);
+      setCharCreatorRetryAttempt(0);
       socket.emit('explorationActing', { acting: false });
       if (data.isPvpExploration) setExplorationCombatReturn(true);
       setGameState('battle');
@@ -2537,9 +2546,14 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       },
     };
 
+    const MAX_CHAR_RETRIES = 4;
     let attempts = 0;
+    const myGenerationId = ++charGenerationIdRef.current;
 
     while (true) {
+      // Bail out if the game state moved on (e.g. arena phase changed)
+      if (charGenerationIdRef.current !== myGenerationId) break;
+
       setCharCreatorError(null);
       setCharCreatorRetryAttempt(attempts);
 
@@ -2558,10 +2572,12 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         // Add a placeholder for the model's response
         setMessages(prev => [...prev, { role: 'model', text: "" }]);
 
-        // Stream with chunk-level timeout (45s between chunks)
+        // Stream with chunk-level timeout (45s between chunks).
+        // Start the timer NOW so there is a timeout before the first chunk too.
         const CHUNK_TIMEOUT_MS = 45_000;
         let chunkTimer: ReturnType<typeof setTimeout> | null = null;
         const clearChunkTimer = () => { if (chunkTimer) { clearTimeout(chunkTimer); chunkTimer = null; } };
+        chunkTimer = setTimeout(() => abortController.abort(), CHUNK_TIMEOUT_MS);
         
         try {
           for await (const chunk of responseStream) {
@@ -2628,11 +2644,14 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       } catch (error: any) {
         console.error("Error creating character:", error);
 
+        // If externally cancelled (phase change, new generation), bail silently
+        if (charGenerationIdRef.current !== myGenerationId) break;
+
         // Treat abort (timeout) as retryable
         const isAbort = error?.name === 'AbortError' || error?.message === 'Aborted';
         const errorInfo = classifyAIError(error);
 
-        if (errorInfo.retryable || isAbort) {
+        if ((errorInfo.retryable || isAbort) && attempts < MAX_CHAR_RETRIES) {
           // Remove the empty model placeholder from failed attempt
           setMessages(prev => {
             const newMsgs = [...prev];
@@ -2650,7 +2669,9 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
           continue;
         }
 
-        const formattedError = formatAIError(errorInfo);
+        const formattedError = (errorInfo.retryable || isAbort)
+          ? `Model unavailable after ${attempts + 1} attempts. Tap Send to try again.`
+          : formatAIError(errorInfo);
         const errorMsg = `[SYSTEM ERROR]: Failed to generate response using model ${settingsRef.current.charModel}. ${formattedError}`;
         setMessages(prev => {
           const newMsgs = [...prev];
@@ -2661,12 +2682,15 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         });
         setCharCreatorRetryAttempt(0);
         setCharCreatorError(formattedError);
-        upsertChatStatusMessage('char-creator-retry', `⚠️ Character creator error: ${formattedError}`);
+        upsertChatStatusMessage('char-creator-retry', `⚠️ ${formattedError}`);
         break;
       }
     }
 
-    setIsWaitingForChar(false);
+    // Only touch UI state if we still own this generation
+    if (charGenerationIdRef.current === myGenerationId) {
+      setIsWaitingForChar(false);
+    }
   };
 
   // ============ EXPLORATION HANDLERS ============
