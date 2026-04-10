@@ -745,6 +745,7 @@ export default function App() {
   const [isWaitingForChar, setIsWaitingForChar] = useState(false);
   const [charCreatorRetryAttempt, setCharCreatorRetryAttempt] = useState(0);
   const [charCreatorError, setCharCreatorError] = useState<string | null>(null);
+  const charAbortRef = useRef<AbortController | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
 
   // World & Exploration state
@@ -1113,6 +1114,7 @@ export default function App() {
       setMessages([]);
       setInputText('');
       setIsWaitingForChar(false);
+      if (charAbortRef.current) { charAbortRef.current.abort(); charAbortRef.current = null; }
       setCharCreatorError(null);
       setCharCreatorRetryAttempt(0);
       clearChatStatusMessage('char-creator-retry');
@@ -1123,6 +1125,8 @@ export default function App() {
     setShowProfileModal(false);
     // Preserve chat from head-start rewrite; only show intro if no messages yet
     setMessages(prev => prev.length > 0 ? prev : [{ role: 'model', text: 'You have one rewrite window before the duel. Refine your legend now.' }]);
+    setIsWaitingForChar(false);
+    if (charAbortRef.current) { charAbortRef.current.abort(); charAbortRef.current = null; }
     setCharCreatorError(null);
     setCharCreatorRetryAttempt(0);
     clearChatStatusMessage('char-creator-retry');
@@ -2536,6 +2540,11 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       setCharCreatorError(null);
       setCharCreatorRetryAttempt(attempts);
 
+      // Abort any previous request
+      if (charAbortRef.current) charAbortRef.current.abort();
+      const abortController = new AbortController();
+      charAbortRef.current = abortController;
+
       try {
         const responseStream = await aiClient.models.generateContentStream(charApiConfig);
         
@@ -2545,28 +2554,41 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         
         // Add a placeholder for the model's response
         setMessages(prev => [...prev, { role: 'model', text: "" }]);
+
+        // Stream with chunk-level timeout (45s between chunks)
+        const CHUNK_TIMEOUT_MS = 45_000;
+        let chunkTimer: ReturnType<typeof setTimeout> | null = null;
+        const clearChunkTimer = () => { if (chunkTimer) { clearTimeout(chunkTimer); chunkTimer = null; } };
         
-        for await (const chunk of responseStream) {
-          const parts = chunk.candidates?.[0]?.content?.parts || [];
-          for (const part of parts) {
-            if (part.functionCall) {
-              toolCallData = part.functionCall;
-            } else if ((part as any).thought) {
-              // Skip thought parts
-            } else {
-              fullText += (part as any).text || "";
+        try {
+          for await (const chunk of responseStream) {
+            if (abortController.signal.aborted) throw new Error('Aborted');
+            clearChunkTimer();
+            chunkTimer = setTimeout(() => abortController.abort(), CHUNK_TIMEOUT_MS);
+
+            const parts = chunk.candidates?.[0]?.content?.parts || [];
+            for (const part of parts) {
+              if (part.functionCall) {
+                toolCallData = part.functionCall;
+              } else if ((part as any).thought) {
+                // Skip thought parts
+              } else {
+                fullText += (part as any).text || "";
+              }
+            }
+            
+            const displayText = fullText.trim();
+            if (displayText !== currentModelMessage) {
+              currentModelMessage = displayText;
+              setMessages(prev => {
+                const newMsgs = [...prev];
+                newMsgs[newMsgs.length - 1] = { role: 'model', text: displayText };
+                return newMsgs;
+              });
             }
           }
-          
-          const displayText = fullText.trim();
-          if (displayText !== currentModelMessage) {
-            currentModelMessage = displayText;
-            setMessages(prev => {
-              const newMsgs = [...prev];
-              newMsgs[newMsgs.length - 1] = { role: 'model', text: displayText };
-              return newMsgs;
-            });
-          }
+        } finally {
+          clearChunkTimer();
         }
         
         // Handle tool call (native function calling)
@@ -2603,9 +2625,11 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       } catch (error: any) {
         console.error("Error creating character:", error);
 
+        // Treat abort (timeout) as retryable
+        const isAbort = error?.name === 'AbortError' || error?.message === 'Aborted';
         const errorInfo = classifyAIError(error);
 
-        if (errorInfo.retryable) {
+        if (errorInfo.retryable || isAbort) {
           // Remove the empty model placeholder from failed attempt
           setMessages(prev => {
             const newMsgs = [...prev];
@@ -2615,6 +2639,13 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
             return newMsgs;
           });
           attempts++;
+          if (attempts >= 5) {
+            const errorMsg = `[SYSTEM ERROR]: Failed after ${attempts} attempts. Please try again.`;
+            setMessages(prev => [...prev.filter(m => m.text), { role: 'system', text: errorMsg }]);
+            setCharCreatorRetryAttempt(0);
+            setCharCreatorError(errorMsg);
+            break;
+          }
           const delay = getAIRetryDelaySeconds(attempts);
           setCharCreatorRetryAttempt(attempts);
           setCharCreatorError(`Waiting for model (${attempts})...`);
