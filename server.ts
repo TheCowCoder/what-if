@@ -1594,6 +1594,7 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
       model,
       contents: prompt,
       config: {
+        abortSignal,
         systemInstruction: sysPrompt,
         temperature: 0.8,
         thinkingConfig: { includeThoughts: true },

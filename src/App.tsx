@@ -1569,6 +1569,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
               model: settingsRef.current.battleModel,
               contents: contents,
               config: {
+                abortSignal: attemptAbort.signal,
                 systemInstruction: fullSysPrompt,
                 temperature: 1.5,
                 thinkingConfig: {
@@ -2574,7 +2575,10 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       charAbortRef.current = abortController;
 
       try {
-        const responseStream = await aiClient.models.generateContentStream(charApiConfig);
+        const responseStream = await aiClient.models.generateContentStream({
+          ...charApiConfig,
+          config: { ...charApiConfig.config, abortSignal: abortController.signal },
+        });
         
         let fullText = "";
         let currentModelMessage = "";
