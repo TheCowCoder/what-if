@@ -15,7 +15,30 @@ declare global {
 }
 
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || '';
-const socket: Socket = io(BACKEND_URL || undefined);
+const CLIENT_SESSION_STORAGE_KEY = 'arena_clash_session_id';
+const getClientSessionId = () => {
+  try {
+    const stored = localStorage.getItem(CLIENT_SESSION_STORAGE_KEY);
+    if (stored) return stored;
+    const generated = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `session_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    localStorage.setItem(CLIENT_SESSION_STORAGE_KEY, generated);
+    return generated;
+  } catch {
+    return `session_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  }
+};
+
+const socket: Socket = io(BACKEND_URL || undefined, {
+  auth: {
+    sessionId: getClientSessionId(),
+  },
+  reconnection: true,
+  reconnectionAttempts: Infinity,
+  reconnectionDelay: 1_000,
+  reconnectionDelayMax: 5_000,
+});
 
 type Tab = 'home' | 'profile' | 'social';
 type GameState = 'menu' | 'char_creation' | 'matchmaking' | 'arena_prep' | 'battle' | 'post_match' | 'exploration' | 'level_select';
@@ -57,6 +80,7 @@ interface WorldLocation {
   connections: string[];
   npcs: string[];
   enemies: string[];
+  subZones?: any[];
 }
 
 interface ExplorationState {
@@ -73,170 +97,6 @@ interface ExplorationState {
   equippedWeapon: string | null;
   equippedArmor: string | null;
 }
-
-const DEFAULT_STARTING_GOLD = 25;
-const BATTLE_STREAM_THOUGHTS_PREFIX = 'STREAMING_THOUGHTS_';
-const BATTLE_STREAM_ANSWER_PREFIX = 'STREAMING_ANSWER_';
-const BATTLE_PLAYER_ACTIONS_PREFIX = 'PLAYER_ACTIONS_';
-const BATTLE_PENDING_ACTION_PREFIX = 'PENDING_PLAYER_ACTION_';
-
-const normalizeCharacter = (value: any): Character => ({
-  ...value,
-  name: value?.name || 'Unknown',
-  hp: value?.hp ?? 100,
-  maxHp: value?.maxHp ?? 100,
-  mana: value?.mana ?? 100,
-  maxMana: value?.maxMana ?? 100,
-  gold: typeof value?.gold === 'number' ? value.gold : DEFAULT_STARTING_GOLD,
-  profileMarkdown: value?.profileMarkdown || '',
-});
-
-const normalizeCharacters = (values: any[]): Character[] => Array.isArray(values) ? values.map(normalizeCharacter) : [];
-
-const pickPreferredCharacter = (values: Character[], preferredName?: string | null, fallbackIndex = 0): Character | null => {
-  if (!values.length) return null;
-
-  if (preferredName) {
-    const preferredCharacter = values.find(character => character.name === preferredName);
-    if (preferredCharacter) return preferredCharacter;
-  }
-
-  return values[fallbackIndex] || values[0] || null;
-};
-
-const stripCharacterImageForSync = (value: Character | null) => {
-  if (!value) return null;
-  const { imageUrl, ...rest } = value;
-  return rest;
-};
-
-const stripCharacterImagesForCloud = (values: Character[]) => values.map(character => {
-  const { imageUrl, ...rest } = character;
-  return rest;
-});
-
-const optimizeCharacterAvatar = async (imageUrl: string) => {
-  if (!imageUrl.startsWith('data:image/')) return imageUrl;
-
-  return new Promise<string>((resolve) => {
-    const image = new Image();
-    image.onload = () => {
-      const maxDimension = 768;
-      const scale = Math.min(1, maxDimension / Math.max(image.width, image.height));
-      const canvas = document.createElement('canvas');
-      canvas.width = Math.max(1, Math.round(image.width * scale));
-      canvas.height = Math.max(1, Math.round(image.height * scale));
-      const context = canvas.getContext('2d');
-      if (!context) {
-        resolve(imageUrl);
-        return;
-      }
-
-      context.drawImage(image, 0, 0, canvas.width, canvas.height);
-      try {
-        const optimized = canvas.toDataURL('image/webp', 0.82);
-        resolve(optimized.length < imageUrl.length ? optimized : imageUrl);
-      } catch {
-        resolve(imageUrl);
-      }
-    };
-    image.onerror = () => resolve(imageUrl);
-    image.src = imageUrl;
-  });
-};
-
-const extractInlineImageFrames = (parts: any[]): string[] => parts.flatMap(part => {
-  if (!(part as any).inlineData) return [];
-  const imageData = (part as any).inlineData;
-  return [`data:${imageData.mimeType};base64,${imageData.data}`];
-});
-
-const buildBattleActionsLog = (roomPlayers: Record<string, any>): string => (
-  BATTLE_PLAYER_ACTIONS_PREFIX + Object.keys(roomPlayers)
-    .map(pid => `**${roomPlayers[pid].character.name}:** ${roomPlayers[pid].action}`)
-    .join('\n\n')
-);
-
-const appendBattleLogIfMissing = (logs: string[], entry: string): string[] => (
-  logs.includes(entry) ? logs : [...logs, entry]
-);
-
-const buildPendingBattleActionLog = (playerId: string, action: string): string => (
-  `${BATTLE_PENDING_ACTION_PREFIX}${playerId}::${action}`
-);
-
-const removePendingBattleActionLogs = (logs: string[], playerId?: string): string[] => {
-  const prefix = playerId ? `${BATTLE_PENDING_ACTION_PREFIX}${playerId}::` : BATTLE_PENDING_ACTION_PREFIX;
-  return logs.filter(log => !log.startsWith(prefix));
-};
-
-const ensureBattleStreamLog = (logs: string[], prefix: string): string[] => {
-  const firstIndex = logs.findIndex(log => log.startsWith(prefix));
-  if (firstIndex === -1) {
-    return [...logs, prefix];
-  }
-
-  return logs.filter((log, index) => !log.startsWith(prefix) || index === firstIndex);
-};
-
-const ensureBattleStreamPlaceholders = (logs: string[]): string[] => {
-  const withThoughts = ensureBattleStreamLog(logs, BATTLE_STREAM_THOUGHTS_PREFIX);
-  return ensureBattleStreamLog(withThoughts, BATTLE_STREAM_ANSWER_PREFIX);
-};
-
-const removeBattleStreamPlaceholders = (logs: string[]): string[] => (
-  logs.filter(log => !log.startsWith(BATTLE_STREAM_THOUGHTS_PREFIX) && !log.startsWith(BATTLE_STREAM_ANSWER_PREFIX))
-);
-
-const ImageSequencePreview = ({ frames, fps = 60, alt }: { frames: string[]; fps?: number; alt: string }) => {
-  const [frameIndex, setFrameIndex] = useState(0);
-
-  useEffect(() => {
-    if (frames.length <= 1) {
-      setFrameIndex(0);
-      return;
-    }
-
-    let animationFrame = 0;
-    let lastTimestamp = 0;
-    const frameDuration = 1000 / Math.max(1, fps);
-
-    const tick = (timestamp: number) => {
-      if (!lastTimestamp || timestamp - lastTimestamp >= frameDuration) {
-        setFrameIndex(previous => (previous + 1) % frames.length);
-        lastTimestamp = timestamp;
-      }
-      animationFrame = window.requestAnimationFrame(tick);
-    };
-
-    animationFrame = window.requestAnimationFrame(tick);
-    return () => window.cancelAnimationFrame(animationFrame);
-  }, [frames, fps]);
-
-  if (!frames.length) return null;
-
-  return <img src={frames[frameIndex] || frames[0]} alt={alt} className="w-full" />;
-};
-
-const InlineMessageMedia = ({ message, alt, onImageClick }: { message: Message; alt: string; onImageClick?: (url: string) => void }) => {
-  const frames = message.imageFrames?.length ? message.imageFrames : message.imageUrl ? [message.imageUrl] : [];
-  if (!frames.length) return null;
-
-  return (
-    <div className="mt-2 rounded-lg overflow-hidden border-2 border-duo-gray bg-white cursor-pointer" onClick={() => onImageClick?.(frames[0])}>
-      {frames.length > 1 ? (
-        <>
-          <ImageSequencePreview frames={frames} fps={message.imageFrameFps || 60} alt={alt} />
-          <div className="px-3 py-2 text-[10px] font-black uppercase tracking-[0.16em] text-duo-blue bg-duo-blue/5 border-t border-duo-blue/10">
-            {frames.length} frame preview at {message.imageFrameFps || 60} FPS
-          </div>
-        </>
-      ) : (
-        <img src={frames[0]} alt={alt} className="w-full" />
-      )}
-    </div>
-  );
-};
 
 interface WorldPlayer {
   id: string;
@@ -296,195 +156,168 @@ interface MapMarkerLayoutPosition {
   y: number;
 }
 
+const DEFAULT_STARTING_GOLD = 25;
+const BATTLE_STREAM_THOUGHTS_PREFIX = 'STREAMING_THOUGHTS_';
+const BATTLE_STREAM_ANSWER_PREFIX = 'STREAMING_ANSWER_';
+const BATTLE_PLAYER_ACTIONS_PREFIX = 'PLAYER_ACTIONS_';
+const BATTLE_PENDING_ACTION_PREFIX = 'PENDING_PLAYER_ACTION_';
+const BATTLE_TURN_SUMMARY_PREFIX = 'TURN_SUMMARY_';
+
+const EMPTY_BATTLE_MAP_STATE: BattleMapState = {
+  discoveredLocations: [],
+  players: [],
+  npcs: [],
+};
+
+const normalizeCharacter = (value: any): Character => ({
+  ...value,
+  name: value?.name || 'Unknown',
+  hp: value?.hp ?? 100,
+  maxHp: value?.maxHp ?? 100,
+  mana: value?.mana ?? 100,
+  maxMana: value?.maxMana ?? 100,
+  gold: typeof value?.gold === 'number' ? value.gold : DEFAULT_STARTING_GOLD,
+  profileMarkdown: value?.profileMarkdown || '',
+});
+
+const normalizeCharacters = (values: any[]): Character[] => Array.isArray(values) ? values.map(normalizeCharacter) : [];
+
+const pickPreferredCharacter = (values: Character[], preferredName?: string | null, fallbackIndex = 0): Character | null => {
+  if (!values.length) return null;
+  if (preferredName) {
+    const preferredCharacter = values.find(character => character.name === preferredName);
+    if (preferredCharacter) return preferredCharacter;
+  }
+  return values[fallbackIndex] || values[0] || null;
+};
+
+const stripCharacterImageForSync = (value: Character | null) => {
+  if (!value) return null;
+  const { imageUrl, ...rest } = value;
+  return rest;
+};
+
+const stripCharacterImagesForCloud = (values: Character[]) => values.map(character => {
+  const { imageUrl, ...rest } = character;
+  return rest;
+});
+
+const optimizeCharacterAvatar = async (imageUrl: string) => {
+  if (!imageUrl.startsWith('data:image/')) return imageUrl;
+  return new Promise<string>((resolve) => {
+    const image = new Image();
+    image.onload = () => {
+      const maxDimension = 768;
+      const scale = Math.min(1, maxDimension / Math.max(image.width, image.height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.round(image.width * scale));
+      canvas.height = Math.max(1, Math.round(image.height * scale));
+      const context = canvas.getContext('2d');
+      if (!context) {
+        resolve(imageUrl);
+        return;
+      }
+      context.drawImage(image, 0, 0, canvas.width, canvas.height);
+      try {
+        const optimized = canvas.toDataURL('image/webp', 0.82);
+        resolve(optimized.length < imageUrl.length ? optimized : imageUrl);
+      } catch {
+        resolve(imageUrl);
+      }
+    };
+    image.onerror = () => resolve(imageUrl);
+    image.src = imageUrl;
+  });
+};
+
+const extractInlineImageFrames = (parts: any[]): string[] => parts.flatMap(part => {
+  if (!(part as any).inlineData) return [];
+  const imageData = (part as any).inlineData;
+  return [`data:${imageData.mimeType};base64,${imageData.data}`];
+});
+
+const buildBattleActionsLog = (roomPlayers: Record<string, any>): string => (
+  BATTLE_PLAYER_ACTIONS_PREFIX + Object.keys(roomPlayers)
+    .map(pid => `**${roomPlayers[pid].character.name}:** ${roomPlayers[pid].action}`)
+    .join('\n\n')
+);
+
+const appendBattleLogIfMissing = (logs: string[], entry: string): string[] => (
+  logs.includes(entry) ? logs : [...logs, entry]
+);
+
+const buildPendingBattleActionLog = (playerId: string, action: string): string => (
+  `${BATTLE_PENDING_ACTION_PREFIX}${playerId}::${action}`
+);
+
+const removePendingBattleActionLogs = (logs: string[], playerId?: string): string[] => {
+  const prefix = playerId ? `${BATTLE_PENDING_ACTION_PREFIX}${playerId}::` : BATTLE_PENDING_ACTION_PREFIX;
+  return logs.filter(log => !log.startsWith(prefix));
+};
+
+const ensureBattleStreamLog = (logs: string[], prefix: string): string[] => {
+  const firstIndex = logs.findIndex(log => log.startsWith(prefix));
+  if (firstIndex === -1) return [...logs, prefix];
+  return logs.filter((log, index) => !log.startsWith(prefix) || index === firstIndex);
+};
+
+const ensureBattleStreamPlaceholders = (logs: string[]): string[] => {
+  const withThoughts = ensureBattleStreamLog(logs, BATTLE_STREAM_THOUGHTS_PREFIX);
+  return ensureBattleStreamLog(withThoughts, BATTLE_STREAM_ANSWER_PREFIX);
+};
+
+const removeBattleStreamPlaceholders = (logs: string[]): string[] => (
+  logs.filter(log => !log.startsWith(BATTLE_STREAM_THOUGHTS_PREFIX) && !log.startsWith(BATTLE_STREAM_ANSWER_PREFIX))
+);
+
 const clampMapValue = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 
 const estimateMarkerLabelWidth = (label: string, minWidth: number, maxWidth: number, charWidth: number) => (
   clampMapValue(label.length * charWidth, minWidth, maxWidth)
 );
 
-const getLocationMarkerGlyph = (type: string) => {
-  if (type === 'village') return '🏘️';
-  if (type === 'ruins') return '🏚️';
-  if (type === 'cave') return '🕳️';
-  return '·';
-};
-
 const getWorldLocationById = (worldData: any, locationId?: string | null): WorldLocation | null => (
   worldData?.locations?.find((entry: WorldLocation) => entry.id === locationId) || null
 );
 
-const getLocationHopDistance = (worldData: any, startLocationId?: string | null, endLocationId?: string | null): number => {
-  if (!startLocationId || !endLocationId) return Number.POSITIVE_INFINITY;
-  if (startLocationId === endLocationId) return 0;
-
-  const visited = new Set<string>([startLocationId]);
-  const queue: Array<{ locationId: string; distance: number }> = [{ locationId: startLocationId, distance: 0 }];
-
-  while (queue.length > 0) {
-    const current = queue.shift();
-    if (!current) continue;
-
-    const location = getWorldLocationById(worldData, current.locationId);
-    for (const connectionId of location?.connections || []) {
-      if (visited.has(connectionId)) continue;
-      if (connectionId === endLocationId) return current.distance + 1;
-      visited.add(connectionId);
-      queue.push({ locationId: connectionId, distance: current.distance + 1 });
-    }
-  }
-
-  return Number.POSITIVE_INFINITY;
-};
-
-const getZoneHopDistance = (zones: BattleZone[], fromId: string, toId: string): number => {
-  if (fromId === toId) return 0;
-  const visited = new Set<string>();
-  const queue: [string, number][] = [[fromId, 0]];
-  visited.add(fromId);
-  while (queue.length > 0) {
-    const [current, dist] = queue.shift()!;
-    const zone = zones.find(z => z.id === current);
-    if (!zone) continue;
-    for (const neighbor of zone.connections) {
-      if (neighbor === toId) return dist + 1;
-      if (!visited.has(neighbor)) {
-        visited.add(neighbor);
-        queue.push([neighbor, dist + 1]);
+const layoutRepelledMarkers = (
+  markers: MapMarkerLayoutInput[],
+  bounds: { width: number; height: number },
+): Record<string, MapMarkerLayoutPosition> => {
+  if (markers.length === 0) return {};
+  const padding = 8;
+  const positions = markers.map(marker => ({ ...marker, x: marker.anchorX, y: marker.anchorY }));
+  for (let iteration = 0; iteration < 36; iteration++) {
+    const forces = positions.map(() => ({ x: 0, y: 0 }));
+    for (let i = 0; i < positions.length; i++) {
+      for (let j = i + 1; j < positions.length; j++) {
+        const left = positions[i];
+        const right = positions[j];
+        const dx = right.x - left.x;
+        const dy = right.y - left.y;
+        const overlapX = (left.width + right.width) / 2 + padding - Math.abs(dx);
+        const overlapY = (left.height + right.height) / 2 + padding - Math.abs(dy);
+        if (overlapX <= 0 || overlapY <= 0) continue;
+        const safeDx = Math.abs(dx) < 0.01 ? (j - i || 1) * 0.01 : dx;
+        const safeDy = Math.abs(dy) < 0.01 ? ((i + j) % 2 === 0 ? 0.01 : -0.01) : dy;
+        const length = Math.hypot(safeDx, safeDy) || 1;
+        const pushStrength = Math.max(overlapX, overlapY) * 0.22;
+        const pushX = (safeDx / length) * pushStrength;
+        const pushY = (safeDy / length) * pushStrength;
+        forces[i].x -= pushX;
+        forces[i].y -= pushY;
+        forces[j].x += pushX;
+        forces[j].y += pushY;
       }
     }
+    positions.forEach((marker, index) => {
+      forces[index].x += (marker.anchorX - marker.x) * 0.12;
+      forces[index].y += (marker.anchorY - marker.y) * 0.12;
+      marker.x = clampMapValue(marker.x + forces[index].x, marker.width / 2 + 4, bounds.width - marker.width / 2 - 4);
+      marker.y = clampMapValue(marker.y + forces[index].y, marker.height / 2 + 4, bounds.height - marker.height / 2 - 4);
+    });
   }
-  return Infinity;
-};
-
-const buildBattleMapContext = (worldData: any, mapState?: BattleMapState, roomPlayers?: Record<string, any>, options?: { isJudge?: boolean }) => {
-  if (!worldData || !mapState || mapState.players.length === 0) return '';
-
-  let context = '';
-
-  // Zone-based combat context (preferred)
-  if (mapState.zones && mapState.zones.length > 0 && mapState.combatantZones) {
-    context += 'BATTLE ZONES:\n';
-    for (const zone of mapState.zones) {
-      const occupants = Object.entries(mapState.combatantZones)
-        .filter(([, zoneId]) => zoneId === zone.id)
-        .map(([name]) => name);
-      context += `- **${zone.name}** [${zone.id}]: ${zone.description}`;
-      if (occupants.length > 0) context += ` — Occupied by: ${occupants.join(', ')}`;
-      context += `. Connected to: ${zone.connections.join(', ')}.\n`;
-    }
-
-    context += '\nCOMBATANT POSITIONS:\n';
-    for (const [name, zoneId] of Object.entries(mapState.combatantZones)) {
-      const zone = mapState.zones.find(z => z.id === zoneId);
-      context += `- ${name} is in ${zone?.name || zoneId}\n`;
-    }
-
-    // Zone distances between combatants
-    const names = Object.keys(mapState.combatantZones);
-    if (names.length >= 2) {
-      context += '\nDISTANCES:\n';
-      for (let i = 0; i < names.length; i++) {
-        for (let j = i + 1; j < names.length; j++) {
-          const z1 = mapState.combatantZones[names[i]];
-          const z2 = mapState.combatantZones[names[j]];
-          if (z1 === z2) {
-            context += `- ${names[i]} and ${names[j]} are in the SAME ZONE (melee range)\n`;
-          } else {
-            // BFS for zone distance
-            const dist = getZoneHopDistance(mapState.zones, z1, z2);
-            const label = dist === 1 ? '1 zone apart (adjacent)' : dist === Infinity ? 'disconnected' : `${dist} zones apart`;
-            context += `- ${names[i]} and ${names[j]} are ${label}\n`;
-          }
-        }
-      }
-    }
-    return context;
-  }
-
-  // Fallback: legacy grid-based context
-  context += 'BATTLE MAP STATE:\n';
-  if (options?.isJudge) {
-    context += 'No battle zones have been set up yet. Call setup_battle_zones on this first turn to create the spatial arena layout.\n';
-  } else {
-    context += 'The battlefield layout has not been established yet.\n';
-  }
-  for (const player of mapState.players) {
-    const location = getWorldLocationById(worldData, player.locationId);
-    const playerName = roomPlayers?.[player.id]?.character?.name || player.name;
-    context += `- ${playerName} starts near ${location?.name || player.locationId}.\n`;
-  }
-  for (const npc of (mapState.npcs || [])) {
-    const location = getWorldLocationById(worldData, npc.locationId);
-    context += `- ${npc.name} (NPC Ally) starts near ${location?.name || npc.locationId}.\n`;
-  }
-
-  return context;
-};
-
-const mergeBattlePositionUpdates = (
-  worldData: any,
-  currentMapState: BattleMapState | undefined,
-  positionUpdates: Record<string, { x?: number; y?: number; locationId?: string }> | null | undefined,
-  roomPlayers: Record<string, any>,
-): BattleMapState | undefined => {
-  if (!currentMapState || !positionUpdates) return currentMapState;
-
-  const gridWidth = worldData?.meta?.gridSize?.width ?? 0;
-  const gridHeight = worldData?.meta?.gridSize?.height ?? 0;
-  const discoveredLocations = new Set(currentMapState.discoveredLocations);
-  const clampCoordinate = (value: number, max: number) => (
-    max > 0 ? clampMapValue(value, 0, max) : value
-  );
-
-  const applyUpdate = <T extends { id: string; name: string; locationId: string; x: number; y: number }>(
-    entity: T,
-    preferredName?: string,
-  ) => {
-    const update = positionUpdates[preferredName || entity.name] || positionUpdates[entity.name] || positionUpdates[entity.id];
-    if (!update) return entity;
-
-    const nextLocationId = typeof update.locationId === 'string' && update.locationId.trim()
-      ? update.locationId
-      : entity.locationId;
-    const nextLocation = getWorldLocationById(worldData, nextLocationId);
-    if (nextLocation) {
-      discoveredLocations.add(nextLocation.id);
-      for (const connectionId of nextLocation.connections || []) {
-        discoveredLocations.add(connectionId);
-      }
-    }
-
-    return {
-      ...entity,
-      locationId: nextLocationId,
-      x: typeof update.x === 'number' && Number.isFinite(update.x)
-        ? clampCoordinate(update.x, gridWidth)
-        : entity.x,
-      y: typeof update.y === 'number' && Number.isFinite(update.y)
-        ? clampCoordinate(update.y, gridHeight)
-        : entity.y,
-    };
-  };
-
-  const players = currentMapState.players.map(player => {
-    const playerName = roomPlayers?.[player.id]?.character?.name || player.name;
-    return applyUpdate(player, playerName);
-  });
-
-  const npcs = currentMapState.npcs.map(npc => applyUpdate(npc));
-
-  return {
-    ...currentMapState,
-    discoveredLocations: Array.from(discoveredLocations),
-    players,
-    npcs,
-  };
-};
-
-const EMPTY_BATTLE_MAP_STATE: BattleMapState = {
-  discoveredLocations: [],
-  players: [],
-  npcs: [],
+  return Object.fromEntries(positions.map(marker => [marker.id, { x: marker.x, y: marker.y }]));
 };
 
 const TypingDots = ({ className = '', dotClassName = 'h-1.5 w-1.5' }: { className?: string; dotClassName?: string }) => (
@@ -499,68 +332,74 @@ const TypingDots = ({ className = '', dotClassName = 'h-1.5 w-1.5' }: { classNam
   </span>
 );
 
-const layoutRepelledMarkers = (
-  markers: MapMarkerLayoutInput[],
-  bounds: { width: number; height: number },
-): Record<string, MapMarkerLayoutPosition> => {
-  if (markers.length === 0) return {};
-
-  const padding = 8;
-  const positions = markers.map(marker => ({
-    ...marker,
-    x: marker.anchorX,
-    y: marker.anchorY,
-  }));
-
-  for (let iteration = 0; iteration < 36; iteration++) {
-    const forces = positions.map(() => ({ x: 0, y: 0 }));
-
-    for (let i = 0; i < positions.length; i++) {
-      for (let j = i + 1; j < positions.length; j++) {
-        const left = positions[i];
-        const right = positions[j];
-        const dx = right.x - left.x;
-        const dy = right.y - left.y;
-        const overlapX = (left.width + right.width) / 2 + padding - Math.abs(dx);
-        const overlapY = (left.height + right.height) / 2 + padding - Math.abs(dy);
-
-        if (overlapX <= 0 || overlapY <= 0) continue;
-
-        const safeDx = Math.abs(dx) < 0.01 ? (j - i || 1) * 0.01 : dx;
-        const safeDy = Math.abs(dy) < 0.01 ? ((i + j) % 2 === 0 ? 0.01 : -0.01) : dy;
-        const length = Math.hypot(safeDx, safeDy) || 1;
-        const pushStrength = Math.max(overlapX, overlapY) * 0.22;
-        const pushX = (safeDx / length) * pushStrength;
-        const pushY = (safeDy / length) * pushStrength;
-
-        forces[i].x -= pushX;
-        forces[i].y -= pushY;
-        forces[j].x += pushX;
-        forces[j].y += pushY;
-      }
+const buildBattleMapContext = (worldData: any, mapState?: BattleMapState, roomPlayers?: Record<string, any>, options?: { isJudge?: boolean }) => {
+  if (!worldData || !mapState || mapState.players.length === 0) return '';
+  let context = '';
+  if (mapState.zones && mapState.zones.length > 0 && mapState.combatantZones) {
+    context += 'BATTLE ZONES:\n';
+    for (const zone of mapState.zones) {
+      const occupants = Object.entries(mapState.combatantZones)
+        .filter(([, zoneId]) => zoneId === zone.id)
+        .map(([name]) => name);
+      context += `- **${zone.name}** [${zone.id}]: ${zone.description}`;
+      if (occupants.length > 0) context += ` — Occupied by: ${occupants.join(', ')}`;
+      context += `. Connected to: ${zone.connections.join(', ')}.\n`;
     }
-
-    positions.forEach((marker, index) => {
-      forces[index].x += (marker.anchorX - marker.x) * 0.12;
-      forces[index].y += (marker.anchorY - marker.y) * 0.12;
-
-      marker.x = clampMapValue(marker.x + forces[index].x, marker.width / 2 + 4, bounds.width - marker.width / 2 - 4);
-      marker.y = clampMapValue(marker.y + forces[index].y, marker.height / 2 + 4, bounds.height - marker.height / 2 - 4);
-    });
+    context += '\nCOMBATANT POSITIONS:\n';
+    for (const [name, zoneId] of Object.entries(mapState.combatantZones)) {
+      const zone = mapState.zones.find(z => z.id === zoneId);
+      context += `- ${name} is in ${zone?.name || zoneId}\n`;
+    }
+    return context;
   }
+  context += 'BATTLE MAP STATE:\n';
+  for (const player of mapState.players) {
+    const location = getWorldLocationById(worldData, player.locationId);
+    const playerName = roomPlayers?.[player.id]?.character?.name || player.name;
+    context += `- ${playerName} starts near ${location?.name || player.locationId}.\n`;
+  }
+  return context;
+};
 
-  return Object.fromEntries(positions.map(marker => [
-    marker.id,
-    { x: marker.x, y: marker.y },
-  ]));
+const mergeBattlePositionUpdates = (
+  worldData: any,
+  currentMapState: BattleMapState | undefined,
+  positionUpdates: Record<string, { x?: number; y?: number; locationId?: string }> | null | undefined,
+  roomPlayers: Record<string, any>,
+): BattleMapState | undefined => {
+  if (!currentMapState || !positionUpdates) return currentMapState;
+  const gridWidth = worldData?.meta?.gridSize?.width ?? 0;
+  const gridHeight = worldData?.meta?.gridSize?.height ?? 0;
+  const discoveredLocations = new Set(currentMapState.discoveredLocations);
+  const clampCoordinate = (value: number, max: number) => (max > 0 ? clampMapValue(value, 0, max) : value);
+  const applyUpdate = (entity: any, preferredName?: string) => {
+    const update = positionUpdates[preferredName || entity.name] || positionUpdates[entity.name] || positionUpdates[entity.id];
+    if (!update) return entity;
+    const nextLocId = update.locationId || entity.locationId;
+    const loc = getWorldLocationById(worldData, nextLocId);
+    if (loc) {
+      discoveredLocations.add(loc.id);
+      if (loc.connections) loc.connections.forEach(c => discoveredLocations.add(c));
+    }
+    return {
+      ...entity,
+      locationId: nextLocId,
+      x: typeof update.x === 'number' ? clampCoordinate(update.x, gridWidth) : entity.x,
+      y: typeof update.y === 'number' ? clampCoordinate(update.y, gridHeight) : entity.y,
+    };
+  };
+  return {
+    ...currentMapState,
+    discoveredLocations: Array.from(discoveredLocations),
+    players: currentMapState.players.map(p => applyUpdate(p, roomPlayers[p.id]?.character?.name)),
+    npcs: currentMapState.npcs.map(n => applyUpdate(n)),
+  };
 };
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>('home');
   const [gameState, setGameState] = useState<GameState>('menu');
   const gameStateRef = useRef<GameState>('menu');
-  
-  // Auth state
   const [authToken, setAuthToken] = useState<string | null>(() => localStorage.getItem('duo_auth_token'));
   const [authUser, setAuthUser] = useState<string | null>(() => localStorage.getItem('duo_auth_user'));
   const [showAuthModal, setShowAuthModal] = useState(false);
@@ -570,7 +409,6 @@ export default function App() {
   const [authError, setAuthError] = useState('');
   const [authLoading, setAuthLoading] = useState(false);
   const [dbAvailable, setDbAvailable] = useState(false);
-
   const [characters, setCharacters] = useState<Character[]>(() => {
     const saved = localStorage.getItem('duo_characters');
     return saved ? normalizeCharacters(JSON.parse(saved)) : [];
@@ -579,45 +417,28 @@ export default function App() {
     const savedCharacters = normalizeCharacters(JSON.parse(localStorage.getItem('duo_characters') || '[]'));
     const preferredCharacter = pickPreferredCharacter(savedCharacters, localStorage.getItem('duo_active_character_name'));
     if (preferredCharacter) return preferredCharacter;
-
     const saved = localStorage.getItem('duo_character');
     return saved ? normalizeCharacter(JSON.parse(saved)) : null;
   });
   const charactersRef = useRef<Character[]>([]);
   const characterRef = useRef<Character | null>(null);
   const activeCharacterNameRef = useRef<string | null>(localStorage.getItem('duo_active_character_name'));
-  
-  // Track whether localStorage had saved debug durations — if so, skip server overwrite
   const hadLocalDurations = useRef(false);
   const [settings, setSettings] = useState(() => {
     const defaultSettings = {
-      apiKey: '',
-      charModel: 'gemini-3-flash-preview',
-      explorationModel: 'gemini-3-flash-preview',
-      battleModel: 'gemini-3-flash-preview',
-      botModel: 'gemini-2.5-flash',
-      unlimitedTurnTime: false,
-      arenaPreviewSeconds: 15,
-      arenaTweakSeconds: 120,
-      battleTurnSeconds: 90,
+      apiKey: '', charModel: 'gemini-3-flash-preview', explorationModel: 'gemini-3-flash-preview', battleModel: 'gemini-3-flash-preview', botModel: 'gemini-2.5-flash',
+      unlimitedTurnTime: false, arenaPreviewSeconds: 15, arenaTweakSeconds: 120, battleTurnSeconds: 90,
     };
     const saved = localStorage.getItem('duo_settings');
     if (saved) {
       try {
         const parsed = JSON.parse(saved);
-        // Strip model fields from localStorage — always use current defaults
-        delete parsed.charModel;
-        delete parsed.explorationModel;
-        delete parsed.battleModel;
-        delete parsed.botModel;
-        // If localStorage has any duration keys, mark as authoritative
+        delete parsed.charModel; delete parsed.explorationModel; delete parsed.battleModel; delete parsed.botModel;
         if (parsed.arenaPreviewSeconds !== undefined || parsed.arenaTweakSeconds !== undefined || parsed.battleTurnSeconds !== undefined || parsed.unlimitedTurnTime !== undefined) {
           hadLocalDurations.current = true;
         }
         return { ...defaultSettings, ...parsed };
-      } catch (e) {
-        return defaultSettings;
-      }
+      } catch (e) { return defaultSettings; }
     }
     return defaultSettings;
   });
@@ -627,10 +448,8 @@ export default function App() {
 
   useEffect(() => {
     settingsRef.current = settings;
-    // Only persist non-model settings to localStorage — models always use current defaults
     const { charModel, explorationModel, battleModel, botModel, ...persistedSettings } = settings;
     localStorage.setItem('duo_settings', JSON.stringify(persistedSettings));
-    // Sync debug settings to server (shared across all players, no auth required)
     fetch(`${BACKEND_URL}/api/settings`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -650,110 +469,132 @@ export default function App() {
       activeCharacterNameRef.current = character.name;
       setCharacters(prev => {
         const index = prev.findIndex(c => c.name === character.name);
-        let newChars = prev;
         if (index >= 0) {
-          const previousCharacter = prev[index];
-          if (JSON.stringify(previousCharacter) === JSON.stringify(character)) {
-            localStorage.setItem('duo_characters', JSON.stringify(prev));
-            return prev;
-          }
-          newChars = [...prev];
-          newChars[index] = character;
+          const next = [...prev]; next[index] = character;
+          localStorage.setItem('duo_characters', JSON.stringify(next)); return next;
         } else {
-          newChars = [...prev, character];
+          const next = [...prev, character];
+          localStorage.setItem('duo_characters', JSON.stringify(next)); return next;
         }
-        localStorage.setItem('duo_characters', JSON.stringify(newChars));
-        return newChars;
       });
     }
   }, [character]);
 
+  // Socket listeners for game flow
   useEffect(() => {
-    charactersRef.current = characters;
-  }, [characters]);
+    socket.on('characterSaved', (state: any) => {
+      const normalizedState = normalizeCharacter(state);
+      setCharacter(normalizedState);
+      setMessages(prev => [...prev, { role: 'system', text: `✓ ${normalizedState.name} saved!` }]);
+    });
 
-  useEffect(() => {
-    characterRef.current = character;
-  }, [character]);
+    socket.on('queueUpdated', (queue) => {
+      setQueuePlayers(queue);
+    });
+
+    socket.on('waitingForOpponent', () => {
+      setGameState('matchmaking');
+    });
+
+    socket.on('arenaPreparationState', (data: any) => {
+      setRoomId(data.roomId);
+      setPlayers(data.players);
+      setIsBotMatch(data.isBotMatch);
+      setArenaPreparation({
+        stage: data.stage,
+        remaining: data.remaining,
+        playerRemaining: data.playerRemaining || {},
+        tweakDuration: data.tweakDuration || 0,
+        isBotMatch: data.isBotMatch,
+        skipVotes: data.skipVotes || [],
+      });
+      setBattleLogs([]);
+      setBattleInput('');
+      setGameState('arena_prep');
+    });
+
+    socket.on('roomPlayersUpdated', (data: any) => {
+      setPlayers(data.players);
+      if (data.phase === 'preview' || data.phase === 'tweak') {
+        setArenaPreparation(prev => prev ? { ...prev, stage: data.phase as ArenaPreparationState['stage'] } : prev);
+      }
+    });
+
+    socket.on('turnResolved', (data: any) => {
+      if (data.players) setPlayers(data.players);
+      if (data.mapState) setBattleMapState(data.mapState);
+      setBattleLogs(prev => [...prev, ...data.logs]);
+      setHasVisualizedThisTurn(false);
+      setIsLockedIn(false);
+    });
+
+    socket.on('battleEnded', (data: any) => {
+      setBattleOutcome(data.outcome);
+      setGameState('post_match');
+    });
+
+    socket.on('explorationStarted', (data: any) => {
+      setExplorationState(data.explorationState || explorationState);
+      setGameState('exploration');
+    });
+
+    socket.on('error', (msg: string) => {
+      console.error('Server error:', msg);
+      // Show in appropriate context based on gameState
+      if (gameStateRef.current === 'char_creation') {
+        setMessages(prev => [...prev, { role: 'system', text: `⚠️ Error: ${msg}` }]);
+      } else if (gameStateRef.current === 'battle') {
+        setBattleError(msg);
+      }
+    });
+
+    return () => {
+      socket.off('characterSaved');
+      socket.off('queueUpdated');
+      socket.off('waitingForOpponent');
+      socket.off('arenaPreparationState');
+      socket.off('roomPlayersUpdated');
+      socket.off('turnResolved');
+      socket.off('battleEnded');
+      socket.off('explorationStarted');
+      socket.off('error');
+    };
+  }, []);
 
   const getAIClient = useCallback(() => {
     const customKey = settingsRef.current.apiKey?.trim();
-    if (customKey) {
-      console.log(`Using custom API key ending in ...${customKey.slice(-4)}`);
-      return createAIClient(customKey);
-    }
-    
-    // If the user selected a key via the platform dialog, it might be injected here
-    // We create a new instance to ensure we pick up any dynamically injected keys
-    console.log("Using platform-provided API key");
+    if (customKey) return createAIClient(customKey);
     return createAIClient(process.env.API_KEY || process.env.GEMINI_API_KEY);
   }, []);
 
-  const upsertExplorationStreamMessage = useCallback((streamId: string, text: string, kind: 'thought' | 'answer') => {
-    setExplorationLog(prev => {
-      const next = [...prev];
-      for (let i = next.length - 1; i >= 0; i--) {
-        if (next[i].streamId === streamId && next[i].kind === kind) {
-          next[i] = { ...next[i], role: 'model', text, streamId, kind };
-          return next;
-        }
-      }
-      return [...prev, { role: 'model', text, streamId, kind }];
-    });
-  }, []);
+  const clearTypingPresence = (context: string) => {
+    // Clear typing indicator for context ('battle', 'exploration', 'char')
+    // This is a no-op stub for now; can be expanded for actual typing notifications
+  };
 
-  const clearExplorationStreamMessage = useCallback((streamId: string, kind?: 'thought' | 'answer') => {
-    setExplorationLog(prev => prev.filter(message => message.streamId !== streamId || (kind ? message.kind !== kind : false)));
-  }, []);
+  const getBotSystemPrompt = async (): Promise<string> => {
+    // Return a system prompt for bot actions
+    return 'You are a skilled RPG combatant. Respond with creative but strategic battle actions.';
+  };
 
-  const upsertChatStatusMessage = useCallback((statusId: string, text: string) => {
-    setMessages(prev => {
-      const next = [...prev];
-      for (let i = next.length - 1; i >= 0; i--) {
-        if (next[i].streamId === statusId) {
-          next[i] = { ...next[i], role: 'system', text, streamId: statusId };
-          return next;
-        }
-      }
-      return [...prev, { role: 'system', text, streamId: statusId }];
-    });
-  }, []);
+  const handleChatScroll = () => {
+    if (!chatScrollContainerRef.current) return;
+    const el = chatScrollContainerRef.current;
+    chatShouldAutoScrollRef.current = (el.scrollHeight - el.scrollTop - el.clientHeight) < 100;
+  };
 
-  const clearChatStatusMessage = useCallback((statusId: string) => {
-    setMessages(prev => prev.filter(message => message.streamId !== statusId));
-  }, []);
+  const handleBattleScroll = () => {
+    if (!battleScrollContainerRef.current) return;
+    const el = battleScrollContainerRef.current;
+    battleShouldAutoScrollRef.current = (el.scrollHeight - el.scrollTop - el.clientHeight) < 100;
+  };
 
-  const upsertExplorationStatusMessage = useCallback((statusId: string, text: string) => {
-    setExplorationLog(prev => {
-      const next = [...prev];
-      for (let i = next.length - 1; i >= 0; i--) {
-        if (next[i].streamId === statusId) {
-          next[i] = { ...next[i], role: 'system', text, streamId: statusId };
-          return next;
-        }
-      }
-      return [...prev, { role: 'system', text, streamId: statusId }];
-    });
-  }, []);
+  const handleExplorationScroll = () => {
+    if (!explorationScrollContainerRef.current) return;
+    const el = explorationScrollContainerRef.current;
+    explorationShouldAutoScrollRef.current = (el.scrollHeight - el.scrollTop - el.clientHeight) < 100;
+  };
 
-  const clearExplorationStatusMessage = useCallback((statusId: string) => {
-    setExplorationLog(prev => prev.filter(message => message.streamId !== statusId));
-  }, []);
-
-  const upsertBattleStatusLog = useCallback((statusId: string, text: string) => {
-    const prefix = `STATUS_${statusId}::`;
-    setBattleLogs(prev => {
-      const next = prev.filter(log => !log.startsWith(prefix));
-      return [...next, `${prefix}${text}`];
-    });
-  }, []);
-
-  const clearBattleStatusLog = useCallback((statusId: string) => {
-    const prefix = `STATUS_${statusId}::`;
-    setBattleLogs(prev => prev.filter(log => !log.startsWith(prefix)));
-  }, []);
-  
-  // Chat state
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputText, setInputText] = useState('');
   const [isWaitingForChar, setIsWaitingForChar] = useState(false);
@@ -761,22 +602,10 @@ export default function App() {
   const [charCreatorError, setCharCreatorError] = useState<string | null>(null);
   const charAbortRef = useRef<AbortController | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
-
-  // World & Exploration state
   const [worldData, setWorldData] = useState<any>(null);
+  const worldDataRef = useRef<any>(null);
   const [explorationState, setExplorationState] = useState<ExplorationState>({
-    locationId: '',
-    subZoneId: null,
-    x: 0,
-    y: 0,
-    hunger: 100,
-    thirst: 100,
-    stamina: 100,
-    inventory: {},
-    discoveredLocations: [],
-    goals: ['Find a water source', 'Talk to a local', 'Gather some wood', 'Explore a new area', 'Craft your first tool'],
-    equippedWeapon: null,
-    equippedArmor: null,
+    locationId: '', subZoneId: null, x: 0, y: 0, hunger: 100, thirst: 100, stamina: 100, inventory: {}, discoveredLocations: [], goals: [], equippedWeapon: null, equippedArmor: null,
   });
   const [explorationLog, setExplorationLog] = useState<Message[]>([]);
   const [explorationInput, setExplorationInput] = useState('');
@@ -795,103 +624,23 @@ export default function App() {
   const mapDragRef = useRef<{ dragging: boolean; pointerId: number; lastX: number; lastY: number }>({ dragging: false, pointerId: -1, lastX: 0, lastY: 0 });
   const mapPinchRef = useRef<{ distance: number; centerX: number; centerY: number }>({ distance: 0, centerX: 0, centerY: 0 });
   const [showInventory, setShowInventory] = useState(false);
+  const [showExplorationMeta, setShowExplorationMeta] = useState(false);
+  const [showExplorationNearby, setShowExplorationNearby] = useState(false);
   const [showCharImage, setShowCharImage] = useState(false);
   const [isGeneratingCharImage, setIsGeneratingCharImage] = useState(false);
   const [explorationCombatReturn, setExplorationCombatReturn] = useState(false);
   const [combatEnemyLoot, setCombatEnemyLoot] = useState<string[]>([]);
   const explorationEndRef = useRef<HTMLDivElement>(null);
   const explorationInputRef = useRef<HTMLTextAreaElement>(null);
-  const worldDataRef = useRef<any>(null);
   const activeExplorationStreamIdRef = useRef<string | null>(null);
   const [explorationRetryAttempt, setExplorationRetryAttempt] = useState(0);
   const [explorationError, setExplorationError] = useState<string | null>(null);
 
-  const moveExplorationStateToLocation = useCallback((locationId: string, x: number, y: number) => {
-    setExplorationState(prev => {
-      const newDiscovered = [...prev.discoveredLocations];
-      if (!newDiscovered.includes(locationId)) newDiscovered.push(locationId);
-      const loc = worldDataRef.current?.locations?.find((l: any) => l.id === locationId);
-      if (loc?.connections) {
-        for (const connId of loc.connections) {
-          if (!newDiscovered.includes(connId)) newDiscovered.push(connId);
-        }
-      }
-      return {
-        ...prev,
-        locationId,
-        subZoneId: null,
-        x,
-        y,
-        discoveredLocations: newDiscovered,
-      };
-    });
-  }, []);
-
-  const compactConversation = useCallback(async () => {
-    // Estimate tokens: ~4 chars per token
-    const logText = explorationLog.map(m => m.text).join('\n');
-    const estimatedTokens = Math.ceil(logText.length / 4);
-    const COMPACT_THRESHOLD = 6000; // ~24K chars
-    if (estimatedTokens < COMPACT_THRESHOLD || isCompacting) return;
-
-    setIsCompacting(true);
-    try {
-      const aiClient = getAIClient();
-      // Take the oldest 2/3 of messages to summarize
-      const splitIdx = Math.floor(explorationLog.length * 2 / 3);
-      const oldMessages = explorationLog.slice(0, splitIdx);
-      const oldText = oldMessages.map(m => `[${m.role}] ${m.text}`).join('\n');
-
-      const existingSummary = explorationSummary ? `PREVIOUS SUMMARY:\n${explorationSummary}\n\n` : '';
-      const prompt = `${existingSummary}Summarize this RPG exploration conversation history into a concise narrative summary. Preserve: key events, decisions, combat outcomes, NPC interactions, items found/used, quest progress, and important dialog. Keep it under 500 words.\n\nCONVERSATION:\n${oldText}`;
-
-      const response = await aiClient.models.generateContent({
-        model: 'gemini-2.0-flash',
-        contents: prompt,
-        config: { temperature: 0.3 },
-      });
-
-      const summary = response.text?.trim();
-      if (summary) {
-        setExplorationSummary(summary);
-        setExplorationLog(prev => prev.slice(splitIdx));
-      }
-    } catch (e) {
-      console.error('Compaction failed:', e);
-    } finally {
-      setIsCompacting(false);
-    }
-  }, [explorationLog, explorationSummary, isCompacting, getAIClient]);
-
-  const syncBattleMapState = useCallback((nextState?: Partial<BattleMapState> | null) => {
-    setBattleMapState(prev => ({
-      discoveredLocations: nextState?.discoveredLocations ?? prev.discoveredLocations ?? [],
-      players: nextState?.players ?? prev.players ?? [],
-      npcs: nextState?.npcs ?? prev.npcs ?? [],
-      zones: nextState?.zones ?? prev.zones,
-      combatantZones: nextState?.combatantZones ?? prev.combatantZones,
-    }));
-  }, []);
-
-  useEffect(() => {
-    if (gameState !== 'exploration' || !character) return;
-    socket.emit('syncExplorationState', {
-      explorationState,
-      character: {
-        hp: character.hp,
-        maxHp: character.maxHp,
-        mana: character.mana,
-        maxMana: character.maxMana,
-        gold: character.gold,
-      },
-    });
-  }, [gameState, explorationState, character]);
-
-  // Battle state
   const [roomId, setRoomId] = useState<string | null>(null);
   const [players, setPlayers] = useState<Record<string, any>>({});
   const playersRef = useRef<Record<string, any>>({});
   const [battleMapState, setBattleMapState] = useState<BattleMapState>(EMPTY_BATTLE_MAP_STATE);
+  const battleMapStateRef = useRef<BattleMapState>(EMPTY_BATTLE_MAP_STATE);
   const [arenaPreparation, setArenaPreparation] = useState<ArenaPreparationState | null>(null);
   const [battleLogs, setBattleLogs] = useState<string[]>([]);
   const battleLogsRef = useRef<string[]>([]);
@@ -900,6 +649,9 @@ export default function App() {
   const [retryAttempt, setRetryAttempt] = useState(0);
   const [expandedThoughts, setExpandedThoughts] = useState<Set<number>>(new Set());
   const [expandedExplorationThoughts, setExpandedExplorationThoughts] = useState<Set<string>>(new Set());
+  const [showBattleMeta, setShowBattleMeta] = useState(false);
+  const [showBattleInventory, setShowBattleInventory] = useState(false);
+  const [showArenaRoster, setShowArenaRoster] = useState(true);
   const abortControllerRef = useRef<AbortController | null>(null);
   const [isLockedIn, setIsLockedIn] = useState(false);
   const [roomTypingIds, setRoomTypingIds] = useState<string[]>([]);
@@ -909,15 +661,24 @@ export default function App() {
   const battleEndRef = useRef<HTMLDivElement>(null);
   const charInputRef = useRef<HTMLTextAreaElement>(null);
   const battleInputRef = useRef<HTMLTextAreaElement>(null);
+  const chatScrollContainerRef = useRef<HTMLDivElement>(null);
+  const battleScrollContainerRef = useRef<HTMLDivElement>(null);
+  const explorationScrollContainerRef = useRef<HTMLDivElement>(null);
+  const chatShouldAutoScrollRef = useRef(true);
+  const battleShouldAutoScrollRef = useRef(true);
+  const explorationShouldAutoScrollRef = useRef(true);
+  const [chatNeedsJump, setChatNeedsJump] = useState(false);
+  const [battleNeedsJump, setBattleNeedsJump] = useState(false);
+  const [explorationNeedsJump, setExplorationNeedsJump] = useState(false);
   const handleGenerateBattleImageRef = useRef<(() => void) | null>(null);
-
-  const [showBotModal, setShowBotModal] = useState(false);
-  const [botDifficulty, setBotDifficulty] = useState<number>(1);
   const [botCharacters, setBotCharacters] = useState<any[]>([]);
   const [selectedBotCharacter, setSelectedBotCharacter] = useState<string>('');
   const [isGeneratingBot, setIsGeneratingBot] = useState(false);
   const [isSynced, setIsSynced] = useState(false);
+  const [connectionPhase, setConnectionPhase] = useState<'online' | 'reconnecting' | 'resyncing'>('online');
+  const connectionPhaseRef = useRef<'online' | 'reconnecting' | 'resyncing'>('online');
   const lastSyncedCharRef = useRef<string>('');
+  const hasConnectedOnceRef = useRef(false);
   const [queuePlayers, setQueuePlayers] = useState<any[]>([]);
   const [isBotMatch, setIsBotMatch] = useState(false);
   const [battleOutcome, setBattleOutcome] = useState<'win' | 'loss' | null>(null);
@@ -935,4958 +696,359 @@ export default function App() {
   const botSystemPromptRef = useRef<string | null>(null);
   const [turnTimerRemaining, setTurnTimerRemaining] = useState<number | null>(null);
   const [isVisualizingScene, setIsVisualizingScene] = useState(false);
-  const isBotMatchRef = useRef(false);
   const [showProfileModal, setShowProfileModal] = useState(false);
   const [profileToView, setProfileToView] = useState<string | null>(null);
   const [expandedImageUrl, setExpandedImageUrl] = useState<string | null>(null);
-  useEffect(() => { isBotMatchRef.current = isBotMatch; }, [isBotMatch]);
-  const difficultyLabels = ['Easy', 'Medium', 'Hard', 'Superintelligent'];
-  const avatarSyncKeysRef = useRef<Record<string, string>>({});
 
-  useEffect(() => {
-    playersRef.current = players;
-  }, [players]);
+  const upsertBattleStatusLog = useCallback((statusId: string, text: string) => {
+    const prefix = `STATUS_${statusId}::`;
+    setBattleLogs(prev => { const next = prev.filter(log => !log.startsWith(prefix)); return [...next, `${prefix}${text}`]; });
+  }, []);
 
-  const getBotSystemPrompt = async () => {
-    if (botSystemPromptRef.current) return botSystemPromptRef.current;
-    const botPromptRes = await fetch(`${BACKEND_URL}/api/prompts/bot_player.txt`);
-    const botSysPrompt = await botPromptRes.text();
-    botSystemPromptRef.current = botSysPrompt;
-    return botSysPrompt;
+  const clearBattleStatusLog = useCallback((statusId: string) => {
+    const prefix = `STATUS_${statusId}::`;
+    setBattleLogs(prev => prev.filter(log => !log.startsWith(prefix)));
+  }, []);
+
+  const upsertExplorationStatusMessage = useCallback((statusId: string, text: string) => {
+    setExplorationLog(prev => {
+      const next = [...prev];
+      for (let i = next.length - 1; i >= 0; i--) { if (next[i].streamId === statusId) { next[i] = { ...next[i], role: 'system', text, streamId: statusId }; return next; } }
+      return [...prev, { role: 'system', text, streamId: statusId }];
+    });
+  }, []);
+
+  const clearExplorationStatusMessage = useCallback((statusId: string) => {
+    setExplorationLog(prev => prev.filter(message => message.streamId !== statusId));
+  }, []);
+
+  // Keep refs in sync with state
+  useEffect(() => { gameStateRef.current = gameState; }, [gameState]);
+  useEffect(() => { playersRef.current = players; }, [players]);
+  useEffect(() => { battleLogsRef.current = battleLogs; }, [battleLogs]);
+  useEffect(() => { battleMapStateRef.current = battleMapState; }, [battleMapState]);
+  useEffect(() => { worldDataRef.current = worldData; }, [worldData]);
+  useEffect(() => { charactersRef.current = characters; }, [characters]);
+  useEffect(() => { characterRef.current = character; }, [character]);
+
+  const handleEnterArena = () => {
+    if (!character) { setActiveTab('profile'); setGameState('char_creation'); if (messages.length === 0) setMessages([{ role: 'model', text: "Welcome! character?" }]); return; }
+    socket.emit('enterArena', { unlimitedTurnTime: settingsRef.current.unlimitedTurnTime, arenaPreviewSeconds: settingsRef.current.arenaPreviewSeconds, arenaTweakSeconds: settingsRef.current.arenaTweakSeconds, battleTurnSeconds: settingsRef.current.battleTurnSeconds });
   };
 
-  useEffect(() => {
-    gameStateRef.current = gameState;
-  }, [gameState]);
+  const handlePlayBot = () => {
+    if (!character) { setActiveTab('profile'); setGameState('char_creation'); if (messages.length === 0) setMessages([{ role: 'model', text: "Welcome! character?" }]); return; }
+    setGameState('matchmaking');
+    socket.emit('startBotMatch', { difficulty: 'Medium', unlimitedTurnTime: settingsRef.current.unlimitedTurnTime, arenaPreviewSeconds: settingsRef.current.arenaPreviewSeconds, arenaTweakSeconds: settingsRef.current.arenaTweakSeconds, battleTurnSeconds: settingsRef.current.battleTurnSeconds });
+  };
 
-  const mergeWorldPlayers = useCallback((nextPlayers: WorldPlayer[]) => {
-    setWorldPlayers(prev => {
-      const previousById = new globalThis.Map(prev.map(player => [player.id, player]));
-      return (nextPlayers || []).map(player => {
-        const previous = previousById.get(player.id);
-        return {
-          ...previous,
-          ...player,
-          acting: player.acting ?? previous?.acting,
-          typing: player.typing ?? previous?.typing,
-        };
+  const handleBattleUnlock = () => { clearTypingPresence('battle'); socket.emit('playerUnlock'); setIsLockedIn(false); };
+  
+  const handleSendBattleAction = () => {
+    const action = battleInput.trim(); if (!action || isLockedIn || awaitingBattleImage) return;
+    clearTypingPresence('battle');
+    if (socket.id) setBattleLogs(prev => [...removePendingBattleActionLogs(prev, socket.id), buildPendingBattleActionLog(socket.id!, action)]);
+    socket.emit('playerAction', action); setIsLockedIn(true); setBattleInput('');
+  };
+
+  const getThoughtTitle = (content: string) => {
+    const lines = content.split('\n').filter(l => l.trim());
+    for (let i = lines.length - 1; i >= 0; i--) { const line = lines[i].trim(); if (line.startsWith('#') || (line.startsWith('**') && line.endsWith('**'))) return line.replace(/[#*]/g, '').trim(); }
+    const words = (lines[lines.length - 1] || "Thinking...").replace(/[#*]/g, '').trim().split(' ');
+    return words.length <= 4 ? words.join(' ') : words.slice(0, 4).join(' ') + '...';
+  };
+
+  const handleGenerateBattleImage = async () => {
+    if (hasVisualizedThisTurn) { setAwaitingBattleImage(false); setIsLockedIn(false); socket.emit('readyForNextTurn'); return; }
+    if (battleImageAbortRef.current) battleImageAbortRef.current.abort();
+    const masterAbort = new AbortController();
+    battleImageAbortRef.current = masterAbort;
+    setIsGeneratingBattleImage(true);
+    upsertBattleStatusLog('battle-image-generation', '🎨 Generating battle image...');
+    try {
+      const aiClient = getAIClient();
+      const lastActions = [...battleLogs].reverse().find(l => l.startsWith(BATTLE_PLAYER_ACTIONS_PREFIX));
+      const playerActions = lastActions ? lastActions.substring(BATTLE_PLAYER_ACTIONS_PREFIX.length) : '';
+      const narrativeLogs = battleLogs.filter(l => !l.startsWith('STREAMING_') && !l.startsWith('>') && !l.startsWith('PLAYER_ACTIONS_') && !l.startsWith(BATTLE_PENDING_ACTION_PREFIX) && !l.startsWith('STATUS_IMAGE')).slice(-2).join('\n').substring(0, 800);
+      const playerDescriptions = Object.values(players).map((p: any) => `${p.character.name} (HP: ${p.character.hp}/${p.character.maxHp}, Mana: ${p.character.mana}/${p.character.maxMana})`).join(' vs ');
+      const prompt = `Generate a dynamic RPG battle art scene. Combatants: ${playerDescriptions}\n\nActions: ${playerActions}\n\nResult: ${narrativeLogs}\n\nStyle: Dynamic fantasy battle, cinematic. No text.`;
+      const contentParts: any[] = [{ text: prompt }];
+      Object.values(players).forEach((p: any) => {
+        const avatarUrl = p.character?.imageUrl;
+        if (avatarUrl && avatarUrl.startsWith('data:')) {
+          const match = avatarUrl.match(/^data:(image\/\w+);base64,(.+)$/);
+          if (match) contentParts.push({ text: `Ref for ${p.character.name}:` }, { inlineData: { mimeType: match[1], data: match[2] } });
+        }
       });
-    });
-  }, []);
-
-  const setExplorationTypingIds = useCallback((typingIds: string[]) => {
-    const typingSet = new Set(typingIds);
-    setWorldPlayers(prev => prev.map(player => ({
-      ...player,
-      typing: typingSet.has(player.id),
-    })));
-  }, []);
-
-  const updateTypingPresence = useCallback((channel: 'character' | 'battle' | 'exploration', value: string) => {
-    const timeoutId = typingStopTimeoutsRef.current[channel];
-    if (timeoutId) {
-      window.clearTimeout(timeoutId);
-      delete typingStopTimeoutsRef.current[channel];
-    }
-
-    const isTyping = value.trim().length > 0;
-    socket.emit('typing', { isTyping });
-
-    if (!isTyping) {
-      return;
-    }
-
-    typingStopTimeoutsRef.current[channel] = window.setTimeout(() => {
-      socket.emit('typing', { isTyping: false });
-      delete typingStopTimeoutsRef.current[channel];
-    }, 1100);
-  }, []);
-
-  const clearTypingPresence = useCallback((channel: 'character' | 'battle' | 'exploration') => {
-    const timeoutId = typingStopTimeoutsRef.current[channel];
-    if (timeoutId) {
-      window.clearTimeout(timeoutId);
-      delete typingStopTimeoutsRef.current[channel];
-    }
-    socket.emit('typing', { isTyping: false });
-  }, []);
-
-  const syncCharacterAvatarToCloud = useCallback(async (targetCharacter: Character) => {
-    if (!authToken || !targetCharacter.imageUrl) return;
-
-    const syncKey = `${targetCharacter.name}:${targetCharacter.imageUrl.length}:${targetCharacter.imageUrl.slice(-48)}`;
-    if (avatarSyncKeysRef.current[targetCharacter.name] === syncKey) return;
-
-    const res = await fetch(`${BACKEND_URL}/api/account/character-avatar`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${authToken}`,
-      },
-      body: JSON.stringify({
-        name: targetCharacter.name,
-        imageUrl: targetCharacter.imageUrl,
-      }),
-    });
-
-    if (!res.ok) {
-      throw new Error(await res.text());
-    }
-
-    avatarSyncKeysRef.current[targetCharacter.name] = syncKey;
-  }, [authToken]);
-
-  useEffect(() => {
-    socket.on('characterSynced', () => setIsSynced(true));
-    socket.on('disconnect', () => setIsSynced(false));
-    return () => {
-      socket.off('characterSynced');
-      socket.off('disconnect');
-    };
-  }, []);
-
-  useEffect(() => {
-    const sync = () => {
-      const syncCharacter = stripCharacterImageForSync(character);
-      const charStr = JSON.stringify(syncCharacter);
-      if (syncCharacter && charStr !== lastSyncedCharRef.current) {
-        socket.emit('characterCreated', syncCharacter);
-        lastSyncedCharRef.current = charStr;
-      }
-    };
-
-    socket.on('connect', sync);
-    if (socket.connected) {
-      sync();
-    }
-
-    return () => {
-      socket.off('connect', sync);
-    };
-  }, [character]);
-
-  useEffect(() => {
-    fetch(`${BACKEND_URL}/api/bot_characters`)
-      .then(res => res.json())
-      .then(data => {
-        setBotCharacters(data);
-        if (data.length > 0) {
-          setSelectedBotCharacter(data[0].id);
-        }
-      })
-      .catch(err => console.error("Failed to load bot characters", err));
-    
-    // Load world data  
-    fetch(`${BACKEND_URL}/api/world`)
-      .then(res => res.json())
-      .then(data => { setWorldData(data); worldDataRef.current = data; })
-      .catch(err => console.error("Failed to load world data", err));
-  }, []);
-
-  useEffect(() => {
-    battleLogsRef.current = battleLogs;
-  }, [battleLogs]);
-
-  useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
-
-  useEffect(() => {
-    battleEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [battleLogs]);
-
-  useEffect(() => {
-    explorationEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [explorationLog]);
-
-  const roomIdRef = useRef(roomId);
-  useEffect(() => { roomIdRef.current = roomId; }, [roomId]);
-  const botDifficultyRef = useRef(botDifficulty);
-  useEffect(() => { botDifficultyRef.current = botDifficulty; }, [botDifficulty]);
-
-  // Pause/resume the tweak-phase timer while the LLM is responding
-  useEffect(() => {
-    if (gameState !== 'arena_prep') return;
-    const isTweak = arenaPreparation?.stage === 'tweak' || !!(socket.id && players[socket.id || '']?.prepSkippedPreview);
-    if (!isTweak) return;
-    if (isWaitingForChar) {
-      socket.emit('prepTimerPause');
-    } else {
-      socket.emit('prepTimerResume');
-    }
-  }, [isWaitingForChar, gameState, arenaPreparation?.stage]);
-
-  const arenaPreparationStageRef = useRef<ArenaPreparationState['stage'] | null>(null);
-  const botPreparationRewriteRoomRef = useRef<string | null>(null);
-  const headStartEnteredRef = useRef(false);
-
-  // Detect head-start entry (player skipped preview early) and show initial message
-  useEffect(() => {
-    if (gameState !== 'arena_prep' || !arenaPreparation) {
-      headStartEnteredRef.current = false;
-      return;
-    }
-    const myId = socket.id || '';
-    const isHeadStart = arenaPreparation.stage === 'preview' && !!players[myId]?.prepSkippedPreview;
-    if (isHeadStart && !headStartEnteredRef.current) {
-      headStartEnteredRef.current = true;
-      const remaining = arenaPreparation.remaining;
-      setMessages([{ role: 'model', text: `You have a ${remaining} second head start before the rewrite phase. Refine your legend now.` }]);
-    }
-    if (arenaPreparation.stage === 'tweak') {
-      headStartEnteredRef.current = false;
-    }
-  }, [gameState, arenaPreparation, players]);
-
-  useEffect(() => {
-    if (gameState !== 'arena_prep' || !arenaPreparation) return;
-
-    if (arenaPreparation.stage === arenaPreparationStageRef.current) return;
-    arenaPreparationStageRef.current = arenaPreparation.stage;
-
-    if (arenaPreparation.stage === 'preview') {
-      setMessages([]);
-      setInputText('');
-      setIsWaitingForChar(false);
-      if (charAbortRef.current) { charAbortRef.current.abort(); charAbortRef.current = null; }
-      setCharCreatorError(null);
-      setCharCreatorRetryAttempt(0);
-      clearChatStatusMessage('char-creator-retry');
-      clearTypingPresence('character');
-      return;
-    }
-
-    setShowProfileModal(false);
-    // Preserve chat from head-start rewrite; only show intro if no messages yet
-    setMessages(prev => prev.length > 0 ? prev : [{ role: 'model', text: 'You have one rewrite window before the duel. Refine your legend now.' }]);
-    setIsWaitingForChar(false);
-    if (charAbortRef.current) { charAbortRef.current.abort(); charAbortRef.current = null; }
-    setCharCreatorError(null);
-    setCharCreatorRetryAttempt(0);
-    clearChatStatusMessage('char-creator-retry');
-  }, [arenaPreparation, clearChatStatusMessage, clearTypingPresence, gameState]);
-
-  useEffect(() => {
-    if (!arenaPreparation) {
-      arenaPreparationStageRef.current = null;
-      botPreparationRewriteRoomRef.current = null;
-    }
-  }, [arenaPreparation]);
-
-  // Auto-save character when tweak timer expires
-  const autoSaveTriggeredRef = useRef(false);
-  useEffect(() => {
-    // Reset when leaving prep
-    if (gameState !== 'arena_prep') {
-      autoSaveTriggeredRef.current = false;
-      return;
-    }
-    if (!arenaPreparation || arenaPreparation.stage !== 'tweak') return;
-    const myId = socket.id || '';
-    if (!myId || players[myId]?.lockedIn || isWaitingForChar) return;
-    if (autoSaveTriggeredRef.current) return;
-
-    const myRemaining = arenaPreparation.playerRemaining[myId];
-    if (typeof myRemaining !== 'number' || myRemaining > 5) return;
-
-    // Timer is about to expire — auto-save the character from chat history
-    autoSaveTriggeredRef.current = true;
-    const currentChar = characterRef.current;
-    const chatHistory = messages.filter(m => m.role !== 'system');
-
-    // If there's no chat history beyond the initial prompt, just lock in with existing character
-    if (chatHistory.length <= 1 || !currentChar) {
-      socket.emit('passArenaPreparation');
-      return;
-    }
-
-    // Fire a quick AI call to finalize the character
-    setMessages(prev => [...prev, { role: 'system', text: '⏰ Time running out — auto-saving your character...' }]);
-    (async () => {
-      setIsWaitingForChar(true);
-      try {
-        const aiClient = getAIClient();
-        const contents = chatHistory.map(m => ({
-          role: m.role === 'user' ? 'user' : 'model',
-          parts: [{ text: m.text }]
-        }));
-        // Add a final user message asking to finalize
-        contents.push({
-          role: 'user',
-          parts: [{ text: 'Time is up! Save the character now with all the changes we discussed. Use the save_character tool immediately.' }]
-        });
-
-        const saveCharacterTool = {
-          name: "save_character",
-          description: "Save or update the character state.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              name: { type: "STRING", description: "The character's name" },
-              hp: { type: "INTEGER", description: "Current HP" },
-              maxHp: { type: "INTEGER", description: "Max HP" },
-              mana: { type: "INTEGER", description: "Current Mana" },
-              maxMana: { type: "INTEGER", description: "Max Mana" },
-              gold: { type: "INTEGER", description: "Current gold coins" },
-              profileMarkdown: { type: "STRING", description: "Character profile markdown" }
-            },
-            required: ["name", "hp", "maxHp", "mana", "maxMana", "profileMarkdown"]
-          }
-        };
-
-        const sysPromptRes = await fetch(`${BACKEND_URL}/api/prompts/char_creator.txt`);
-        const sysPrompt = await sysPromptRes.text();
-        let fullSysPrompt = sysPrompt + `\n\nExisting Character Profile:\n${JSON.stringify(currentChar)}\n\nIMPORTANT: The user's time is running out. Save the character IMMEDIATELY with the save_character tool, incorporating all changes discussed so far.`;
-
-        const response = await aiClient.models.generateContent({
-          model: settingsRef.current.charModel,
-          contents,
-          config: {
-            systemInstruction: fullSysPrompt,
-            temperature: 0.3,
-            tools: [{ functionDeclarations: [saveCharacterTool as any] }],
-            toolConfig: { functionCallingConfig: { mode: 'ANY' as any } },
-          },
-        });
-
-        const parts = response.candidates?.[0]?.content?.parts || [];
-        let saved = false;
-        for (const part of parts) {
-          if ((part as any).functionCall?.name === 'save_character') {
-            const state = (part as any).functionCall.args;
-            socket.emit('characterCreated', {
-              name: state.name || currentChar.name,
-              hp: state.hp || currentChar.hp,
-              maxHp: state.maxHp || currentChar.maxHp,
-              mana: state.mana || currentChar.mana,
-              maxMana: state.maxMana || currentChar.maxMana,
-              gold: state.gold ?? currentChar.gold ?? DEFAULT_STARTING_GOLD,
-              profileMarkdown: state.profileMarkdown || currentChar.profileMarkdown,
-            });
-            saved = true;
-            break;
-          }
-        }
-        if (!saved) {
-          // Fallback: lock in with existing character
-          socket.emit('passArenaPreparation');
-        }
-      } catch (error) {
-        console.error('Auto-save character failed:', error);
-        socket.emit('passArenaPreparation');
-      } finally {
-        setIsWaitingForChar(false);
-      }
-    })();
-  }, [gameState, arenaPreparation, players, isWaitingForChar, messages, getAIClient]);
-
-  useEffect(() => {
-    const lockedInIds = Object.entries(players)
-      .filter(([, player]) => !!player?.lockedIn)
-      .map(([id]) => id);
-
-    if (lockedInIds.length === 0) return;
-
-    setLocalRoomTypingIds(prev => prev.filter(id => !lockedInIds.includes(id)));
-  }, [players]);
-
-  useEffect(() => {
-    const roomPlayers = playersRef.current;
-    const botId = Object.keys(roomPlayers).find(id => id.startsWith('bot_'));
-    const botPlayer = botId ? roomPlayers[botId] : null;
-    const botHasRewriteAccess = !!botPlayer?.prepSkippedPreview || arenaPreparation?.stage === 'tweak';
-    if (!arenaPreparation?.isBotMatch || !roomId || !botId || !botHasRewriteAccess || botPreparationRewriteRoomRef.current === roomId) return;
-
-    if (!botPlayer?.character) return;
-
-    botPreparationRewriteRoomRef.current = roomId;
-    setLocalRoomTypingIds(prev => prev.includes(botId) ? prev : [...prev, botId]);
-
-    let cancelled = false;
-    let rewriteSubmitted = false;
-
-    const finishBotRewrite = (profileMarkdown: string) => {
-      if (cancelled || rewriteSubmitted) return;
-      rewriteSubmitted = true;
-      window.clearTimeout(previewFallbackTimeout);
-      socket.emit('characterCreated', {
-        playerId: botId,
-        ...botPlayer.character,
-        profileMarkdown,
-      });
-      setLocalRoomTypingIds(prev => prev.filter(id => id !== botId));
-      setBotRewriteAttempt(0);
-    };
-
-    const previewFallbackTimeout = window.setTimeout(() => {
-      finishBotRewrite(botPlayer.character.profileMarkdown);
-    }, 2500);
-
-    const rewriteBotProfile = async () => {
-      let attempt = 0;
+      let attempts = 0;
       while (true) {
-        if (cancelled || rewriteSubmitted) return;
+        if (masterAbort.signal.aborted) break;
+        const attemptAbort = new AbortController();
+        const onMasterAbort = () => attemptAbort.abort();
+        masterAbort.signal.addEventListener('abort', onMasterAbort);
+        let timeoutId: any = setTimeout(() => attemptAbort.abort(), 60_000);
         try {
-          const aiClient = getAIClient();
-          const opponents = Object.entries(roomPlayers)
-            .filter(([id]) => id !== botId)
-            .map(([, player]) => `Opponent: ${player.character.name}\n${player.character.profileMarkdown}`)
-            .join('\n\n');
-          const response = await aiClient.models.generateContent({
-            model: settingsRef.current.botModel,
-            contents: `You are revising your dueling profile before the arena begins. Keep the same name and return markdown only.\n\nCurrent profile:\n${botPlayer.character.profileMarkdown}\n\nOpponents:\n${opponents}\n\nRefine the profile to better prepare for this duel while preserving identity and formatting.`,
-            config: {
-              temperature: 0.8,
-            },
-          });
-
-          const rewrittenProfile = response.text?.trim();
-          if (rewrittenProfile) {
-            finishBotRewrite(rewrittenProfile);
+          const res = await aiClient.models.generateContent({ model: 'gemini-3-pro-image-preview', contents: [{ role: 'user', parts: contentParts }], config: { responseModalities: ['IMAGE', 'TEXT'], abortSignal: attemptAbort.signal } });
+          if (timeoutId) clearTimeout(timeoutId);
+          masterAbort.signal.removeEventListener('abort', onMasterAbort);
+          if (masterAbort.signal.aborted) break;
+          const parts = res.candidates?.[0]?.content?.parts || [];
+          let foundImage = false;
+          for (const part of parts) {
+            if ((part as any).inlineData) {
+              const imageData = (part as any).inlineData;
+              const imageUrl = `data:${imageData.mimeType};base64,${imageData.data}`;
+              setBattleLogs(prev => [...prev, `STATUS_IMAGE::🎨 The scene takes shape...`, `STATUS_IMAGE_URL::${imageUrl}`]);
+              setHasVisualizedThisTurn(true); foundImage = true; break;
+            }
           }
-          return;
+          break;
         } catch (error: any) {
-          if (cancelled || rewriteSubmitted) return;
-          attempt++;
-          setBotRewriteAttempt(attempt);
+          if (timeoutId) clearTimeout(timeoutId);
+          masterAbort.signal.removeEventListener('abort', onMasterAbort);
+          if (masterAbort.signal.aborted) break;
           const errorInfo = classifyAIError(error);
           if (errorInfo.retryable) {
-            const delay = getAIRetryDelaySeconds(attempt);
-            await new Promise(resolve => setTimeout(resolve, delay * 1000));
-            continue;
+            attempts++; const delay = getAIRetryDelaySeconds(attempts);
+            upsertBattleStatusLog('battle-image-generation', `🎨 Generating battle image... (Attempt ${attempts + 1}: ${errorInfo.label})`);
+            await new Promise(resolve => setTimeout(resolve, delay * 1000)); continue;
           }
-          console.error('Bot rewrite error (non-retryable):', error);
+          upsertBattleStatusLog('battle-image-generation', `⚠️ Scene generation failed: ${formatAIError(errorInfo)}`);
           break;
         }
       }
-
-      finishBotRewrite(botPlayer.character.profileMarkdown);
-    };
-
-    rewriteBotProfile();
-
-    return () => {
-      cancelled = true;
-      window.clearTimeout(previewFallbackTimeout);
-      setLocalRoomTypingIds(prev => prev.filter(id => id !== botId));
-      setBotRewriteAttempt(0);
-    };
-  }, [arenaPreparation?.isBotMatch, getAIClient, roomId]);
+    } finally {
+      setIsGeneratingBattleImage(false); setAwaitingBattleImage(false); setIsLockedIn(false); socket.emit('readyForNextTurn');
+      const pendingRoom = pendingBotRoomRef.current; pendingBotRoomRef.current = null;
+      if (pendingRoom) { generateNpcAllyActions(pendingRoom, pendingRoom.turnId); generateBotAction(pendingRoom, pendingRoom.turnId); }
+    }
+  };
 
   const generateBotAction = async (currentRoom: any, turnId?: number) => {
-    if (!currentRoom || !currentRoom.isBotMatch) return;
-    if (botActionInFlightRef.current) return;
-    if (typeof turnId === 'number' && botLastActionTurnRef.current === turnId) {
-      console.log('[FollowerBattle] Skipping duplicate bot generation for turn', turnId);
-      return;
-    }
-    
-    const playerIds = Object.keys(currentRoom.players);
-    const botId = playerIds.find(id => id.startsWith('bot_'));
-    const playerId = playerIds.find(id => !id.startsWith('bot_'));
-    
-    if (!botId || !playerId) return;
-
-    const p1Data = currentRoom.players[playerId];
-    const p2Data = currentRoom.players[botId];
-
-    if (p2Data.lockedIn) return;
-
-    if (typeof turnId === 'number') {
-      botLastActionTurnRef.current = turnId;
-    }
-    console.log('[FollowerBattle] Generating bot action', { turnId, botId, botName: p2Data.character.name });
+    if (!currentRoom || !currentRoom.isBotMatch || botActionInFlightRef.current) return;
+    const botId = Object.keys(currentRoom.players).find(id => id.startsWith('bot_'));
+    const playerId = Object.keys(currentRoom.players).find(id => !id.startsWith('bot_'));
+    if (!botId || !playerId || currentRoom.players[botId].lockedIn) return;
+    if (typeof turnId === 'number') botLastActionTurnRef.current = turnId;
     botActionInFlightRef.current = true;
     setLocalRoomTypingIds(prev => prev.includes(botId) ? prev : [...prev, botId]);
     try {
       const aiClient = getAIClient();
       const botSysPrompt = await getBotSystemPrompt();
-      
-      const cleanLogs = battleLogsRef.current.filter(log => !log.startsWith("> **Judge's Thoughts:**"));
-      const fullLogText = cleanLogs.join('\n\n');
-      const logLines = fullLogText.split('\n');
-      const totalLines = logLines.length;
-      const battleMapContext = buildBattleMapContext(worldDataRef.current, currentRoom.mapState, currentRoom.players);
-
-      const botPrompt = `
-DIFFICULTY: ${currentRoom.botDifficulty}
-YOU ARE PLAYING AS: ${p2Data.character.name}
-YOUR STATE: ${JSON.stringify(p2Data.character)}
-OPPONENT STATE: ${JSON.stringify(p1Data.character)}
-    ${battleMapContext ? `${battleMapContext}\n` : ''}
-LATEST BATTLE EVENTS:
-${totalLines > 0 ? logLines.slice(Math.max(0, totalLines - 15)).join('\n') : "The battle has just begun."}
-
-What is your action? Keep it short and tactical. Remember, you are ${p2Data.character.name}.
-`;
-      const botRes = await aiClient.models.generateContent({
-        model: settingsRef.current.botModel,
-        contents: botPrompt,
-        config: {
-          systemInstruction: botSysPrompt,
-          temperature: 0.8,
-        },
-      });
-      
-      const rawAction = botRes.text || "I do nothing.";
-      // Strip any hallucinated tool calls (e.g., "setup_battle_zones([...])")
-      const action = rawAction.replace(/^\s*\w+\([\s\S]*?\)\s*$/gm, '').trim() || rawAction.trim() || "I attack!";
-      console.log('[FollowerBattle] Bot action ready', { turnId, botId, action });
-      socket.emit('playerAction', { playerId: botId, action });
-    } catch (error) {
-      console.error("Error generating bot action:", error);
-      // Fallback: send a generic attack so the battle doesn't stall
-      console.log('[FollowerBattle] Bot action fallback', { turnId, botId });
-      socket.emit('playerAction', {
-        playerId: botId,
-        action: `${currentRoom.players[botId!]?.character?.name || 'The enemy'} attacks with a basic strike!`,
-      });
-    } finally {
-      botActionInFlightRef.current = false;
-      setLocalRoomTypingIds(prev => prev.filter(id => id !== botId));
+      const botPrompt = `Difficulty: ${currentRoom.botDifficulty}\nAs: ${currentRoom.players[botId].character.name}\nHistory: ${battleLogsRef.current.slice(-10).join('\n')}`;
+      const botRes = await aiClient.models.generateContent({ model: settingsRef.current.botModel, contents: botPrompt, config: { systemInstruction: botSysPrompt, temperature: 0.8 } });
+      socket.emit('playerAction', { playerId: botId, action: (botRes.text || "I strike!").trim() });
+    } catch (error) { socket.emit('playerAction', { playerId: botId, action: `${currentRoom.players[botId].character.name} attacks!` }); } finally {
+      botActionInFlightRef.current = false; setLocalRoomTypingIds(prev => prev.filter(id => id !== botId));
     }
   };
 
   const generateNpcAllyActions = async (currentRoom: any, turnId?: number) => {
     if (!currentRoom) return;
     const npcAllyIds = Object.keys(currentRoom.players).filter(id => id.startsWith('npc_ally_'));
-    if (npcAllyIds.length === 0) {
-      console.log('[FollowerBattle] No NPC allies available for turn', turnId);
-      return;
-    }
-
-    console.log('[FollowerBattle] Starting NPC ally generation', { turnId, npcAllyIds });
-
-    const cleanLogs = battleLogsRef.current.filter(log => !log.startsWith("> **Judge's Thoughts:**"));
-    const logLines = cleanLogs.join('\n\n').split('\n');
-    const totalLines = logLines.length;
-    const battleMapContext = buildBattleMapContext(worldDataRef.current, currentRoom.mapState, currentRoom.players);
-
+    if (npcAllyIds.length === 0) return;
     await Promise.all(npcAllyIds.map(async (npcId) => {
       const npcData = currentRoom.players[npcId];
-      if (!npcData) return;
-      if (typeof turnId === 'number' && npcAllyLastActionTurnRef.current[npcId] === turnId) {
-        console.log('[FollowerBattle] Skipping duplicate NPC ally generation', { turnId, npcId });
-        return;
-      }
-      if (npcData.lockedIn || npcAllyActionsInFlightRef.current.has(npcId)) {
-        console.log('[FollowerBattle] NPC ally already locked or generating', { turnId, npcId, lockedIn: npcData.lockedIn });
-        return;
-      }
-
-      const requestId = Date.now() + Math.random();
-      if (typeof turnId === 'number') {
-        npcAllyLastActionTurnRef.current[npcId] = turnId;
-      }
+      if (!npcData || npcData.lockedIn || npcAllyActionsInFlightRef.current.has(npcId)) return;
       npcAllyActionsInFlightRef.current.add(npcId);
-      npcAllyActionRequestIdsRef.current[npcId] = requestId;
       upsertBattleStatusLog(`npc-ally-${npcId}`, `🤝 ${npcData.character.name} is choosing an action...`);
-      console.log('[FollowerBattle] Generating NPC ally action', { turnId, npcId, npcName: npcData.character.name });
       setLocalRoomTypingIds(prev => prev.includes(npcId) ? prev : [...prev, npcId]);
-      const actionAbort = new AbortController();
-      const actionTimeout = window.setTimeout(() => actionAbort.abort(), 12_000);
       try {
         const aiClient = getAIClient();
         const sysPrompt = await getBotSystemPrompt();
-
-        const enemyId = Object.keys(currentRoom.players).find(id => id.startsWith('bot_'));
-        const enemyData = enemyId ? currentRoom.players[enemyId] : null;
-        const playerData = Object.entries(currentRoom.players)
-          .find(([id, p]: any) => !id.startsWith('bot_') && !p.character?.isNpcAlly)?.[1] as any;
-
-        const prompt = `
-YOU ARE AN NPC ALLY fighting alongside the player.
-YOU ARE PLAYING AS: ${npcData.character.name}
-YOUR STATE: HP ${npcData.character.hp}/${npcData.character.maxHp}, Mana ${npcData.character.mana}/${npcData.character.maxMana}
-YOUR PROFILE:\n${npcData.character.profileMarkdown}
-${enemyData ? `ENEMY: ${enemyData.character.name} (HP: ${enemyData.character.hp})` : ''}
-${playerData ? `YOUR ALLY (the player): ${playerData.character.name} (HP: ${playerData.character.hp})` : ''}
-${battleMapContext ? `${battleMapContext}\n` : ''}
-LATEST BATTLE EVENTS:
-${totalLines > 0 ? logLines.slice(Math.max(0, totalLines - 10)).join('\n') : "The battle has just begun."}
-
-What is your action? Stay in character. Support your ally. Keep it short and tactical.
-`;
-        const res = await aiClient.models.generateContent({
-          model: settingsRef.current.botModel,
-          contents: prompt,
-          config: {
-            systemInstruction: sysPrompt,
-            temperature: 0.8,
-            abortSignal: actionAbort.signal,
-          },
-        });
-        const rawAction = res.text || `${npcData.character.name} attacks!`;
-        const action = rawAction.replace(/^\s*\w+\([\s\S]*?\)\s*$/gm, '').trim() || `${npcData.character.name} attacks!`;
-        if (npcAllyActionRequestIdsRef.current[npcId] === requestId) {
-          console.log('[FollowerBattle] NPC ally action ready', { turnId, npcId, action });
-          socket.emit('playerAction', { playerId: npcId, action });
-        }
-      } catch (error) {
-        if (npcAllyActionRequestIdsRef.current[npcId] === requestId) {
-          console.error(`Error generating NPC ally action for ${npcId}:`, error);
-          console.log('[FollowerBattle] NPC ally action fallback', { turnId, npcId });
-          socket.emit('playerAction', {
-            playerId: npcId,
-            action: `${npcData.character.name} attacks the enemy!`,
-          });
-        }
-      } finally {
-        window.clearTimeout(actionTimeout);
-        if (npcAllyActionRequestIdsRef.current[npcId] === requestId) {
-          delete npcAllyActionRequestIdsRef.current[npcId];
-          npcAllyActionsInFlightRef.current.delete(npcId);
-          setLocalRoomTypingIds(prev => prev.filter(id => id !== npcId));
-        }
+        const prompt = `NPC ally as: ${npcData.character.name}\nHP: ${npcData.character.hp}\nHistory: ${battleLogsRef.current.slice(-10).join('\n')}`;
+        const res = await aiClient.models.generateContent({ model: settingsRef.current.botModel, contents: prompt, config: { systemInstruction: sysPrompt, temperature: 0.8 } });
+        socket.emit('playerAction', { playerId: npcId, action: (res.text || "I help!").trim() });
+      } catch (e) { socket.emit('playerAction', { playerId: npcId, action: `${npcData.character.name} attacks!` }); } finally {
+        npcAllyActionsInFlightRef.current.delete(npcId); setLocalRoomTypingIds(prev => prev.filter(id => id !== npcId));
       }
     }));
-  };
-
-  useEffect(() => {
-    socket.on('characterSaved', (state: Character) => {
-      const existingCharacter = charactersRef.current.find(entry => entry.name === state.name)
-        || (characterRef.current?.name === state.name ? characterRef.current : null);
-      const normalizedState = normalizeCharacter({
-        ...existingCharacter,
-        ...state,
-        imageUrl: state.imageUrl || existingCharacter?.imageUrl,
-      });
-      const stateStr = JSON.stringify(stripCharacterImageForSync(normalizedState));
-      if (stateStr !== lastSyncedCharRef.current) {
-        setCharacter(normalizedState);
-        const isUpdate = charactersRef.current.some(c => c.name === normalizedState.name);
-      setMessages(prev => [...prev, { role: 'system', text: isUpdate ? `Updated character: ${normalizedState.name}!` : `Created character: ${normalizedState.name}!` }]);
-        lastSyncedCharRef.current = stateStr;
-        // Auto-generate character portrait
-        if (!normalizedState.imageUrl && gameStateRef.current !== 'arena_prep') {
-          setTimeout(async () => {
-            const generationMessageId = `avatar-generation-${state.name}-${Date.now()}`;
-            try {
-              console.log("[Portrait Auto] Starting generation for:", state.name);
-              setMessages(prev => [...prev, { role: 'system', text: '🎨 Generating portrait...', streamId: generationMessageId }]);
-              const aiClient = getAIClient();
-              const prompt = `Generate a fantasy character portrait for: ${state.name}. ${state.profileMarkdown.substring(0, 500)}. Style: detailed digital art, fantasy RPG character portrait, vibrant colors. Draw the character in their true form — they may be a creature, monster, spirit, or non-human entity. Do NOT default to humanoid. Do NOT include any text, stats, UI elements, health bars, or labels in the image.`;
-              const imgRes = await aiClient.models.generateContent({
-                model: 'gemini-3-pro-image-preview',
-                contents: prompt,
-                config: { responseModalities: ['IMAGE', 'TEXT'] },
-              });
-              const imgParts = imgRes.candidates?.[0]?.content?.parts || [];
-              const imageFrames = extractInlineImageFrames(imgParts);
-              if (imageFrames.length > 0) {
-                const optimizedImageUrl = await optimizeCharacterAvatar(imageFrames[imageFrames.length - 1]);
-                setCharacter(prev => prev ? { ...prev, imageUrl: optimizedImageUrl } : prev);
-                setMessages(prev => {
-                  const filtered = prev.filter(message => message.streamId !== generationMessageId);
-                  return [...filtered, {
-                    role: 'system',
-                    text: '🎨 Portrait generated!',
-                    imageUrl: optimizedImageUrl,
-                    imageFrames: imageFrames.length > 1 ? imageFrames : undefined,
-                    imageFrameFps: imageFrames.length > 1 ? 60 : undefined,
-                  }];
-                });
-                console.log("[Portrait Auto] Success!");
-                return;
-              }
-              console.warn("[Portrait Auto] No image in response");
-            } catch (err: any) {
-              console.error("[Portrait Auto] Error:", err.message);
-            } finally {
-              setMessages(prev => prev.filter(message => message.streamId !== generationMessageId));
-            }
-          }, 500);
-        }
-      }
-    });
-
-    socket.on('queueUpdated', (queue) => {
-      setQueuePlayers(queue);
-    });
-
-    socket.on('waitingForOpponent', () => {
-      setGameState('matchmaking');
-    });
-
-    socket.on('arenaPreparationState', (data: { roomId: string; players: Record<string, any>; isBotMatch: boolean; stage: 'preview' | 'tweak'; remaining: number; playerRemaining?: Record<string, number>; tweakDuration?: number; skipVotes?: string[] }) => {
-      setRoomId(data.roomId);
-      setPlayers(data.players);
-      setIsBotMatch(data.isBotMatch);
-      setArenaPreparation({
-        stage: data.stage,
-        remaining: data.remaining,
-        playerRemaining: data.playerRemaining || {},
-        tweakDuration: data.tweakDuration || 0,
-        isBotMatch: data.isBotMatch,
-        skipVotes: data.skipVotes || [],
-      });
-      setBattleLogs([]);
-      setBattleInput('');
-      setGameState('arena_prep');
-    });
-
-    socket.on('roomPlayersUpdated', (data: { players: Record<string, any>; phase: string }) => {
-      setPlayers(data.players);
-      if (data.phase === 'preview' || data.phase === 'tweak') {
-        setArenaPreparation(prev => prev ? { ...prev, stage: data.phase as ArenaPreparationState['stage'] } : prev);
-      }
-    });
-
-    socket.on('matchFound', (data) => {
-      setRoomId(data.roomId);
-      setPlayers(data.players);
-      syncBattleMapState(data.mapState);
-      setArenaPreparation(null);
-      setRoomTypingIds([]);
-      setLocalRoomTypingIds([]);
-      setIsBotMatch(data.isBotMatch);
-      setBattleOutcome(null);
-      setIsExplorationProcessing(false);
-      setExplorationLockStatus([]);
-      setExplorationRetryAttempt(0);
-      setExplorationError(null);
-      activeExplorationStreamIdRef.current = null;
-      socket.emit('explorationActing', { acting: false });
-      if (data.isPvpExploration) setExplorationCombatReturn(true);
-      setGameState('battle');
-      setBattleLogs(['**Match Found!** The battle begins.']);
-      setIsLockedIn(false);
-      setHasVisualizedThisTurn(false);
-      if (data.isBotMatch) {
-        const turnId = ++autonomousTurnSequenceRef.current;
-        console.log('[FollowerBattle] matchFound autonomous turn start', {
-          turnId,
-          players: Object.keys(data.players || {}),
-          npcAllies: Object.keys(data.players || {}).filter((id: string) => id.startsWith('npc_ally_')),
-        });
-        generateNpcAllyActions(data, turnId);
-        generateBotAction(data, turnId);
-      }
-    });
-
-    socket.on('battleMapStateUpdated', (data: Partial<BattleMapState>) => {
-      syncBattleMapState(data);
-    });
-
-    socket.on('battleMapMovementLog', (data: { log: string }) => {
-      setBattleLogs(prev => appendBattleLogIfMissing(prev, data.log));
-    });
-
-    socket.on('typingStatusUpdated', (data: { context: 'room' | 'exploration'; typingIds: string[] }) => {
-      if (data.context === 'room') {
-        setRoomTypingIds(data.typingIds || []);
-        return;
-      }
-
-      setExplorationTypingIds(data.typingIds || []);
-    });
-
-    socket.on('battleActionsSubmitted', (data: { log: string }) => {
-      setBattleLogs(prev => appendBattleLogIfMissing(removePendingBattleActionLogs(prev), data.log));
-    });
-
-    socket.on('playerLockedIn', (id) => {
-      setPlayers(prev => ({
-        ...prev,
-        [id]: { ...prev[id], lockedIn: true }
-      }));
-    });
-
-    socket.on('playerUnlocked', (id) => {
-      setPlayers(prev => ({
-        ...prev,
-        [id]: { ...prev[id], lockedIn: false }
-      }));
-      setBattleLogs(prev => removePendingBattleActionLogs(prev, id));
-      if (id === socket.id) {
-        setIsLockedIn(false);
-      }
-    });
-
-    socket.on('requestTurnResolution', async (room) => {
-      if (socket.id !== room.host) return;
-      
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-      }
-      // Master signal: aborted only when a NEW requestTurnResolution arrives or game ends
-      const masterAbort = new AbortController();
-      abortControllerRef.current = masterAbort;
-
-      const playerIds = Object.keys(room.players);
-      const actionsLog = buildBattleActionsLog(room.players);
-      const baseLogs = appendBattleLogIfMissing(battleLogsRef.current, actionsLog);
-      setBattleLogs(prev => appendBattleLogIfMissing(prev, actionsLog));
-
-      const cleanLogs = baseLogs.filter(log => !log.startsWith("> **Judge's Thoughts:**"));
-      const fullLogText = cleanLogs.join('\n\n');
-      const logLines = fullLogText.split('\n');
-      const totalLines = logLines.length;
-
-      let profiles = "";
-      for (const pid of playerIds) {
-        const pData = room.players[pid];
-        const label = pData.character.isNpcAlly ? 'NPC Ally' : 'Player';
-        profiles += `${label} Profile for ${pData.character.name}:\n${pData.character.profileMarkdown}\n\n`;
-      }
-
-      const sysPromptRes = await fetch(`${BACKEND_URL}/api/prompts/battle_judge.txt`);
-      const sysPrompt = await sysPromptRes.text();
-      const fullSysPrompt = sysPrompt + "\n\n" + profiles;
-
-      let prompt = `BATTLE STATE (TURN START):\n`;
-      for (const pid of playerIds) {
-        const pData = room.players[pid];
-        const label = pData.character.isNpcAlly ? 'NPC Ally' : 'Player';
-        prompt += `${label} (${pData.character.name}):\nHP: ${pData.character.hp}/${pData.character.maxHp || pData.character.hp}, Mana: ${pData.character.mana}/${pData.character.maxMana || pData.character.mana}\nAction: ${pData.action}\n\n`;
-      }
-      prompt += buildBattleMapContext(worldDataRef.current, room.mapState, room.players, { isJudge: true });
-      prompt += `The battle log currently has ${totalLines} lines. You can use the read_battle_history tool to read it if you need context from previous turns. Otherwise, resolve the turn simultaneously.`;
-
-      const readBattleHistory = {
-        name: "read_battle_history",
-        description: "Read the battle history markdown log. Provide start and end lines to read a specific section. The log contains all previous turns.",
-        parameters: {
-          type: "OBJECT",
-          properties: {
-            startLine: { type: "INTEGER", description: "The line number to start reading from (1-indexed)." },
-            endLine: { type: "INTEGER", description: "The line number to end reading at (inclusive)." }
-          },
-          required: ["startLine", "endLine"]
-        }
-      };
-
-      const setupBattleZones = {
-        name: "setup_battle_zones",
-        description: "Generate the battlefield zones for this combat encounter. Call this FIRST on Turn 1 before writing the battle log. Creates the spatial layout of the arena.",
-        parameters: {
-          type: "OBJECT",
-          properties: {
-            zones: {
-              type: "STRING",
-              description: "JSON string of zone definitions. Format: [{\"id\": \"rocky_outcrop\", \"name\": \"Rocky Outcrop\", \"description\": \"A cluster of boulders providing solid cover\", \"connections\": [\"open_field\", \"tower_base\"]}, ...]. Each zone needs id, name, description, and connections (array of connected zone ids)."
-            },
-            combatantZones: {
-              type: "STRING",
-              description: "JSON string mapping EVERY combatant name (players AND NPC allies) to their starting zone id. Format: {\"CharName1\": \"zone_id\", \"CharName2\": \"zone_id\", \"NpcAllyName\": \"zone_id\"}"
-            }
-          },
-          required: ["zones", "combatantZones"]
-        }
-      };
-
-      const submitBattleResult = {
-        name: "submit_battle_result",
-        description: "Submit the updated character states after resolving the turn. Call this AFTER writing the battle log narrative. Always include combatantZones to track where each combatant ends the turn.",
-        parameters: {
-          type: "OBJECT",
-          properties: {
-            characterStates: {
-              type: "STRING",
-              description: "JSON string of character states. Format: {\"CharName1\": {\"hp\": number, \"mana\": number, \"profileMarkdown\": \"optional updated markdown\"}, \"CharName2\": {\"hp\": number, \"mana\": number}}"
-            },
-            combatantZones: {
-              type: "STRING",
-              description: "JSON string mapping EVERY combatant name (players AND NPC allies) to their current zone id after this turn. Format: {\"CharName1\": \"zone_id\", \"NpcAllyName\": \"zone_id\"}"
-            },
-            zoneUpdates: {
-              type: "STRING",
-              description: "Optional JSON string of zone changes (destroyed cover, new hazards, etc). Format: [{\"id\": \"zone_id\", \"description\": \"Updated description after explosion destroyed the wall\"}]"
-            },
-            battlePositions: {
-              type: "STRING",
-              description: "Optional JSON string of per-character map positions for minimap. Format: {\"CharName1\": {\"x\": number, \"y\": number, \"locationId\": \"nearest_or_tactical_location_id\"}, \"CharName2\": {\"x\": number, \"y\": number, \"locationId\": \"...\"}}."
-            }
-          },
-          required: ["characterStates", "combatantZones"]
-        }
-      };
-
-      const aiClient = getAIClient();
-      let contents: any[] = [{ role: 'user', parts: [{ text: prompt }] }];
-      let hasEmittedStart = false;
-      let finalThoughts = "";
-      let finalAnswer = "";
-      let displayedThoughts = "";
-      let displayedAnswer = "";
-
-      let attempts = 0;
-      clearBattleStatusLog('battle-retry');
-
-      while (true) {
-        if (masterAbort.signal.aborted) break;
-        setBattleError(null);
-        setRetryAttempt(attempts);
-
-        // Per-attempt abort controller — chunk timeouts abort this without killing masterAbort
-        const attemptAbort = new AbortController();
-        const onMasterAbort = () => attemptAbort.abort();
-        masterAbort.signal.addEventListener('abort', onMasterAbort);
-
-        try {
-          while (true) {
-            if (attemptAbort.signal.aborted) break;
-            const responseStream = await aiClient.models.generateContentStream({
-              model: settingsRef.current.battleModel,
-              contents: contents,
-              config: {
-                abortSignal: attemptAbort.signal,
-                systemInstruction: fullSysPrompt,
-                temperature: 1.5,
-                thinkingConfig: {
-                  includeThoughts: true,
-                  thinkingBudget: 8192
-                },
-                tools: [{ functionDeclarations: [readBattleHistory as any, setupBattleZones as any, submitBattleResult as any] }]
-              },
-            });
-
-            let hasToolCall = false;
-            let toolCallPart = null;
-            let modelParts = [];
-            let streamedThoughts = "";
-            let streamedAnswer = "";
-
-            // Chunk-level timeout (45s) — start NOW to cover the gap before first chunk
-            const BATTLE_CHUNK_TIMEOUT_MS = 45_000;
-            let battleChunkTimer: ReturnType<typeof setTimeout> | null = null;
-            const clearBattleChunkTimer = () => { if (battleChunkTimer) { clearTimeout(battleChunkTimer); battleChunkTimer = null; } };
-            battleChunkTimer = setTimeout(() => attemptAbort.abort(), BATTLE_CHUNK_TIMEOUT_MS);
-
-            try {
-            for await (const chunk of responseStream) {
-              if (attemptAbort.signal.aborted) break;
-              clearBattleChunkTimer();
-              battleChunkTimer = setTimeout(() => attemptAbort.abort(), BATTLE_CHUNK_TIMEOUT_MS);
-              const parts = chunk.candidates?.[0]?.content?.parts || [];
-              for (const part of parts) {
-                modelParts.push(part);
-                if (part.functionCall) {
-                  hasToolCall = true;
-                  toolCallPart = part;
-                } else if (!hasToolCall) {
-                  const p = part as any;
-                  const isThought = !!p.thought;
-                  const text = typeof p.thought === 'string' ? p.thought : (p.text || "");
-
-                  if (text) {
-                    if (!hasEmittedStart) {
-                      socket.emit('streamTurnResolutionStart');
-                      hasEmittedStart = true;
-                    }
-                    
-                    if (isThought) {
-                      streamedThoughts += text;
-                    } else {
-                      streamedAnswer += text;
-                    }
-                    
-                    // With native tool calling, the answer text IS the battle log directly (no XML tags)
-                    const nextThoughts = finalThoughts + streamedThoughts;
-                    const nextAnswer = (finalAnswer + streamedAnswer).trim();
-                    if (nextThoughts.length >= displayedThoughts.length) {
-                      displayedThoughts = nextThoughts;
-                    }
-                    if (nextAnswer.length >= displayedAnswer.length) {
-                      displayedAnswer = nextAnswer;
-                    }
-                    
-                    socket.emit('streamTurnResolutionChunk', { type: 'thought', text: "REFRESH:" + displayedThoughts });
-                    socket.emit('streamTurnResolutionChunk', { type: 'answer', text: "REFRESH:" + displayedAnswer });
-                  }
-                }
-              }
-            }
-            } finally {
-              clearBattleChunkTimer();
-            }
-            if (attemptAbort.signal.aborted) break;
-
-            finalThoughts += streamedThoughts;
-            finalAnswer += streamedAnswer;
-            displayedThoughts = finalThoughts;
-            displayedAnswer = finalAnswer.trim();
-
-            if (hasToolCall && toolCallPart) {
-              const functionCall = toolCallPart.functionCall;
-              if (!functionCall) {
-                continue;
-              }
-
-              const funcName = functionCall.name;
-              const args = functionCall.args as any;
-              
-              if (funcName === 'read_battle_history') {
-                const start = Math.max(1, args.startLine || 1);
-                const end = Math.min(totalLines, args.endLine || totalLines);
-                const resultText = logLines.slice(start - 1, end).join('\n');
-                
-                contents.push({ role: 'model', parts: modelParts });
-                contents.push({
-                  role: 'user',
-                  parts: [{
-                    functionResponse: {
-                      name: "read_battle_history",
-                      response: { result: resultText }
-                    }
-                  }]
-              });
-              // Loop again to let the model continue
-              } else if (funcName === 'setup_battle_zones') {
-                // AI is setting up the battle arena zones (Turn 1)
-                let zones: BattleZone[] = [];
-                let combatantZones: Record<string, string> = {};
-                try {
-                  zones = typeof args.zones === 'string' ? JSON.parse(args.zones) : args.zones;
-                } catch (e) {
-                  console.error("Failed to parse battle zones", e);
-                }
-                try {
-                  combatantZones = typeof args.combatantZones === 'string' ? JSON.parse(args.combatantZones) : args.combatantZones;
-                } catch (e) {
-                  console.error("Failed to parse combatant zones", e);
-                }
-
-                // Store zones in mapState and emit to server
-                if (zones.length > 0) {
-                  socket.emit('battleZonesSetup', { zones, combatantZones });
-                  syncBattleMapState({ zones, combatantZones });
-                }
-
-                // Respond to the tool call so the model can continue with the battle log
-                contents.push({ role: 'model', parts: modelParts });
-                contents.push({
-                  role: 'user',
-                  parts: [{
-                    functionResponse: {
-                      name: "setup_battle_zones",
-                      response: { result: `Battle zones set up: ${zones.map(z => z.name).join(', ')}. Combatants placed. Now write the battle log and call submit_battle_result.` }
-                    }
-                  }]
-                });
-              } else if (funcName === 'submit_battle_result') {
-                // Native tool call for battle state update
-                let newState = null;
-                try {
-                  newState = typeof args.characterStates === 'string' 
-                    ? JSON.parse(args.characterStates) 
-                    : args.characterStates;
-                } catch (e) {
-                  console.error("Failed to parse battle state from tool call", e);
-                }
-
-                // Process zone position updates
-                let combatantZones: Record<string, string> | null = null;
-                try {
-                  combatantZones = typeof args.combatantZones === 'string'
-                    ? JSON.parse(args.combatantZones)
-                    : args.combatantZones || null;
-                } catch (e) {
-                  console.error("Failed to parse combatant zones", e);
-                }
-
-                // Process zone description updates (destroyed cover, new hazards)
-                let zoneUpdates: { id: string; description: string }[] | null = null;
-                try {
-                  zoneUpdates = typeof args.zoneUpdates === 'string'
-                    ? JSON.parse(args.zoneUpdates)
-                    : args.zoneUpdates || null;
-                } catch (e) {
-                  console.error("Failed to parse zone updates", e);
-                }
-
-                let battlePositionUpdates = null;
-                try {
-                  battlePositionUpdates = typeof args.battlePositions === 'string'
-                    ? JSON.parse(args.battlePositions)
-                    : args.battlePositions;
-                } catch (e) {
-                  console.error("Failed to parse battle positions from tool call", e);
-                }
-
-                const resolvedMapState = mergeBattlePositionUpdates(
-                  worldDataRef.current,
-                  room.mapState,
-                  battlePositionUpdates,
-                  room.players,
-                );
-
-                // Merge zone updates into mapState
-                const finalMapState = resolvedMapState ?? room.mapState;
-                if (combatantZones) {
-                  finalMapState.combatantZones = combatantZones;
-                }
-                if (zoneUpdates && finalMapState.zones) {
-                  for (const update of zoneUpdates) {
-                    const zone = finalMapState.zones.find((z: BattleZone) => z.id === update.id);
-                    if (zone) zone.description = update.description;
-                  }
-                }
-                
-                let thoughts = finalThoughts.trim();
-                let markdownLog = finalAnswer.trim();
-                
-                socket.emit('submitTurnResolution', {
-                  log: markdownLog,
-                  thoughts: thoughts,
-                  state: newState,
-                  mapState: finalMapState,
-                });
-                masterAbort.signal.removeEventListener('abort', onMasterAbort);
-                clearBattleStatusLog('battle-retry');
-                setRetryAttempt(0);
-                setBattleError(null);
-                return;
-              }
-            } else {
-              // Done — no tool call, extract state from text as fallback
-              const combinedOutput = finalThoughts + "\n" + finalAnswer;
-              
-              const stateMatch = combinedOutput.match(/<BATTLE_STATE>([\s\S]*?)(?:<\/BATTLE_STATE>|$)/);
-              let newState = null;
-              if (stateMatch) {
-                try {
-                  newState = JSON.parse(stateMatch[1]);
-                } catch (e) {
-                  console.error("Failed to parse battle state", e);
-                }
-              }
-
-              const positionMatch = combinedOutput.match(/<BATTLE_POSITIONS>([\s\S]*?)(?:<\/BATTLE_POSITIONS>|$)/);
-              let battlePositionUpdates = null;
-              if (positionMatch) {
-                try {
-                  battlePositionUpdates = JSON.parse(positionMatch[1]);
-                } catch (e) {
-                  console.error("Failed to parse battle positions", e);
-                }
-              }
-
-              const resolvedMapState = mergeBattlePositionUpdates(
-                worldDataRef.current,
-                room.mapState,
-                battlePositionUpdates,
-                room.players,
-              );
-
-              let thoughts = finalThoughts.trim();
-              let markdownLog = finalAnswer
-                .replace(/<BATTLE_STATE>[\s\S]*?(?:<\/BATTLE_STATE>|$)/, "")
-                .replace(/<BATTLE_POSITIONS>[\s\S]*?(?:<\/BATTLE_POSITIONS>|$)/, "")
-                .trim();
-              
-              socket.emit('submitTurnResolution', {
-                log: markdownLog,
-                thoughts: thoughts,
-                state: newState,
-                mapState: resolvedMapState ?? room.mapState,
-              });
-              masterAbort.signal.removeEventListener('abort', onMasterAbort);
-              clearBattleStatusLog('battle-retry');
-              setRetryAttempt(0);
-              setBattleError(null);
-              return;
-            }
-          }
-        } catch (error: any) {
-          masterAbort.signal.removeEventListener('abort', onMasterAbort);
-          // Genuine external abort (new turn, game over) — stop entirely
-          if (masterAbort.signal.aborted) return;
-
-          console.error("Error resolving turn:", error);
-
-          // Treat chunk-timeout aborts and retryable API errors the same way
-          const isAbort = error?.name === 'AbortError' || error?.name === 'APIUserAbortError' || error?.message === 'Aborted' || /abort/i.test(error?.message || '');
-          const errorInfo = classifyAIError(error);
-
-          if (errorInfo.retryable || isAbort) {
-            attempts++;
-            const delay = getAIRetryDelaySeconds(attempts);
-            setRetryAttempt(attempts);
-            const reason = isAbort ? 'timeout' : errorInfo.label;
-            setBattleError(`Waiting for model (${attempts}) — ${reason}`);
-            upsertBattleStatusLog('battle-retry', `⏳ Waiting for model (${attempts}) — ${reason}`);
-            await new Promise(resolve => setTimeout(resolve, delay * 1000));
-            continue;
-          }
-
-          const formattedError = formatAIError(errorInfo);
-          socket.emit('error', `Turn resolution failed (Model: ${settingsRef.current.battleModel}). ${formattedError}`);
-          setBattleError(formattedError);
-          upsertBattleStatusLog('battle-retry', `⚠️ Battle resolution error: ${formattedError}`);
-          setRetryAttempt(0);
-          break;
-        }
-      }
-    });
-
-    socket.on('turnResolved', (data) => {
-      // Cancel any in-progress image generation from the previous turn
-      if (battleImageAbortRef.current) {
-        battleImageAbortRef.current.abort();
-        battleImageAbortRef.current = null;
-      }
-      setHasVisualizedThisTurn(false);
-      clearBattleStatusLog('battle-image-generation');
-      npcAllyActionsInFlightRef.current.clear();
-      npcAllyActionRequestIdsRef.current = {};
-      botActionInFlightRef.current = false;
-      for (const id of Object.keys(data.players || {})) {
-        if (id.startsWith('npc_ally_')) {
-          clearBattleStatusLog(`npc-ally-${id}`);
-        }
-      }
-      setBattleLogs(prev => {
-        const filtered = removePendingBattleActionLogs(removeBattleStreamPlaceholders(prev));
-        const thoughts = data.thoughts || "";
-        return [...filtered, `> **Judge's Thoughts:**\n> ${thoughts.replace(/\n/g, '\n> ')}`, data.log];
-      });
-      if (data.players) {
-        setPlayers(data.players);
-      }
-      if (data.mapState) {
-        syncBattleMapState(data.mapState);
-      }
-        
-        // Check win condition
-        const alivePlayers = Object.values(data.players).filter((p: any) => p.character.hp > 0);
-        if (alivePlayers.length <= 1) {
-          const winner = alivePlayers[0] as any;
-          const winnerName = winner ? winner.character.name : "No one";
-          const myName = characterRef.current?.name;
-          const isWin = !!(winner && myName && winner.character.name === myName);
-          setBattleOutcome(isWin ? 'win' : 'loss');
-          setCharacter(prev => {
-            if (!prev) return prev;
-            const b = (prev.battles || 0) + 1;
-            const w = (prev.wins || 0) + (isWin ? 1 : 0);
-            const l = (prev.losses || 0) + (isWin ? 0 : 1);
-            // Update fight counter in profileMarkdown
-            const counterLine = `**Battles: ${b}** (${w}W-${l}L)`;
-            const md = prev.profileMarkdown.replace(/^\*\*Battles: \d+\*\* \(\d+W-\d+L\)\n?/, '');
-            return { ...prev, battles: b, wins: w, losses: l, profileMarkdown: counterLine + '\n' + md };
-          });
-          setBattleLogs(prev => [...prev, `**GAME OVER!** ${winnerName} is victorious!`]);
-          setIsLockedIn(false);
-        } else {
-          const turnId = ++autonomousTurnSequenceRef.current;
-          // Store bot room data for after image completes
-          const room = {
-            id: roomIdRef.current,
-            players: data.players,
-            mapState: data.mapState ?? battleMapState,
-            isBotMatch: isBotMatchRef.current,
-            botDifficulty: botDifficultyRef.current,
-            turnId,
-          };
-          pendingBotRoomRef.current = room.isBotMatch ? room : null;
-          // Unlock typing immediately; awaitingBattleImage still blocks sending until the scene finishes.
-          setIsLockedIn(false);
-          setAwaitingBattleImage(true);
-        }
-      // Auto-generate battle scene image after turn resolution (each client generates their own)
-      setTimeout(() => handleGenerateBattleImageRef.current?.(), 500);
-    });
-
-    socket.on('battleEndedByInactivity', (data: { log: string }) => {
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-        abortControllerRef.current = null;
-      }
-
-      setBattleLogs(prev => [...removePendingBattleActionLogs(removeBattleStreamPlaceholders(prev)), data.log]);
-      setBattleError(null);
-      setRetryAttempt(0);
-      setIsLockedIn(false);
-      setTurnTimerRemaining(null);
-      setRoomId(null);
-      syncBattleMapState(null);
-      setArenaPreparation(null);
-      setRoomTypingIds([]);
-      setLocalRoomTypingIds([]);
-      setBattleInput('');
-      setBattleOutcome('loss'); // Inactivity counts as loss
-      setCharacter(prev => {
-        if (!prev) return prev;
-        const b = (prev.battles || 0) + 1;
-        const l = (prev.losses || 0) + 1;
-        const counterLine = `**Battles: ${b}** (${prev.wins || 0}W-${l}L)`;
-        const md = prev.profileMarkdown.replace(/^\*\*Battles: \d+\*\* \(\d+W-\d+L\)\n?/, '');
-        return { ...prev, battles: b, losses: l, profileMarkdown: counterLine + '\n' + md };
-      });
-      setGameState('post_match');
-    });
-
-    socket.on('streamTurnResolutionStart', () => {
-      setBattleLogs(prev => ensureBattleStreamPlaceholders(prev));
-    });
-
-    socket.on('streamTurnResolutionChunk', (data: { type: 'thought' | 'answer', text: string }) => {
-      setBattleLogs(prev => {
-        const newLogs = ensureBattleStreamPlaceholders(prev);
-        const isRefresh = data.text.startsWith('REFRESH:');
-        const textToAppend = isRefresh ? data.text.substring('REFRESH:'.length) : data.text;
-
-        if (data.type === 'thought') {
-          const idx = newLogs.findIndex(l => l.startsWith(BATTLE_STREAM_THOUGHTS_PREFIX));
-          if (idx !== -1) {
-            if (isRefresh) {
-              newLogs[idx] = BATTLE_STREAM_THOUGHTS_PREFIX + textToAppend;
-            } else {
-              const current = newLogs[idx].substring(BATTLE_STREAM_THOUGHTS_PREFIX.length);
-              newLogs[idx] = BATTLE_STREAM_THOUGHTS_PREFIX + current + textToAppend;
-            }
-          }
-        } else {
-          const idx = newLogs.findIndex(l => l.startsWith(BATTLE_STREAM_ANSWER_PREFIX));
-          if (idx !== -1) {
-            if (isRefresh) {
-              newLogs[idx] = BATTLE_STREAM_ANSWER_PREFIX + textToAppend;
-            } else {
-              const current = newLogs[idx].substring(BATTLE_STREAM_ANSWER_PREFIX.length);
-              newLogs[idx] = BATTLE_STREAM_ANSWER_PREFIX + current + textToAppend;
-            }
-          }
-        }
-        return newLogs;
-      });
-    });
-
-    socket.on('battleImageShared', (data: { imageUrl: string }) => {
-      setBattleLogs(prev => [...prev, `![Battle Scene](${data.imageUrl})`]);
-    });
-
-    socket.on('turnTimerTick', (data: { remaining: number | null }) => {
-      setTurnTimerRemaining(data.remaining);
-    });
-
-    socket.on('turnTimerAutoLocked', (data: { playerId: string; playerName: string }) => {
-      setBattleLogs(prev => [...prev, `⏰ **${data.playerName}** ran out of time and took a defensive stance!`]);
-      if (data.playerId === socket.id) {
-        setIsLockedIn(true);
-      }
-    });
-
-    socket.on('opponentDisconnected', () => {
-      setBattleLogs(prev => [...prev, '**Opponent disconnected.** You win by default!']);
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-      }
-      setArenaPreparation(null);
-      setRoomTypingIds([]);
-      setLocalRoomTypingIds([]);
-    });
-
-    socket.on('npcAllyAction', (data: { npcId: string; npcName: string; action: string }) => {
-      upsertBattleStatusLog(`npc-ally-${data.npcId}`, `🤝 ${data.npcName} locked in an action.`);
-      setBattleLogs(prev => [...prev, `NPC_ALLY_ACTION_**${data.npcName}:** ${data.action}`]);
-    });
-
-    socket.on('error', (msg) => {
-      alert(msg);
-      setIsWaitingForChar(false);
-    });
-
-    // Exploration events
-    socket.on('explorationStarted', (data) => {
-      setExplorationState(prev => {
-        const newDiscovered = [data.locationId];
-        const loc = worldDataRef.current?.locations?.find((l: any) => l.id === data.locationId);
-        if (loc?.connections) {
-          for (const connId of loc.connections) {
-            if (!newDiscovered.includes(connId)) newDiscovered.push(connId);
-          }
-        }
-        return {
-          ...prev,
-          locationId: data.locationId,
-          x: data.x,
-          y: data.y,
-          discoveredLocations: newDiscovered,
-        };
-      });
-      mergeWorldPlayers(data.worldPlayers || []);
-      setWorldNpcs(data.npcStates || []);
-    });
-
-    socket.on('playerMoved', (data) => {
-      moveExplorationStateToLocation(data.locationId, data.x, data.y);
-    });
-
-    socket.on('explorationPlayersUpdated', (players) => {
-      const selfPlayer = (players || []).find((entry: WorldPlayer) => entry.id === socket.id);
-      if (selfPlayer) {
-        setExplorationState(prev => {
-          if (prev.locationId === selfPlayer.locationId && prev.x === selfPlayer.x && prev.y === selfPlayer.y) {
-            return prev;
-          }
-
-          const discoveredLocations = new Set(prev.discoveredLocations);
-          discoveredLocations.add(selfPlayer.locationId);
-          const location = worldDataRef.current?.locations?.find((entry: WorldLocation) => entry.id === selfPlayer.locationId);
-          for (const connectionId of location?.connections || []) {
-            discoveredLocations.add(connectionId);
-          }
-
-          return {
-            ...prev,
-            locationId: selfPlayer.locationId,
-            x: selfPlayer.x,
-            y: selfPlayer.y,
-            discoveredLocations: Array.from(discoveredLocations),
-          };
-        });
-      }
-      mergeWorldPlayers(players || []);
-    });
-
-    socket.on('explorationNpcStatesUpdated', (npcs) => {
-      followingNpcIdsRef.current = new Set((npcs || [])
-        .filter((npc: WorldNpc) => npc.followTargetId === socket.id)
-        .map((npc: WorldNpc) => npc.id));
-      setWorldNpcs(npcs || []);
-    });
-
-    socket.on('playerActing', (data: { id: string; acting: boolean }) => {
-      setWorldPlayers(prev => prev.map(p => p.id === data.id ? { ...p, acting: data.acting } : p));
-    });
-
-    socket.on('sceneImageShared', (data: { fromName: string; locationName: string; imageUrl: string }) => {
-      setExplorationLog(prev => [...prev, { role: 'system', text: `🎨 ${data.fromName} visualized **${data.locationName}**`, imageUrl: data.imageUrl }]);
-    });
-
-    socket.on('explorationLockStatus', (status: {id: string; name: string; lockedIn: boolean}[]) => {
-      setExplorationLockStatus(status);
-      // If lock status cleared (player left, now solo), reset lock state
-      if (status.length === 0) {
-        setIsExplorationLockedIn(false);
-      }
-    });
-
-    socket.on('explorationAllLockedIn', (data: { action: string; allActions: {playerId: string; playerName: string; action: string; locationId: string}[] }) => {
-      console.log('[LOCK] All locked in! allActions:', data.allActions.length);
-      setIsExplorationLockedIn(false);
-      setIsExplorationProcessing(true);
-      setExplorationError(null);
-      setExplorationRetryAttempt(0);
-      
-      // Show all players' actions in the log
-      for (const a of data.allActions) {
-        if (a.playerId !== socket.id) {
-          setExplorationLog(prev => [...prev, { role: 'user' as const, text: `🔒 ${a.action}`, playerName: a.playerName }]);
-        }
-      }
-      // Server handles the unified AI call — results arrive via explorationStreamStart/Chunk/ActionResult
-    });
-
-    // Server-side AI streaming events
-    socket.on('explorationStreamStart', (data: { requestId: string }) => {
-      activeExplorationStreamIdRef.current = data.requestId;
-      upsertExplorationStreamMessage(data.requestId, '', 'thought');
-    });
-
-    socket.on('explorationStreamChunk', (data: { requestId: string; type: 'thought' | 'answer'; text: string }) => {
-      if (activeExplorationStreamIdRef.current && activeExplorationStreamIdRef.current !== data.requestId) return;
-      if (!data.text) return;
-      upsertExplorationStreamMessage(data.requestId, data.text, data.type);
-    });
-
-    socket.on('explorationActionResult', (data: { requestId: string; text: string; thoughts?: string; toolCalls: any[] }) => {
-      if (activeExplorationStreamIdRef.current && activeExplorationStreamIdRef.current !== data.requestId) return;
-      activeExplorationStreamIdRef.current = null;
-      console.log('[SERVER AI] Result received, text length:', data.text?.length, 'tools:', data.toolCalls?.length);
-      setIsExplorationProcessing(false);
-      setExplorationLockStatus([]);
-      setExplorationRetryAttempt(0);
-      setExplorationError(null);
-      clearExplorationStatusMessage('exploration-retry');
-      socket.emit('explorationActing', { acting: false });
-
-      if (data.thoughts?.trim()) {
-        upsertExplorationStreamMessage(data.requestId, data.thoughts, 'thought');
-      } else {
-        clearExplorationStreamMessage(data.requestId, 'thought');
-      }
-
-      if (data.text) {
-        upsertExplorationStreamMessage(data.requestId, data.text, 'answer');
-      } else {
-        clearExplorationStreamMessage(data.requestId, 'answer');
-      }
-
-      // Process tool calls locally
-      if (data.toolCalls?.length > 0) {
-        const toolBadges: string[] = [];
-        for (const tc of data.toolCalls) {
-          if (tc.name === 'update_player_state') {
-            const args = tc.args as any;
-            const changes: string[] = [];
-            setExplorationState(prev => {
-              const newState = { ...prev };
-              if (args.hungerChange) { newState.hunger = Math.min(100, Math.max(0, prev.hunger + args.hungerChange)); changes.push(`hunger ${args.hungerChange > 0 ? '+' : ''}${args.hungerChange}`); }
-              if (args.thirstChange) { newState.thirst = Math.min(100, Math.max(0, prev.thirst + args.thirstChange)); changes.push(`thirst ${args.thirstChange > 0 ? '+' : ''}${args.thirstChange}`); }
-              if (args.staminaChange) { newState.stamina = Math.min(100, Math.max(0, prev.stamina + args.staminaChange)); changes.push(`stamina ${args.staminaChange > 0 ? '+' : ''}${args.staminaChange}`); }
-              if (args.addItems) {
-                try {
-                  const items = typeof args.addItems === 'string' ? JSON.parse(args.addItems) : args.addItems;
-                  const newInv = { ...newState.inventory };
-                  for (const [k, v] of Object.entries(items)) {
-                    newInv[k] = (newInv[k] || 0) + (v as number);
-                    changes.push(`+${v} ${k}`);
-                  }
-                  newState.inventory = newInv;
-                } catch (e) { console.error("Failed to parse addItems", e); }
-              }
-              if (args.removeItems) {
-                try {
-                  const items = typeof args.removeItems === 'string' ? JSON.parse(args.removeItems) : args.removeItems;
-                  const newInv = { ...newState.inventory };
-                  for (const [k, v] of Object.entries(items)) {
-                    newInv[k] = Math.max(0, (newInv[k] || 0) - (v as number));
-                    if (newInv[k] === 0) delete newInv[k];
-                    changes.push(`-${v} ${k}`);
-                  }
-                  newState.inventory = newInv;
-                } catch (e) { console.error("Failed to parse removeItems", e); }
-              }
-              if (args.equipWeapon) { newState.equippedWeapon = args.equipWeapon; changes.push(`equipped ${args.equipWeapon}`); }
-              if (args.equipArmor) { newState.equippedArmor = args.equipArmor; changes.push(`equipped ${args.equipArmor}`); }
-              return newState;
-            });
-            if (args.hpChange) {
-              setCharacter(prev => prev ? { ...prev, hp: Math.min(prev.maxHp, Math.max(0, prev.hp + args.hpChange)) } : prev);
-              changes.push(`hp ${args.hpChange > 0 ? '+' : ''}${args.hpChange}`);
-            }
-            if (args.manaChange) {
-              setCharacter(prev => prev ? { ...prev, mana: Math.min(prev.maxMana, Math.max(0, prev.mana + args.manaChange)) } : prev);
-              changes.push(`mana ${args.manaChange > 0 ? '+' : ''}${args.manaChange}`);
-            }
-            if (args.goldChange) {
-              setCharacter(prev => prev ? { ...prev, gold: Math.max(0, prev.gold + args.goldChange) } : prev);
-              changes.push(`gold ${args.goldChange > 0 ? '+' : ''}${args.goldChange}`);
-            }
-            if (changes.length > 0) {
-              toolBadges.push(`📊 **Stats Updated** — ${changes.join(', ')}`);
-            }
-          } else if (tc.name === 'update_goals') {
-            try {
-              const goals = typeof tc.args.goals === 'string' ? JSON.parse(tc.args.goals) : tc.args.goals;
-              if (Array.isArray(goals)) {
-                setExplorationState(prev => ({ ...prev, goals: goals.slice(0, 5) }));
-                toolBadges.push(`🎯 **Goals Updated** — refreshed quest objectives`);
-              }
-            } catch (e) { console.error("Failed to parse goals", e); }
-          } else if (tc.name === 'trigger_combat') {
-            const enemyName = tc.args.enemyName || 'Unknown Enemy';
-            setExplorationCombatReturn(true);
-            const enemyProfile = `# ${enemyName}\n\nA dangerous creature encountered in the wild.`;
-            
-            // Parse NPC allies
-            let npcAllies: any[] = [];
-            const explicitNpcAllyIds: string[] = [];
-            if (tc.args.npcAllyIds) {
-              try {
-                const allyIds = typeof tc.args.npcAllyIds === 'string' ? JSON.parse(tc.args.npcAllyIds) : tc.args.npcAllyIds;
-                explicitNpcAllyIds.push(...(allyIds || []));
-              } catch (e) { console.error("Failed to parse npcAllyIds", e); }
-            }
-            const localFollowerIds = Array.from(followingNpcIdsRef.current);
-            const mergedNpcAllyIds = Array.from(new Set([...explicitNpcAllyIds, ...localFollowerIds]));
-            const wd = worldDataRef.current;
-            npcAllies = mergedNpcAllyIds.map((npcId: string) => {
-              const npc = wd?.npcs?.[npcId];
-              if (!npc) return null;
-              return { id: npcId, name: npc.name, hp: npc.hp || 60, mana: npc.mana || 40, profileMarkdown: npc.profileMarkdown };
-            }).filter(Boolean);
-            console.log('[FollowerBattle] trigger_combat local ally merge', {
-              explicitNpcAllyIds,
-              localFollowerIds,
-              mergedNpcAllyIds,
-            });
-            
-            // Build enemy profile from world data if available
-            const enemy = wd?.enemies?.[tc.args.enemyId];
-            setCombatEnemyLoot(enemy?.loot || []);
-            const fullProfile = enemy
-              ? `# ${enemy.name}\n\n**HP:** ${enemy.hp}\n**Damage:** ${enemy.damage}\n\n${enemy.description}\n\n### Loot\n${enemy.loot?.map((l: string) => `- ${l}`).join('\n') || 'None'}`
-              : enemyProfile;
-
-            socket.emit('startBotMatch', {
-              difficulty: 'Medium',
-              botProfile: fullProfile,
-              botName: enemyName,
-              npcAllies,
-              unlimitedTurnTime: settingsRef.current.unlimitedTurnTime,
-              arenaPreviewSeconds: settingsRef.current.arenaPreviewSeconds,
-              arenaTweakSeconds: settingsRef.current.arenaTweakSeconds,
-              battleTurnSeconds: settingsRef.current.battleTurnSeconds,
-            });
-            toolBadges.push(`⚔️ **Combat Initiated** — engaging ${enemyName}!`);
-            for (const ally of npcAllies) {
-              toolBadges.push(`🤝 **Allied with ${ally.name}!**`);
-            }
-          } else if (tc.name === 'move_to_location') {
-            const loc = worldDataRef.current?.locations?.find((l: any) => l.id === tc.args.locationId);
-            if (loc) {
-              moveExplorationStateToLocation(loc.id, loc.x, loc.y);
-              setWorldNpcs(prev => prev.map(npc => {
-                if (npc.followTargetId !== socket.id) return npc;
-                return {
-                  ...npc,
-                  locationId: loc.id,
-                  subZoneId: null,
-                };
-              }));
-            }
-            toolBadges.push(`🗺️ **Moved** — traveled to ${loc?.name || tc.args.locationId}`);
-          } else if (tc.name === 'move_to_subzone') {
-            const subZoneId = tc.args.subZoneId;
-            const loc = worldDataRef.current?.locations?.find((l: any) => l.id === explorationState.locationId);
-            const subZone = loc?.subZones?.find((sz: any) => sz.id === subZoneId);
-            if (subZone) {
-              setExplorationState(prev => ({ ...prev, subZoneId }));
-              setWorldNpcs(prev => prev.map(npc => {
-                if (npc.followTargetId !== socket.id || npc.locationId !== explorationState.locationId) return npc;
-                return {
-                  ...npc,
-                  subZoneId,
-                };
-              }));
-            }
-            toolBadges.push(`📍 **Moved** — went to ${subZone?.name || subZoneId}`);
-          } else if (tc.name === 'trigger_pvp_duel') {
-            // Server already handled PVP — just show badge
-            if (tc.args.surprisedPlayerName && tc.args.openingStrikeDamage) {
-              toolBadges.push(`⚔️ **PVP Duel** — ${tc.args.targetPlayerName} was ambushed for ${tc.args.openingStrikeDamage} HP before the battle.`);
-            } else {
-              toolBadges.push(`⚔️ **PVP Duel** — ${tc.args.targetPlayerName}`);
-            }
-          } else if (tc.name === 'set_npc_follow_state') {
-            const resolvedNpcByName = Object.values(worldDataRef.current?.npcs || {}).find((npc: any) => npc?.name?.toLowerCase() === String(tc.args.npcId || '').toLowerCase()) as any;
-            const npcId = worldDataRef.current?.npcs?.[tc.args.npcId]?.id || resolvedNpcByName?.id || tc.args.npcId;
-            const npcName = worldDataRef.current?.npcs?.[npcId]?.name || tc.args.npcId;
-            if (tc.args.mode === 'follow') {
-              const isFollowingMe = !tc.args.followPlayerName
-                || tc.args.followPlayerName?.toLowerCase() === characterRef.current?.name?.toLowerCase();
-              if (isFollowingMe && socket.id) {
-                followingNpcIdsRef.current = new Set([...followingNpcIdsRef.current, npcId]);
-                setWorldNpcs(prev => prev.map(npc => {
-                  if (npc.id !== npcId) return npc;
-                  return {
-                    ...npc,
-                    followTargetId: socket.id,
-                    locationId: explorationState.locationId,
-                    subZoneId: explorationState.subZoneId,
-                  };
-                }));
-              }
-              toolBadges.push(`🤝 **Follower Joined** — ${npcName} is now following ${tc.args.followPlayerName || 'you'}`);
-            } else {
-              const nextFollowingNpcIds = new Set(followingNpcIdsRef.current);
-              nextFollowingNpcIds.delete(npcId);
-              followingNpcIdsRef.current = nextFollowingNpcIds;
-              setWorldNpcs(prev => prev.map(npc => npc.id === npcId ? { ...npc, followTargetId: null } : npc));
-              toolBadges.push(`👋 **Follower Left** — ${npcName} returned to their own route`);
-            }
-          }
-        }
-
-        if (toolBadges.length > 0) {
-          setExplorationLog(prev => [...prev, ...toolBadges.map(badge => ({ role: 'system' as const, text: badge }))]);
-        }
-      }
-
-      // Survival: starvation/dehydration HP drain
-      setExplorationState(prev => {
-        let hpDrain = 0;
-        if (prev.hunger <= 0) hpDrain += 5;
-        if (prev.thirst <= 0) hpDrain += 5;
-        if (hpDrain > 0) {
-          setCharacter(c => c ? { ...c, hp: Math.max(0, c.hp - hpDrain) } : c);
-          setExplorationLog(logs => [...logs, { role: 'system', text: `💀 You lost ${hpDrain} HP from ${prev.hunger <= 0 && prev.thirst <= 0 ? 'starvation and dehydration' : prev.hunger <= 0 ? 'starvation' : 'dehydration'}!` }]);
-        }
-        return prev;
-      });
-
-      // Trigger token compaction check
-      compactConversation();
-    });
-
-    socket.on('explorationRetry', (data: { requestId: string; attempt: number; delay: number; label: string }) => {
-      if (activeExplorationStreamIdRef.current && activeExplorationStreamIdRef.current !== data.requestId) return;
-      setExplorationRetryAttempt(data.attempt);
-      setExplorationError(`Waiting for model (${data.attempt})...`);
-      upsertExplorationStatusMessage('exploration-retry', `⏳ Waiting for model (${data.attempt})...`);
-      upsertExplorationStreamMessage(data.requestId, '', 'thought');
-    });
-
-    socket.on('explorationActionError', (data: { requestId: string; message: string }) => {
-      if (activeExplorationStreamIdRef.current && activeExplorationStreamIdRef.current !== data.requestId) return;
-      activeExplorationStreamIdRef.current = null;
-      setIsExplorationProcessing(false);
-      setExplorationLockStatus([]);
-      setExplorationRetryAttempt(0);
-      setExplorationError(`Error: ${data.message}`);
-      socket.emit('explorationActing', { acting: false });
-      clearExplorationStreamMessage(data.requestId);
-      upsertExplorationStatusMessage('exploration-retry', `⚠️ Exploration error: ${data.message}`);
-    });
-
-    socket.on('pvpChallengeReceived', (data: { challengerId: string; challengerName: string }) => {
-      // Auto-accept PVP challenges — battles are unavoidable
-      socket.emit('acceptPvpChallenge', { challengerId: data.challengerId });
-      setExplorationLog(prev => [...prev, { role: 'system', text: `⚔️ ${data.challengerName} challenges you to battle!` }]);
-    });
-
-    socket.on('pvpChallengeDeclined', (data: { declinedBy: string }) => {
-      setExplorationLog(prev => [...prev, { role: 'system', text: `${data.declinedBy} declined your challenge.` }]);
-    });
-
-    socket.on('explorationChatMessage', (data: { fromId: string; fromName: string; message: string }) => {
-      setExplorationLog(prev => [...prev, { role: 'user' as const, text: data.message, playerName: data.fromName }]);
-    });
-
-    socket.on('tradeOfferReceived', (data: { offerId: string; fromName: string; text: string }) => {
-      setExplorationLog(prev => [...prev, { role: 'system', text: `💱 ${data.text}` }]);
-    });
-
-    socket.on('tradeOfferUpdate', (data: { text: string }) => {
-      setExplorationLog(prev => [...prev, { role: 'system', text: `💱 ${data.text}` }]);
-    });
-
-    return () => {
-      socket.off('characterSaved');
-      socket.off('waitingForOpponent');
-      socket.off('arenaPreparationState');
-      socket.off('roomPlayersUpdated');
-      socket.off('matchFound');
-      socket.off('battleMapStateUpdated');
-      socket.off('battleMapMovementLog');
-      socket.off('battleActionsSubmitted');
-      socket.off('typingStatusUpdated');
-      socket.off('playerLockedIn');
-      socket.off('requestTurnResolution');
-      socket.off('turnResolved');
-      socket.off('battleEndedByInactivity');
-      socket.off('opponentDisconnected');
-      socket.off('battleImageShared');
-      socket.off('turnTimerTick');
-      socket.off('turnTimerAutoLocked');
-      socket.off('error');
-      socket.off('explorationStarted');
-      socket.off('playerMoved');
-      socket.off('explorationPlayersUpdated');
-      socket.off('explorationNpcStatesUpdated');
-      socket.off('playerActing');
-      socket.off('sceneImageShared');
-      socket.off('explorationLockStatus');
-      socket.off('explorationAllLockedIn');
-      socket.off('explorationStreamStart');
-      socket.off('explorationStreamChunk');
-      socket.off('explorationActionResult');
-      socket.off('explorationActionError');
-      socket.off('explorationRetry');
-      socket.off('explorationChatMessage');
-      socket.off('pvpChallengeReceived');
-      socket.off('pvpChallengeDeclined');
-      socket.off('tradeOfferReceived');
-      socket.off('tradeOfferUpdate');
-      socket.off('npcAllyAction');
-    };
-  }, []);
-
-  // Check DB availability and load global settings + cloud characters on auth
-  useEffect(() => {
-    fetch(`${BACKEND_URL}/api/health`).then(r => r.json()).then(d => setDbAvailable(!!d.dbConnected)).catch(() => {});
-    // Load shared debug settings from server — only if localStorage didn't already have durations
-    // (localStorage is authoritative when present; server is just a cross-device sync fallback)
-    fetch(`${BACKEND_URL}/api/settings`).then(r => r.json()).then(data => {
-      if (data && typeof data === 'object' && !hadLocalDurations.current) {
-        setSettings(prev => ({
-          ...prev,
-          ...(typeof data.unlimitedTurnTime === 'boolean' ? { unlimitedTurnTime: data.unlimitedTurnTime } : {}),
-          ...(typeof data.arenaPreviewSeconds === 'number' ? { arenaPreviewSeconds: data.arenaPreviewSeconds } : {}),
-          ...(typeof data.arenaTweakSeconds === 'number' ? { arenaTweakSeconds: data.arenaTweakSeconds } : {}),
-          ...(typeof data.battleTurnSeconds === 'number' ? { battleTurnSeconds: data.battleTurnSeconds } : {}),
-        }));
-      }
-    }).catch(() => {});
-  }, []);
-
-  useEffect(() => {
-    if (authToken) {
-      // Load characters from cloud
-      fetch(`${BACKEND_URL}/api/account/characters`, {
-        headers: { 'Authorization': `Bearer ${authToken}` }
-      })
-        .then(r => { if (!r.ok) throw new Error('Auth expired'); return r.json(); })
-        .then(data => {
-          if (data.characters?.length > 0) {
-            const normalizedCharacters = normalizeCharacters(data.characters);
-            const preferredCharacter = pickPreferredCharacter(
-              normalizedCharacters,
-              activeCharacterNameRef.current,
-              data.activeCharacterIndex || 0,
-            );
-            setCharacters(normalizedCharacters);
-            setCharacter(preferredCharacter);
-          }
-        })
-        .catch(() => {
-          // Token expired, clear auth
-          localStorage.removeItem('duo_auth_token');
-          localStorage.removeItem('duo_auth_user');
-          setAuthToken(null);
-          setAuthUser(null);
-        });
-    }
-  }, [authToken]);
-
-  const handleAuth = async () => {
-    setAuthError('');
-    setAuthLoading(true);
-    try {
-      const res = await fetch(`${BACKEND_URL}/api/auth/${authMode}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: authUsername, password: authPassword })
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Auth failed');
-      
-      localStorage.setItem('duo_auth_token', data.token);
-      localStorage.setItem('duo_auth_user', data.displayName || data.username);
-      setAuthToken(data.token);
-      setAuthUser(data.displayName || data.username);
-      setShowAuthModal(false);
-      setAuthUsername('');
-      setAuthPassword('');
-      
-      // If server returned characters, load them
-      if (data.characters?.length > 0) {
-        const normalizedCharacters = normalizeCharacters(data.characters);
-        const preferredCharacter = pickPreferredCharacter(
-          normalizedCharacters,
-          activeCharacterNameRef.current,
-          data.activeCharacterIndex || 0,
-        );
-        setCharacters(normalizedCharacters);
-        setCharacter(preferredCharacter);
-      }
-    } catch (e: any) {
-      setAuthError(e.message);
-    } finally {
-      setAuthLoading(false);
-    }
-  };
-
-  const handleLogout = () => {
-    localStorage.removeItem('duo_auth_token');
-    localStorage.removeItem('duo_auth_user');
-    setAuthToken(null);
-    setAuthUser(null);
-  };
-
-  // Sync characters to cloud when they change
-  const syncCharactersToCloud = useCallback(async () => {
-    if (!authToken || characters.length === 0) return;
-    const activeIndex = character ? characters.findIndex(c => c.name === character.name) : 0;
-    try {
-      const res = await fetch(`${BACKEND_URL}/api/account/characters`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` },
-        body: JSON.stringify({ characters: stripCharacterImagesForCloud(characters), activeCharacterIndex: Math.max(0, activeIndex) })
-      });
-      if (!res.ok) console.error("[Sync] Failed:", res.status, await res.text());
-      else console.log("[Sync] Characters synced to cloud successfully");
-    } catch (e) {
-      console.error("[Sync] Failed to sync characters to cloud", e);
-    }
-  }, [authToken, characters, character]);
-
-  // Sync to cloud when characters change
-  useEffect(() => {
-    if (authToken && characters.length > 0) {
-      const timeout = setTimeout(() => syncCharactersToCloud(), 1000);
-      return () => clearTimeout(timeout);
-    }
-  }, [characters, authToken, syncCharactersToCloud]);
-
-  useEffect(() => {
-    if (!authToken) return;
-
-    const charactersWithAvatars = characters.filter(entry => !!entry.imageUrl);
-    if (charactersWithAvatars.length === 0) return;
-
-    let cancelled = false;
-
-    const syncAvatars = async () => {
-      for (const entry of charactersWithAvatars) {
-        if (cancelled) return;
-        try {
-          await syncCharacterAvatarToCloud(entry);
-        } catch (error) {
-          console.error('[Avatar Sync] Failed to sync character avatar', entry.name, error);
-        }
-      }
-    };
-
-    syncAvatars();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [authToken, characters, syncCharacterAvatarToCloud]);
-
-  const handleSendCharMessage = async () => {
-    if (!inputText.trim() || isWaitingForChar || (gameStateRef.current === 'arena_prep' && !!players[socket.id || '']?.lockedIn)) return;
-    
-    const sentText = inputText.trim();
-    clearTypingPresence('character');
-    const newMessages = [...messages, { role: 'user' as const, text: sentText }];
-    setMessages(newMessages);
-    setInputText('');
-    if (charInputRef.current) charInputRef.current.style.height = 'auto';
-    setIsWaitingForChar(true);
-    setCharCreatorError(null);
-    setCharCreatorRetryAttempt(0);
-    clearChatStatusMessage('char-creator-retry');
-    
-    const sysPromptRes = await fetch(`${BACKEND_URL}/api/prompts/char_creator.txt`);
-    const sysPrompt = await sysPromptRes.text();
-
-    let fullSysPrompt = sysPrompt;
-    if (character) {
-      fullSysPrompt += `\n\nExisting Character Profile (The user is tweaking this):\n${JSON.stringify(character)}\n\nIMPORTANT: The user is TWEAKING an existing character. Ask clarifying questions about what they want to change before outputting a new state. Do NOT jump straight to creating — iterate with the user. When you do save the character, this is an UPDATE, not a creation.`;
-    }
-
-    // Function declaration for native tool calling
-    const saveCharacterTool = {
-      name: "save_character",
-      description: "Save or update the character state. Call this when the character is fully defined.",
-      parameters: {
-        type: "OBJECT",
-        properties: {
-          name: { type: "STRING", description: "The character's name" },
-          hp: { type: "INTEGER", description: "Current HP (default 100)" },
-          maxHp: { type: "INTEGER", description: "Max HP (default 100)" },
-          mana: { type: "INTEGER", description: "Current Mana (default 100)" },
-          maxMana: { type: "INTEGER", description: "Max Mana (default 100)" },
-          gold: { type: "INTEGER", description: `Current gold coins (default ${DEFAULT_STARTING_GOLD})` },
-          profileMarkdown: { type: "STRING", description: "Comprehensive markdown character profile with stats, abilities, inventory, etc." }
-        },
-        required: ["name", "hp", "maxHp", "mana", "maxMana", "profileMarkdown"]
-      }
-    };
-
-    // Format history for Gemini — filter out system messages and use proper multi-turn format
-    const chatMessages = newMessages.filter(m => m.role !== 'system');
-    const contents = chatMessages.map(m => ({
-      role: m.role === 'user' ? 'user' : 'model',
-      parts: [{ text: m.text }]
-    }));
-    const aiClient = getAIClient();
-
-    const charApiConfig = {
-      model: settingsRef.current.charModel,
-      contents: contents,
-      config: {
-        systemInstruction: fullSysPrompt,
-        temperature: 0.7,
-        thinkingConfig: { includeThoughts: true },
-        tools: [{ functionDeclarations: [saveCharacterTool as any] }]
-      },
-    };
-
-    let attempts = 0;
-
-    while (true) {
-      setCharCreatorError(null);
-      setCharCreatorRetryAttempt(attempts);
-
-      // Abort any previous request
-      if (charAbortRef.current) charAbortRef.current.abort();
-      const abortController = new AbortController();
-      charAbortRef.current = abortController;
-
-      try {
-        const responseStream = await aiClient.models.generateContentStream({
-          ...charApiConfig,
-          config: { ...charApiConfig.config, abortSignal: abortController.signal },
-        });
-        
-        let fullText = "";
-        let currentModelMessage = "";
-        let toolCallData: any = null;
-        
-        // Add a placeholder for the model's response
-        setMessages(prev => [...prev, { role: 'model', text: "" }]);
-
-        // Stream with chunk-level timeout (45s between chunks).
-        // Start the timer NOW so there is a timeout before the first chunk too.
-        const CHUNK_TIMEOUT_MS = 45_000;
-        let chunkTimer: ReturnType<typeof setTimeout> | null = null;
-        const clearChunkTimer = () => { if (chunkTimer) { clearTimeout(chunkTimer); chunkTimer = null; } };
-        chunkTimer = setTimeout(() => abortController.abort(), CHUNK_TIMEOUT_MS);
-        
-        try {
-          for await (const chunk of responseStream) {
-            if (abortController.signal.aborted) throw new Error('Aborted');
-            clearChunkTimer();
-            chunkTimer = setTimeout(() => abortController.abort(), CHUNK_TIMEOUT_MS);
-
-            const parts = chunk.candidates?.[0]?.content?.parts || [];
-            for (const part of parts) {
-              if (part.functionCall) {
-                toolCallData = part.functionCall;
-              } else if ((part as any).thought) {
-                // Skip thought parts
-              } else {
-                fullText += (part as any).text || "";
-              }
-            }
-            
-            const displayText = fullText.trim();
-            if (displayText !== currentModelMessage) {
-              currentModelMessage = displayText;
-              setMessages(prev => {
-                const newMsgs = [...prev];
-                newMsgs[newMsgs.length - 1] = { role: 'model', text: displayText };
-                return newMsgs;
-              });
-            }
-          }
-        } finally {
-          clearChunkTimer();
-        }
-        
-        // Handle tool call (native function calling)
-        if (toolCallData && toolCallData.name === 'save_character') {
-          const state = toolCallData.args as any;
-          socket.emit('characterCreated', {
-            name: state.name,
-            hp: state.hp || 100,
-            maxHp: state.maxHp || 100,
-            mana: state.mana || 100,
-            maxMana: state.maxMana || 100,
-            gold: state.gold ?? DEFAULT_STARTING_GOLD,
-            profileMarkdown: state.profileMarkdown || ""
-          });
-        } else {
-          // Fallback: check for XML tags in case the model didn't use tool calling
-          const stateMatch = fullText.match(/<CHAR_STATE>([\s\S]*?)<\/CHAR_STATE>/);
-          if (stateMatch) {
-            try {
-              const state = JSON.parse(stateMatch[1]);
-              socket.emit('characterCreated', normalizeCharacter(state));
-            } catch (e) {
-              console.error("Failed to parse char state", e);
-            }
-          }
-        }
-
-        // Success
-        clearChatStatusMessage('char-creator-retry');
-        setCharCreatorRetryAttempt(0);
-        setCharCreatorError(null);
-        break;
-
-      } catch (error: any) {
-        console.error("Error creating character:", error);
-
-        // Treat abort (timeout) as retryable
-        const isAbort = error?.name === 'AbortError' || error?.name === 'APIUserAbortError' || error?.message === 'Aborted' || /abort/i.test(error?.message || '');
-        const errorInfo = classifyAIError(error);
-
-        if (errorInfo.retryable || isAbort) {
-          // Remove the empty model placeholder from failed attempt
-          setMessages(prev => {
-            const newMsgs = [...prev];
-            if (newMsgs.length > 0 && newMsgs[newMsgs.length - 1].role === 'model' && !newMsgs[newMsgs.length - 1].text) {
-              newMsgs.pop();
-            }
-            return newMsgs;
-          });
-          attempts++;
-          const delay = getAIRetryDelaySeconds(attempts);
-          setCharCreatorRetryAttempt(attempts);
-          const reason = isAbort ? 'timeout' : errorInfo.label;
-          setCharCreatorError(`Waiting for model (${attempts}) — ${reason}`);
-          upsertChatStatusMessage('char-creator-retry', `⏳ Waiting for model (${attempts}) — ${reason}`);
-          await new Promise(resolve => setTimeout(resolve, delay * 1000));
-          continue;
-        }
-
-        const formattedError = formatAIError(errorInfo);
-        const errorMsg = `[SYSTEM ERROR]: Failed to generate response using model ${settingsRef.current.charModel}. ${formattedError}`;
-        setMessages(prev => {
-          const newMsgs = [...prev];
-          if (newMsgs.length > 0 && newMsgs[newMsgs.length - 1].role === 'model' && !newMsgs[newMsgs.length - 1].text) {
-            newMsgs.pop();
-          }
-          return [...newMsgs, { role: 'system', text: errorMsg }];
-        });
-        setCharCreatorRetryAttempt(0);
-        setCharCreatorError(formattedError);
-        upsertChatStatusMessage('char-creator-retry', `⚠️ Character creator error: ${formattedError}`);
-        break;
-      }
-    }
-
-    setIsWaitingForChar(false);
-  };
-
-  // ============ EXPLORATION HANDLERS ============
-
-  const getCurrentLocation = (): WorldLocation | null => {
-    if (!worldData) return null;
-    return worldData.locations.find((l: WorldLocation) => l.id === explorationState.locationId) || null;
-  };
-
-  const getConnectedLocations = (): WorldLocation[] => {
-    if (!worldData) return [];
-    const current = getCurrentLocation();
-    if (!current) return [];
-    return current.connections
-      .map((id: string) => worldData.locations.find((l: WorldLocation) => l.id === id))
-      .filter(Boolean);
-  };
-
-  const handleEnterExploration = () => {
-    if (!character) {
-      setActiveTab('profile');
-      setGameState('char_creation');
-      return;
-    }
-    socket.emit('enterExploration', {});
-    setGameState('exploration');
-    setExplorationLog([]);
-    setExplorationState(prev => ({
-      ...prev,
-      hunger: 100,
-      thirst: 100,
-      stamina: 100,
-      inventory: {},
-      goals: ['Find a water source', 'Talk to a local', 'Gather some wood', 'Explore a new area', 'Craft your first tool'],
-    }));
-  };
-
-  const handleExplorationMove = (locationId: string) => {
-    socket.emit('moveToLocation', { locationId });
-    setIsExplorationLockedIn(false);
-    setExplorationLockStatus([]);
-    
-    setExplorationState(prev => ({
-      ...prev,
-      stamina: Math.max(0, prev.stamina - 5),
-      hunger: Math.max(0, prev.hunger - 3),
-      thirst: Math.max(0, prev.thirst - 4),
-    }));
-
-    const location = worldData?.locations?.find((l: WorldLocation) => l.id === locationId);
-    if (location) {
-      // Instant movement — just update log with a system message, no LLM call
-      setExplorationLog(prev => [...prev, { role: 'system', text: `🗺️ Moved to **${location.name}**` }]);
-    }
-  };
-
-  const handleBattleMapMove = (locationId: string) => {
-    if (!roomId) return;
-
-    const location = worldData?.locations?.find((entry: WorldLocation) => entry.id === locationId);
-    if (!location) return;
-
-    syncBattleMapState({
-      discoveredLocations: Array.from(new Set([
-        ...battleMapState.discoveredLocations,
-        location.id,
-        ...(location.connections || []),
-      ])),
-      players: battleMapState.players.map(player => player.id === socket.id ? {
-        ...player,
-        locationId: location.id,
-        x: location.x,
-        y: location.y,
-      } : player),
-      npcs: battleMapState.npcs,
-    });
-    socket.emit('battleMoveToLocation', { roomId, locationId });
-  };
-
-  // Exploration actions are now handled server-side via socket events
-  // (explorationAction for solo, explorationLockIn for multiplayer)
-
-  // Exploration AI is now handled entirely server-side
-
-  const getExplorationContext = () => ({
-    apiKey: settingsRef.current.apiKey?.trim() || '',
-    model: settingsRef.current.explorationModel,
-    explorationState,
-    recentLog: explorationLog.slice(-30).map(m => `${m.role === 'user' ? 'Player' : 'Guide'}: ${m.text}`),
-    summary: explorationSummary || undefined,
-  });
-
-  const isImmediateExplorationAction = (action: string) => {
-    const normalized = action.toLowerCase();
-    const directTradeVerb = /^(?:buy|purchase|sell|offer|trade|accept(?:\s+trade)?|decline(?:\s+trade)?)/i;
-    if (directTradeVerb.test(normalized)) return true;
-    return false;
-  };
-
-  const handleExplorationSend = () => {
-    const action = explorationInput.trim();
-    if (!action || isExplorationProcessing || isExplorationLockedIn) return;
-    clearTypingPresence('exploration');
-    
-    // Detect chat messages — bypass LLM and broadcast directly
-    const chatMatch = action.match(/^(?:i\s+(?:say|chat|tell|shout|whisper|yell|call\s+out)|".*"$|'.*'$)/i);
-    if (chatMatch) {
-      // Extract the spoken text
-      let chatText = action;
-      // Remove "I say/chat/tell..." prefix to get the actual message
-      const prefixMatch = action.match(/^i\s+(?:say|chat|tell|shout|whisper|yell|call\s+out)\s*(?:to\s+\w+\s*)?[":]\s*/i);
-      if (prefixMatch) {
-        chatText = action.slice(prefixMatch[0].length).replace(/^["']|["']$/g, '');
-      } else {
-        chatText = action.replace(/^["']|["']$/g, '');
-      }
-      
-      setExplorationInput('');
-      if (explorationInputRef.current) explorationInputRef.current.style.height = 'auto';
-      
-      // Show locally as own chat message
-      setExplorationLog(prev => [...prev, { role: 'user' as const, text: chatText }]);
-      // Broadcast to nearby players
-      socket.emit('explorationChat', { message: chatText });
-      return;
-    }
-    
-    setExplorationInput('');
-    if (explorationInputRef.current) explorationInputRef.current.style.height = 'auto';
-    
-    const othersInWorld = worldPlayers.filter(p => p.id !== socket.id);
-    const isImmediateAction = isImmediateExplorationAction(action);
-    if (othersInWorld.length > 0 && !isImmediateAction) {
-      // Multiplayer: lock in action and wait for others
-      setIsExplorationLockedIn(true);
-      setExplorationLog(prev => [...prev, { role: 'user', text: `🔒 ${action}` }]);
-      socket.emit('explorationLockIn', { action, ...getExplorationContext() });
-    } else {
-      // Solo or immediate deterministic action: send action to server now
-      setExplorationLog(prev => [...prev, { role: 'user', text: action }]);
-      setIsExplorationProcessing(true);
-      setExplorationError(null);
-      setExplorationRetryAttempt(0);
-      clearExplorationStatusMessage('exploration-retry');
-      socket.emit('explorationActing', { acting: true });
-      socket.emit('explorationAction', { action, ...getExplorationContext() });
-    }
-  };
-
-  const handleExplorationUnlock = () => {
-    clearTypingPresence('exploration');
-    setIsExplorationLockedIn(false);
-    socket.emit('explorationUnlock');
-    // Remove the last locked-in user message
-    setExplorationLog(prev => {
-      const logs = [...prev];
-      for (let i = logs.length - 1; i >= 0; i--) {
-        if (logs[i].role === 'user' && logs[i].text.startsWith('🔒 ')) {
-          const originalText = logs[i].text.slice(2).trim();
-          logs.splice(i, 1);
-          setExplorationInput(originalText);
-          break;
-        }
-      }
-      return logs;
-    });
-  };
-
-  const handleGenerateCharImage = async () => {
-    if (!character || isGeneratingCharImage) return;
-    setIsGeneratingCharImage(true);
-    console.log("[Portrait] Starting generation for:", character.name);
-    const generationMessageId = `avatar-generation-${character.name}-${Date.now()}`;
-    setMessages(prev => [...prev, { role: 'system', text: '🎨 Generating portrait... this may take a moment.', streamId: generationMessageId }]);
-    try {
-      const aiClient = getAIClient();
-      const prompt = `Generate a fantasy character portrait for: ${character.name}. ${character.profileMarkdown.substring(0, 500)}. Style: detailed digital art, fantasy RPG character portrait, vibrant colors. Draw the character in their true form — they may be a creature, monster, spirit, or non-human entity. Do NOT default to humanoid. Do NOT include any text, stats, UI elements, health bars, or labels in the image.`;
-      
-      console.log("[Portrait] Sending request to gemini-3.1-pro-image-preview");
-      const response = await aiClient.models.generateContent({
-        model: 'gemini-3.1-flash-image-preview',
-        contents: prompt,
-        config: {
-          responseModalities: ['IMAGE', 'TEXT'],
-        },
-      });
-
-      console.log("[Portrait] Response received, checking parts...");
-      const parts = response.candidates?.[0]?.content?.parts || [];
-      console.log("[Portrait] Parts count:", parts.length);
-      const imageFrames = extractInlineImageFrames(parts);
-      if (imageFrames.length > 0) {
-        const optimizedImageUrl = await optimizeCharacterAvatar(imageFrames[imageFrames.length - 1]);
-        setCharacter(prev => prev ? { ...prev, imageUrl: optimizedImageUrl } : prev);
-        setMessages(prev => {
-          const filtered = prev.filter(message => message.streamId !== generationMessageId);
-          return [...filtered, {
-            role: 'system',
-            text: '🎨 Portrait generated!',
-            imageUrl: optimizedImageUrl,
-            imageFrames: imageFrames.length > 1 ? imageFrames : undefined,
-            imageFrameFps: imageFrames.length > 1 ? 60 : undefined,
-          }];
-        });
-        console.log("[Portrait] Success! Image generated.");
-        return;
-      }
-      console.warn("[Portrait] No image data in response parts:", parts.map(p => Object.keys(p)));
-      setMessages(prev => [...prev, { role: 'system', text: '⚠️ No image was generated. Try again.' }]);
-    } catch (error: any) {
-      console.error("[Portrait] Generation error:", error);
-      setMessages(prev => [...prev, { role: 'system', text: `⚠️ Image generation failed: ${error.message}` }]);
-    } finally {
-      setMessages(prev => prev.filter(message => message.streamId !== generationMessageId));
-      setIsGeneratingCharImage(false);
-    }
-  };
-
-  const handleVisualizeScene = async () => {
-    if (!worldData || !explorationState.locationId || isVisualizingScene) return;
-    const loc = getCurrentLocation();
-    if (!loc) return;
-    setIsVisualizingScene(true);
-    
-    try {
-      const aiClient = getAIClient();
-      const prompt = `Generate a scenic landscape illustration of: ${loc.name}. ${loc.description}. Style: fantasy RPG environment art, wide landscape, atmospheric lighting, detailed.`;
-      
-      const response = await aiClient.models.generateContent({
-        model: 'gemini-3-pro-image-preview',
-        contents: prompt,
-        config: {
-          responseModalities: ['IMAGE', 'TEXT'],
-        },
-      });
-
-      const parts = response.candidates?.[0]?.content?.parts || [];
-      for (const part of parts) {
-        if ((part as any).inlineData) {
-          const imageData = (part as any).inlineData;
-          const imageUrl = `data:${imageData.mimeType};base64,${imageData.data}`;
-          setExplorationLog(prev => [...prev, { role: 'system', text: `🎨 Scene: **${loc.name}**`, imageUrl }]);
-          // Share with other players at the same location
-          socket.emit('shareSceneImage', { locationId: explorationState.locationId, imageUrl, locationName: loc.name });
-          return;
-        }
-      }
-    } catch (error: any) {
-      console.error("Scene visualization error:", error);
-      setExplorationLog(prev => [...prev, { role: 'system', text: `[ERROR]: Scene visualization failed: ${error.message}` }]);
-    } finally {
-      setIsVisualizingScene(false);
-    }
-  };
-
-  // ============ END EXPLORATION HANDLERS ============
-
-  const handleGenerateBattleImage = async () => {
-    if (hasVisualizedThisTurn) {
-      // Already visualized — still signal ready in case server is waiting
-      setAwaitingBattleImage(false);
-      setIsLockedIn(false);
-      socket.emit('readyForNextTurn');
-      return;
-    }
-    // Cancel any in-progress image generation
-    if (battleImageAbortRef.current) battleImageAbortRef.current.abort();
-    const imageAbort = new AbortController();
-    battleImageAbortRef.current = imageAbort;
-    setIsGeneratingBattleImage(true);
-    upsertBattleStatusLog('battle-image-generation', '🎨 Generating battle image...');
-    try {
-      const aiClient = getAIClient();
-      // Extract the most recent player actions (what players actually declared)
-      const lastActions = [...battleLogs].reverse().find(l => l.startsWith(BATTLE_PLAYER_ACTIONS_PREFIX));
-      const playerActions = lastActions ? lastActions.substring(BATTLE_PLAYER_ACTIONS_PREFIX.length) : '';
-      // Get the most recent narrative log (judge's turn result)
-      const narrativeLogs = battleLogs
-        .filter(l => !l.startsWith('STREAMING_') && !l.startsWith('>') && !l.startsWith('PLAYER_ACTIONS_') && !l.startsWith(BATTLE_PENDING_ACTION_PREFIX) && !l.startsWith('STATUS_IMAGE'))
-        .slice(-2)
-        .join('\n')
-        .substring(0, 800);
-      const playerDescriptions = Object.values(players).map((p: any) => {
-        const c = p.character;
-        return `${c.name} (HP: ${c.hp}/${c.maxHp}, Mana: ${c.mana}/${c.maxMana})`;
-      }).join(' vs ');
-      const prompt = `Generate a dramatic battle scene illustration showing EXACTLY what is described below. Focus on the SPECIFIC ACTIONS — do NOT draw a generic standoff.\n\nCombatants: ${playerDescriptions}\n\n${playerActions ? `CRITICAL — Players declared these actions (SHOW THESE):\n${playerActions}\n\n` : ''}What happened this turn:\n${narrativeLogs}\n\nBelow are reference images of the combatants. Use them to accurately depict each character's appearance.\n\nStyle: Dynamic fantasy RPG battle art. Show the SPECIFIC attacks, grapples, spells, and physical interactions described above — characters should be in direct contact/action, NOT standing apart. Dramatic action poses, magical effects, vibrant colors, cinematic composition. No text, no UI, no health bars, no labels.`;
-
-      // Build multimodal content parts: text prompt + avatar images
-      const contentParts: any[] = [{ text: prompt }];
-      Object.values(players).forEach((p: any) => {
-        const avatarUrl = p.character?.imageUrl;
-        if (avatarUrl && avatarUrl.startsWith('data:')) {
-          const match = avatarUrl.match(/^data:(image\/\w+);base64,(.+)$/);
-          if (match) {
-            contentParts.push({
-              text: `Reference image for ${p.character.name}:`,
-            });
-            contentParts.push({
-              inlineData: { mimeType: match[1], data: match[2] },
-            });
-          }
-        }
-      });
-
-      if (imageAbort.signal.aborted) throw new Error('Aborted');
-      const response = await aiClient.models.generateContent({
-        model: 'gemini-3-pro-image-preview',
-        contents: [{ role: 'user', parts: contentParts }],
-        config: {
-          responseModalities: ['IMAGE', 'TEXT'],
-          abortSignal: imageAbort.signal,
-        },
-      });
-      if (imageAbort.signal.aborted) throw new Error('Aborted');
-
-      const parts = response.candidates?.[0]?.content?.parts || [];
-      for (const part of parts) {
-        if ((part as any).inlineData) {
-          const imageData = (part as any).inlineData;
-          const imageUrl = `data:${imageData.mimeType};base64,${imageData.data}`;
-          setBattleLogs(prev => [...prev, `STATUS_IMAGE::🎨 The scene takes shape...`, `STATUS_IMAGE_URL::${imageUrl}`]);
-          setHasVisualizedThisTurn(true);
-          return;
-        }
-      }
-    } catch (error: any) {
-      if (error?.name !== 'AbortError' && error?.name !== 'APIUserAbortError' && error?.message !== 'Aborted') {
-        console.error("Battle image error:", error);
-      }
-    } finally {
-      setIsGeneratingBattleImage(false);
-      // Image done (success or fail) — unlock turn, signal server, trigger bot if needed
-      setAwaitingBattleImage(false);
-      setIsLockedIn(false);
-      socket.emit('readyForNextTurn');
-      const pendingRoom = pendingBotRoomRef.current;
-      pendingBotRoomRef.current = null;
-      if (pendingRoom) {
-        console.log('[FollowerBattle] post-image autonomous turn start', {
-          turnId: pendingRoom.turnId,
-          players: Object.keys(pendingRoom.players || {}),
-          npcAllies: Object.keys(pendingRoom.players || {}).filter((id: string) => id.startsWith('npc_ally_')),
-        });
-        generateNpcAllyActions(pendingRoom, pendingRoom.turnId);
-        generateBotAction(pendingRoom, pendingRoom.turnId);
-      }
-    }
-  };
-  handleGenerateBattleImageRef.current = handleGenerateBattleImage;
-
-  const handleBattleUnlock = () => {
-    clearTypingPresence('battle');
-    socket.emit('playerUnlock');
-    setIsLockedIn(false);
-  };
-
-  const handleEnterArena = () => {
-    if (!character) {
-      setActiveTab('profile');
-      setGameState('char_creation');
-      if (messages.length === 0) {
-        setMessages([{ role: 'model', text: "Welcome to the Arena! What kind of character do you want to create?" }]);
-      }
-      return;
-    }
-    socket.emit('enterArena', { unlimitedTurnTime: settingsRef.current.unlimitedTurnTime, arenaPreviewSeconds: settingsRef.current.arenaPreviewSeconds, arenaTweakSeconds: settingsRef.current.arenaTweakSeconds, battleTurnSeconds: settingsRef.current.battleTurnSeconds });
-  };
-
-  const handleNewCharacter = () => {
-    activeCharacterNameRef.current = null;
-    localStorage.removeItem('duo_active_character_name');
-    setCharacter(null);
-    setMessages([{ role: 'model', text: "Let's build a new legend. What kind of character do you want to create?" }]);
-    setGameState('char_creation');
-    setActiveTab('profile');
-  };
-
-  const handleSelectCharacter = (name: string) => {
-    const selected = characters.find(c => c.name === name);
-    if (selected) {
-      activeCharacterNameRef.current = selected.name;
-      localStorage.setItem('duo_active_character_name', selected.name);
-      setCharacter(selected);
-      setMessages([{ role: 'model', text: `Switched to ${selected.name}. Ready for action!` }]);
-    }
-  };
-
-  const handleSendBattleAction = () => {
-    const action = battleInput.trim();
-    if (!action || isLockedIn || awaitingBattleImage) return;
-    clearTypingPresence('battle');
-
-    const socketId = socket.id;
-    if (socketId) {
-      setBattleLogs(prev => [...removePendingBattleActionLogs(prev, socketId), buildPendingBattleActionLog(socketId, action)]);
-    }
-
-    socket.emit('playerAction', action);
-    setIsLockedIn(true);
-    setBattleInput('');
-    if (battleInputRef.current) battleInputRef.current.style.height = 'auto';
-  };
-
-  const getThoughtTitle = (content: string) => {
-    const lines = content.split('\n').filter(l => l.trim());
-    // Look for the last header-like line
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i].trim();
-      if (line.startsWith('#') || (line.startsWith('**') && line.endsWith('**'))) {
-        return line.replace(/[#*]/g, '').trim();
-      }
-    }
-    // Fallback to first few words of last line
-    const lastLine = lines[lines.length - 1] || "Thinking...";
-    const words = lastLine.replace(/[#*]/g, '').trim().split(' ');
-    if (words.length <= 4) return words.join(' ');
-    return words.slice(0, 4).join(' ') + '...';
   };
 
   const renderTopBar = () => {
-    // If in battle, show battle stats, else show own stats
-    let hp = 100;
-    let mana = 100;
-    let gold = DEFAULT_STARTING_GOLD;
-    let charName = 'No Character';
-    const currentBattlePlayer = socket.id ? players[socket.id] : undefined;
-
-    if ((gameState === 'battle' || gameState === 'arena_prep') && currentBattlePlayer) {
-      hp = currentBattlePlayer.character.hp;
-      mana = currentBattlePlayer.character.mana;
-      gold = currentBattlePlayer.character.gold ?? character?.gold ?? DEFAULT_STARTING_GOLD;
-      charName = currentBattlePlayer.character.name;
-    } else if (character) {
-      hp = character.hp;
-      mana = character.mana;
-      gold = character.gold;
-      charName = character.name;
-    }
-
+    const p = socket.id ? players[socket.id] : undefined;
+    const hp = p ? p.character.hp : character?.hp ?? 100;
+    const mana = p ? p.character.mana : character?.mana ?? 100;
+    const gold = p ? p.character.gold : character?.gold ?? DEFAULT_STARTING_GOLD;
+    const name = p ? p.character.name : character?.name ?? 'No Legend';
     return (
       <div className="sticky top-0 z-20 bg-white border-b-2 border-duo-gray shadow-sm">
         <div className="px-4 py-3 flex items-center justify-between">
-          <div className="flex items-center gap-2 text-duo-gray-dark font-bold">
-            {(gameState === 'battle' || gameState === 'post_match') && (
-              <button onClick={() => {
-                setGameState('menu');
-                socket.emit('leaveQueue');
-              }} className="mr-1 hover:text-duo-blue transition-colors">
-                <ArrowLeft className="w-6 h-6" />
-              </button>
-            )}
-            <button
-              onClick={() => {
-                if (character?.profileMarkdown) {
-                  setProfileToView(character.profileMarkdown);
-                  setShowProfileModal(true);
-                }
-              }}
-              className="flex items-center gap-2 hover:opacity-80 transition-opacity"
-            >
-              {character?.imageUrl ? (
-                <img src={character.imageUrl} alt="" className="w-7 h-7 rounded-full object-cover border-2 border-duo-gray" />
-              ) : (
-                <div className="w-7 h-7 rounded-full bg-duo-gray flex items-center justify-center">
-                  <User className="w-4 h-4 text-duo-gray-dark" />
-                </div>
-              )}
-              <span className="uppercase text-sm truncate max-w-[120px]">{charName}</span>
+          <div className="flex items-center gap-2 font-bold text-duo-gray-dark">
+            {(gameState === 'battle' || gameState === 'post_match') && <button onClick={() => { setGameState('menu'); socket.emit('leaveQueue'); }} className="mr-1 hover:text-duo-blue"><ArrowLeft className="w-6 h-6" /></button>}
+            <button onClick={() => { if (character?.profileMarkdown) { setProfileToView(character.profileMarkdown); setShowProfileModal(true); } }} className="flex items-center gap-2 hover:opacity-80">
+              {character?.imageUrl ? <img src={character.imageUrl} className="w-7 h-7 rounded-full border-2 border-duo-gray object-cover" /> : <div className="w-7 h-7 rounded-full bg-duo-gray flex items-center justify-center"><User className="w-4 h-4 text-duo-gray-dark" /></div>}
+              <span className="uppercase text-sm truncate max-w-[120px]">{name}</span>
             </button>
           </div>
-          <div className="flex items-center gap-4 font-bold text-lg">
-            {gameState !== 'menu' && (
-              <>
-                <div className="flex items-center gap-1 text-amber-500">
-                  <Coins className="w-6 h-6" />
-                  <span>{gold}</span>
-                </div>
-                <div className="flex items-center gap-1 text-fuchsia-600">
-                  <Orbit className="w-6 h-6" />
-                  <span>{mana}</span>
-                </div>
-                <div className="flex items-center gap-1 text-duo-red">
-                  <Heart className="w-6 h-6 fill-current" />
-                  <span>{hp}</span>
-                </div>
-              </>
-            )}
-            <button onClick={() => setShowSettings(true)} className="text-duo-gray-dark hover:text-duo-blue transition-colors ml-2">
-              <Settings className="w-6 h-6" />
-            </button>
+          <div className="flex items-center gap-4 text-lg font-bold">
+            {gameState !== 'menu' && <><div className="flex items-center gap-1 text-amber-500"><Coins className="w-6 h-6" /><span>{gold}</span></div><div className="flex items-center gap-1 text-fuchsia-600"><Orbit className="w-6 h-6" /><span>{mana}</span></div><div className="flex items-center gap-1 text-duo-red"><Heart className="w-6 h-6 fill-current" /><span>{hp}</span></div></>}
+            <button onClick={() => setShowSettings(true)} className="ml-2 hover:text-duo-blue text-duo-gray-dark"><Settings className="w-6 h-6" /></button>
           </div>
         </div>
-        {gameState === 'battle' && (
-          <>
-            <div className="px-4 py-2 border-t border-duo-gray/30 flex flex-wrap gap-2">
-              {Object.keys(players).map(id => {
-                const p = players[id];
-                const isMe = id === socket.id;
-                return (
-                  <div key={id} className="flex-1 min-w-[120px] space-y-1">
-                    <div className="flex justify-between text-[10px] font-bold text-duo-gray-dark uppercase gap-2 items-center">
-                      <button 
-                        onClick={() => {
-                          setProfileToView(p.character.profileMarkdown);
-                          setShowProfileModal(true);
-                        }}
-                        className="truncate flex-1 hover:text-duo-blue transition-colors text-left"
-                      >
-                        {isMe ? 'You' : p.character.name}
-                      </button>
-                      <div className="flex gap-2 whitespace-nowrap">
-                        <span className="text-duo-blue">{p.character.mana} MNA</span>
-                        <span>{p.character.hp} HP</span>
-                      </div>
-                    </div>
-                    <div className="h-2 bg-duo-gray rounded-full overflow-hidden">
-                      <div 
-                        className={`h-full transition-all duration-500 ${isMe ? 'bg-duo-green' : 'bg-duo-red'}`}
-                        style={{ width: `${Math.max(0, p.character.hp)}%` }} 
-                      />
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-            <div className="px-2 py-1 flex flex-wrap justify-center gap-x-4 gap-y-1 border-t border-duo-gray/50 bg-gray-50/50">
-            </div>
-          </>
-        )}
+        {connectionPhase !== 'online' && <div className={`px-4 py-1.5 text-[10px] font-black uppercase border-t ${connectionPhase === 'reconnecting' ? 'bg-amber-50 text-amber-700 border-amber-200' : 'bg-sky-50 text-sky-700 border-sky-200'}`}>{connectionPhase === 'reconnecting' ? 'Reconnecting...' : 'Resyncing...'}</div>}
+        {gameState === 'battle' && <div className="px-4 py-2 border-t border-duo-gray/30 flex flex-wrap gap-2">{Object.keys(players).map(id => { const isMe = id === socket.id; const p = players[id]; return <div key={id} className="flex-1 min-w-[120px] space-y-1"><div className="flex justify-between items-center gap-2 text-[10px] font-bold text-duo-gray-dark uppercase"><button onClick={() => { setProfileToView(p.character.profileMarkdown); setShowProfileModal(true); }} className="truncate flex-1 text-left">{isMe ? 'You' : p.character.name}</button><div className="flex gap-2"><span>{p.character.mana} MNA</span><span>{p.character.hp} HP</span></div></div><div className="h-2 bg-duo-gray rounded-full overflow-hidden"><div className={`h-full transition-all duration-500 ${isMe ? 'bg-duo-green' : 'bg-duo-red'}`} style={{ width: `${Math.max(0, p.character.hp)}%` }} /></div></div>; })}</div>}
       </div>
     );
   };
 
   const renderBottomBar = () => {
-    if (gameState === 'battle' || gameState === 'arena_prep' || gameState === 'matchmaking' || gameState === 'exploration' || gameState === 'level_select') return null;
-
+    if (['battle', 'arena_prep', 'matchmaking', 'exploration', 'level_select'].includes(gameState)) return null;
     return (
       <div className="w-full max-w-md bg-white border-t-2 border-duo-gray flex justify-around py-3 pb-safe mt-auto">
-        <button 
-          onClick={() => { setActiveTab('home'); setGameState('menu'); }}
-          className={`flex flex-col items-center gap-1 ${activeTab === 'home' ? 'text-duo-green' : 'text-duo-gray-dark'}`}
-        >
-          <Home className={`w-8 h-8 ${activeTab === 'home' ? 'fill-current' : ''}`} />
-        </button>
-        <button 
-          onClick={() => { 
-            setActiveTab('profile'); 
-            setGameState('char_creation');
-            if (messages.length === 0) {
-              setMessages([{ role: 'model', text: "Welcome to the Arena! What kind of character do you want to create?" }]);
-            }
-            setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 100);
-          }}
-          className={`flex flex-col items-center gap-1 ${activeTab === 'profile' ? 'text-duo-green' : 'text-duo-gray-dark'}`}
-        >
-          <User className={`w-8 h-8 ${activeTab === 'profile' ? 'fill-current' : ''}`} />
-        </button>
-        <button 
-          onClick={() => setActiveTab('social')}
-          className={`flex flex-col items-center gap-1 ${activeTab === 'social' ? 'text-duo-green' : 'text-duo-gray-dark'}`}
-        >
-          <Users className={`w-8 h-8 ${activeTab === 'social' ? 'fill-current' : ''}`} />
-        </button>
+        <button onClick={() => { setActiveTab('home'); setGameState('menu'); }} className={activeTab === 'home' ? 'text-duo-green' : 'text-duo-gray-dark'}><Home className={`w-8 h-8 ${activeTab === 'home' ? 'fill-current' : ''}`} /></button>
+        <button onClick={() => { setActiveTab('profile'); setGameState('char_creation'); if (messages.length === 0) setMessages([{ role: 'model', text: "Welcome! character?" }]); }} className={activeTab === 'profile' ? 'text-duo-green' : 'text-duo-gray-dark'}><User className={`w-8 h-8 ${activeTab === 'profile' ? 'fill-current' : ''}`} /></button>
+        <button onClick={() => setActiveTab('social')} className={activeTab === 'social' ? 'text-duo-green' : 'text-duo-gray-dark'}><Users className={`w-8 h-8 ${activeTab === 'social' ? 'fill-current' : ''}`} /></button>
       </div>
     );
   };
 
-  const handleGenerateBot = async () => {
-    setIsGeneratingBot(true);
-    try {
-      const aiClient = getAIClient();
-      const prompt = `Generate a new, unique character for a text-based PvP game. 
-Return ONLY the markdown profile.
-It must start with "# [Character Name]".
-Include Class, Description, Abilities (3), and Inventory (3 items).
-Be creative and concise.`;
-
-      const response = await aiClient.models.generateContent({
-        model: settingsRef.current.charModel,
-        contents: prompt,
-        config: {
-          temperature: 0.9,
-        },
-      });
-
-      const content = response.text || "";
-      const nameMatch = content.match(/^#\s+(.+)$/m);
-      const name = nameMatch ? nameMatch[1].trim() : `Bot_${Date.now()}`;
-
-      const res = await fetch(`${BACKEND_URL}/api/bot_characters`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, content })
-      });
-      const newChar = await res.json();
-      
-      setBotCharacters(prev => [...prev, newChar]);
-      setSelectedBotCharacter(newChar.id);
-    } catch (err: any) {
-      console.error("Failed to generate bot", err);
-      alert(`Failed to generate bot using model ${settingsRef.current.botModel}. Error: ${err.message}`);
-    } finally {
-      setIsGeneratingBot(false);
-      clearBattleStatusLog('battle-image-generation');
-    }
-  };
-
-  const renderMenu = () => (
-    <div className="flex-1 flex flex-col items-center p-6 gap-8 overflow-y-auto">
-      <div className="text-center space-y-2">
-        <h1 className="text-8xl font-black text-duo-text tracking-tight">What If</h1>
-        <p className="text-duo-gray-dark font-bold">Learn to fight. Forever.</p>
-      </div>
-
-      <div className="flex flex-col gap-6 w-full max-w-xs">
-        <div className="flex flex-col items-center gap-3">
-          <div 
-            className="w-24 h-24 rounded-full bg-duo-gray flex items-center justify-center border-4 border-white shadow-md overflow-hidden cursor-pointer"
-            onClick={() => character?.imageUrl && setShowCharImage(true)}
-          >
-            {character?.imageUrl ? (
-              <img src={character.imageUrl} alt={character.name} className="w-full h-full object-cover" />
-            ) : (
-              <User className="w-12 h-12 text-duo-gray-dark" />
-            )}
-          </div>
-          {character && (
-            <button
-              onClick={handleGenerateCharImage}
-              disabled={isGeneratingCharImage}
-              className="text-[10px] font-bold text-duo-blue hover:underline disabled:opacity-50 flex items-center gap-1"
-            >
-              {isGeneratingCharImage ? <><Loader2 className="w-3 h-3 animate-spin" /> Generating...</> : '🎨 Generate Portrait'}
-            </button>
-          )}
-          
-          {characters.length > 0 && (
-            <div className="w-full space-y-2">
-              <label className="block text-xs font-black text-duo-gray-dark uppercase tracking-wider text-center">Active Legend</label>
-              <div className="flex gap-2">
-                <select 
-                  value={character?.name || ''}
-                  onChange={(e) => handleSelectCharacter(e.target.value)}
-                  className="flex-1 bg-duo-gray rounded-xl px-4 py-2 font-bold text-duo-text focus:outline-none border-b-4 border-gray-200"
-                  style={{ fontSize: '16px' }}
-                >
-                  {characters.map(c => (
-                    <option key={c.name} value={c.name}>{c.name}</option>
-                  ))}
-                </select>
-                {character && (
-                  <button 
-                    onClick={() => {
-                      setProfileToView(character.profileMarkdown);
-                      setShowProfileModal(true);
-                    }}
-                    className="p-2 bg-duo-gray rounded-xl border-b-4 border-gray-200 text-duo-blue hover:bg-gray-100"
-                    title="View Profile"
-                  >
-                    <Info className="w-5 h-5" />
-                  </button>
-                )}
-              </div>
-            </div>
-          )}
-
-          <div className="flex gap-2 w-full">
-            <button 
-              onClick={() => {
-                setActiveTab('profile');
-                setGameState('char_creation');
-                if (messages.length === 0) {
-                  setMessages([{ role: 'model', text: "Welcome back! How should we tweak your legend?" }]);
-                }
-              }}
-              className="duo-btn duo-btn-blue flex-1 py-3 text-sm"
-            >
-              {character ? 'Tweak' : 'Create'}
-            </button>
-            <button 
-              onClick={handleNewCharacter}
-              className="duo-btn duo-btn-blue flex-1 py-3 text-sm"
-            >
-              New
-            </button>
-          </div>
-        </div>
-
-        <div className="flex flex-col items-center gap-3">
-          <div className="w-24 h-24 rounded-full bg-duo-gray flex items-center justify-center border-4 border-white shadow-md">
-            <Sword className="w-12 h-12 text-duo-gray-dark" />
-          </div>
-          <button 
-            onClick={handleEnterArena}
-            disabled={!!character && !isSynced}
-            className="duo-btn duo-btn-green w-full py-3 text-lg disabled:opacity-50 flex items-center justify-center gap-2"
-          >
-            {character && !isSynced && <Loader2 className="w-5 h-5 animate-spin" />}
-            {character && !isSynced ? 'Syncing...' : 'Enter Arena'}
-          </button>
-          <button 
-            onClick={() => setShowBotModal(true)}
-            disabled={!!character && !isSynced}
-            className="duo-btn duo-btn-blue w-full py-3 text-lg mt-2 disabled:opacity-50 flex items-center justify-center gap-2"
-          >
-            {character && !isSynced && <Loader2 className="w-5 h-5 animate-spin" />}
-            {character && !isSynced ? 'Syncing...' : 'Play vs Bot'}
-          </button>
-        </div>
-
-        <div className="flex flex-col items-center gap-3">
-          <div className="w-24 h-24 rounded-full bg-duo-gray flex items-center justify-center border-4 border-white shadow-md">
-            <Compass className="w-12 h-12 text-duo-gray-dark" />
-          </div>
-          <button 
-            onClick={handleEnterExploration}
-            disabled={!character || (character && !isSynced)}
-            className="duo-btn duo-btn-green w-full py-3 text-lg disabled:opacity-50 flex items-center justify-center gap-2"
-          >
-            {character && !isSynced && <Loader2 className="w-5 h-5 animate-spin" />}
-            Explore World
-          </button>
-          <button
-            onClick={() => setGameState('level_select')}
-            disabled={!character}
-            className="duo-btn duo-btn-blue w-full py-3 text-lg disabled:opacity-50 flex items-center justify-center gap-2"
-          >
-            Level Path
-          </button>
-        </div>
-      </div>
-
-      {showBotModal && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-          <div className="bg-white rounded-3xl p-6 w-full max-w-sm shadow-xl border-b-4 border-gray-200">
-            <h3 className="text-2xl font-black text-duo-text mb-6 text-center">Bot Match</h3>
-            
-            <div className="mb-6">
-              <label className="block text-sm font-bold text-duo-gray-dark mb-2">Select Persona</label>
-              <div className="flex gap-2">
-                <select 
-                  value={selectedBotCharacter}
-                  onChange={e => setSelectedBotCharacter(e.target.value)}
-                  className="flex-1 bg-duo-gray rounded-xl px-3 py-2 font-bold text-duo-text focus:outline-none focus:ring-2 focus:ring-duo-blue"
-                  style={{ fontSize: '16px' }}
-                >
-                  {botCharacters.map(c => (
-                    <option key={c.id} value={c.id}>{c.name}</option>
-                  ))}
-                </select>
-                <button 
-                  onClick={() => {
-                    const selectedChar = botCharacters.find(c => c.id === selectedBotCharacter);
-                    if (selectedChar) {
-                      setProfileToView(selectedChar.content);
-                      setShowProfileModal(true);
-                    }
-                  }}
-                  disabled={!selectedBotCharacter}
-                  className="duo-btn duo-btn-blue px-4 flex items-center justify-center disabled:opacity-50"
-                  title="View Profile"
-                >
-                  <Info className="w-5 h-5" />
-                </button>
-                <button 
-                  onClick={handleGenerateBot}
-                  disabled={isGeneratingBot}
-                  className="duo-btn duo-btn-blue px-4 flex items-center justify-center disabled:opacity-50"
-                  title="Generate New Persona"
-                >
-                  {isGeneratingBot ? <Loader2 className="w-5 h-5 animate-spin" /> : <User className="w-5 h-5" />}
-                </button>
-              </div>
-            </div>
-
-            <div className="mb-8 px-2">
-              <label className="block text-sm font-bold text-duo-gray-dark mb-4">Difficulty</label>
-              <input 
-                type="range" 
-                min="0" 
-                max="3" 
-                step="1"
-                value={botDifficulty}
-                onChange={(e) => setBotDifficulty(parseInt(e.target.value))}
-                className="w-full h-4 bg-duo-gray rounded-full appearance-none cursor-pointer accent-duo-blue"
-              />
-              <div className="flex justify-between mt-4 text-sm font-bold text-duo-gray-dark">
-                <span className={botDifficulty === 0 ? 'text-duo-blue' : ''}>Easy</span>
-                <span className={botDifficulty === 1 ? 'text-duo-blue' : ''}>Med</span>
-                <span className={botDifficulty === 2 ? 'text-duo-blue' : ''}>Hard</span>
-                <span className={botDifficulty === 3 ? 'text-duo-blue' : ''}>God</span>
-              </div>
-            </div>
-
-            <div className="flex gap-3">
-              <button 
-                onClick={() => setShowBotModal(false)}
-                className="duo-btn duo-btn-gray flex-1 py-3"
-              >
-                Cancel
-              </button>
-              <button 
-                onClick={() => {
-                  setShowBotModal(false);
-                  const selectedChar = botCharacters.find(c => c.id === selectedBotCharacter);
-                  socket.emit('startBotMatch', {
-                    difficulty: difficultyLabels[botDifficulty],
-                    botProfile: selectedChar?.content,
-                    botName: selectedChar?.name,
-                    botCharacterId: selectedChar?.id,
-                    unlimitedTurnTime: settingsRef.current.unlimitedTurnTime,
-                    arenaPreviewSeconds: settingsRef.current.arenaPreviewSeconds,
-                    arenaTweakSeconds: settingsRef.current.arenaTweakSeconds,
-                    battleTurnSeconds: settingsRef.current.battleTurnSeconds,
-                  });
-                }}
-                disabled={!selectedBotCharacter}
-                className="duo-btn duo-btn-green flex-1 py-3 disabled:opacity-50"
-              >
-                Start Match
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-
-  const renderCharCreation = () => (
-    <div className="flex-1 flex flex-col bg-gray-50 overflow-hidden">
-      <div className="p-4 bg-white border-b-2 border-duo-gray flex justify-between items-center">
-        <button 
-          onClick={() => setGameState('menu')}
-          className="text-duo-gray-dark hover:text-duo-text flex items-center gap-1 font-bold"
-        >
-          <ArrowLeft className="w-5 h-5" /> Back
-        </button>
-        <h2 className="text-lg font-black text-duo-text">Character Architect</h2>
-        {character ? (
-          <button 
-            onClick={() => {
-              setProfileToView(character.profileMarkdown);
-              setShowProfileModal(true);
-            }}
-            className="text-duo-blue hover:text-duo-blue-dark flex items-center gap-1 font-bold text-sm"
-          >
-            <Info className="w-4 h-4" /> Profile
-          </button>
-        ) : <div className="w-16" />}
-      </div>
-      <div className="flex-1 overflow-y-auto p-4 space-y-4">
-        {messages.map((msg, i) => {
-          if (!msg.text && msg.role === 'model') return null;
-          return (
-            <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-              {msg.role === 'system' ? (
-                <div className="w-full">
-                  <div className="text-center text-sm font-bold text-red-500 bg-red-50 border border-red-100 rounded-lg py-2 px-4 my-2 markdown-body">
-                    <Markdown rehypePlugins={[rehypeRaw]}>{msg.text}</Markdown>
-                  </div>
-                  <InlineMessageMedia message={msg} alt="Portrait generation" onImageClick={setExpandedImageUrl} />
-                </div>
-              ) : (
-                <div className={msg.role === 'user' ? 'chat-bubble-me' : 'chat-bubble-them'}>
-                  <div className="markdown-body">
-                    <Markdown rehypePlugins={[rehypeRaw]}>{msg.text}</Markdown>
-                  </div>
-                </div>
-              )}
-            </div>
-          );
-        })}
-        {isWaitingForChar && (messages.length === 0 || messages[messages.length - 1].role === 'user' || !messages[messages.length - 1].text) && (
-          <div className="flex justify-start">
-            <div className="chat-bubble-them flex items-center gap-2">
-              <Loader2 className="w-4 h-4 animate-spin" />
-              <span className="font-bold text-sm">Thinking...</span>
-            </div>
-          </div>
-        )}
-        <div ref={chatEndRef} />
-      </div>
-      <div className="p-4 bg-white border-t-2 border-duo-gray flex gap-2">
-        <textarea
-          ref={charInputRef}
-          value={inputText}
-          onChange={(e) => {
-            setInputText(e.target.value);
-            updateTypingPresence('character', e.target.value);
-            e.target.style.height = 'auto';
-            e.target.style.height = Math.min(e.target.scrollHeight, window.innerHeight / 2) + 'px';
-          }}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-              e.preventDefault();
-              handleSendCharMessage();
-            }
-          }}
-          placeholder="Type your response..."
-          className="flex-1 bg-duo-gray rounded-2xl px-4 py-3 font-bold text-duo-text focus:outline-none focus:ring-2 focus:ring-duo-blue resize-none overflow-y-auto"
-          rows={1}
-          style={{ minHeight: '48px', maxHeight: '50vh', fontSize: '16px' }}
-        />
-        <button 
-          onClick={handleSendCharMessage}
-          disabled={isWaitingForChar || !inputText.trim()}
-          className="duo-btn duo-btn-blue px-6 flex items-center justify-center disabled:opacity-50"
-        >
-          <Send className="w-5 h-5" />
-        </button>
-      </div>
-    </div>
-  );
-
-  const renderMatchmaking = () => (
-    <div className="flex-1 flex flex-col items-center justify-center p-6 bg-gray-50 relative">
-      <h2 className="text-2xl font-black text-duo-gray-dark uppercase mb-8 tracking-wider">Arena Queue</h2>
-      
-      <div className="flex flex-wrap justify-center gap-6 mb-20">
-        {queuePlayers.map(p => (
-          <div key={p.id} className="relative flex flex-col items-center gap-2">
-            {/* Blur background if ready */}
-            {p.isReady && (
-              <div className="absolute inset-0 bg-duo-green blur-xl opacity-50 rounded-full" />
-            )}
-            
-            <div className={`relative w-16 h-16 rounded-full flex items-center justify-center text-2xl font-bold border-4 transition-colors ${p.isReady ? 'bg-duo-green/20 border-duo-green text-duo-green' : 'bg-white border-duo-gray text-duo-gray-dark'}`}>
-              {p.character.name.charAt(0).toUpperCase()}
-              {p.isReady && (
-                <div className="absolute inset-0 bg-duo-green/20 rounded-full" />
-              )}
-            </div>
-            <span className="text-xs font-bold text-duo-gray-dark truncate max-w-[80px] text-center">
-              {p.character.name}
-            </span>
-          </div>
-        ))}
-      </div>
-
-      <div className="absolute bottom-0 left-0 right-0 p-4 bg-white border-t-2 border-duo-gray">
-        <button 
-          onClick={() => socket.emit('lockInQueue')}
-          disabled={queuePlayers.find(p => p.id === socket.id)?.isReady}
-          className="w-full duo-button-green py-4 text-lg"
-        >
-          {queuePlayers.find(p => p.id === socket.id)?.isReady ? 'READY' : 'START'}
-        </button>
-        <button 
-          onClick={() => { socket.emit('leaveQueue'); setGameState('menu'); }}
-          className="w-full mt-2 duo-button-gray py-2"
-        >
-          Leave Queue
-        </button>
-      </div>
-    </div>
-  );
-
-  const renderArenaPreparation = () => {
-    const prepPlayers = Object.entries(players);
-    const activeTypingIds = new Set([...roomTypingIds, ...localRoomTypingIds]);
-    const myId = socket.id || '';
-    const myPlayerRemaining = arenaPreparation?.playerRemaining?.[myId];
-    const remaining = (arenaPreparation?.stage === 'tweak' && myPlayerRemaining !== undefined) ? myPlayerRemaining : (arenaPreparation?.remaining ?? 0);
-    const timerLabel = `${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, '0')}`;
-    const hasLocalRewriteAccess = !!(socket.id && players[socket.id]?.prepSkippedPreview);
-    const isTweakStage = arenaPreparation?.stage === 'tweak' || hasLocalRewriteAccess;
-    const isHeadStartRewrite = arenaPreparation?.stage === 'preview' && hasLocalRewriteAccess;
-    const isPrepLockedIn = !!(socket.id && players[socket.id]?.lockedIn);
-    const previewSkipVotes = arenaPreparation?.skipVotes ?? [];
-    const previewParticipantCount = prepPlayers.filter(([, player]) => !player.character?.isNpcAlly).length;
-    const previewSkippers = previewSkipVotes.length;
-
-    return (
-      <div className="flex-1 flex flex-col bg-gray-50 overflow-hidden">
-        <div className="p-4 bg-white border-b-2 border-duo-gray space-y-3">
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <div className="text-[10px] font-black uppercase tracking-[0.2em] text-duo-blue">Arena Preparation</div>
-              <h2 className="text-xl font-black text-duo-text mt-1">
-                {isTweakStage ? (isHeadStartRewrite ? 'Head Start Rewrite' : 'Final Rewrite Window') : 'Study The Opponents'}
-              </h2>
-              <p className="text-xs font-bold text-duo-gray-dark mt-1 max-w-[18rem]">
-                {isTweakStage
-                  ? (isHeadStartRewrite
-                    ? 'You started your rewrite early while the remaining preview countdown continues for anyone still reviewing.'
-                    : 'You have one pass to refine your legend before the duel begins.')
-                  : ''}
-              </p>
-            </div>
-            <div className={`rounded-2xl px-3 py-2 border text-center min-w-[88px] ${isTweakStage ? 'bg-yellow-50 text-yellow-700 border-yellow-200' : 'bg-blue-50 text-duo-blue border-blue-200'}`}>
-              <div className="text-[9px] font-black uppercase">{isTweakStage ? (isHeadStartRewrite ? 'Head Start' : 'Tweak') : 'Preview'}</div>
-              <div className="text-lg font-black leading-none mt-1">{timerLabel}</div>
-            </div>
-          </div>
-          <div className="flex flex-wrap justify-center gap-5 pt-1">
-            {prepPlayers.map(([id, player]) => {
-              const isMe = id === socket.id;
-              const isLockedIn = !!player.lockedIn;
-              const isTyping = activeTypingIds.has(id) && !isLockedIn;
-              const canInspect = !isTweakStage || isMe;
-              const tweakTotal = arenaPreparation?.tweakDuration || 120;
-              const playerRem = arenaPreparation?.playerRemaining?.[id];
-              const effectiveRemaining = (isTweakStage && playerRem !== undefined) ? playerRem : (arenaPreparation?.remaining ?? 0);
-              const ringFraction = isTweakStage ? Math.max(0, Math.min(1, effectiveRemaining / tweakTotal)) : 1;
-              const ringRadius = 44;
-              const ringCircumference = 2 * Math.PI * ringRadius;
-              const ringOffset = ringCircumference * (1 - ringFraction);
-              return (
-                <button
-                  key={id}
-                  onClick={() => {
-                    if (!canInspect) return;
-                    setProfileToView(player.character.profileMarkdown);
-                    setShowProfileModal(true);
-                  }}
-                  className={`flex flex-col items-center gap-2 min-w-[96px] ${canInspect ? '' : 'opacity-80 cursor-default'}`}
-                >
-                  <div className="relative w-[92px] h-[92px] flex items-center justify-center">
-                    {isTweakStage && !isLockedIn && (
-                      <svg className="absolute inset-0 w-full h-full -rotate-90" viewBox="0 0 92 92">
-                        <circle cx="46" cy="46" r={ringRadius} fill="none" stroke={isMe ? '#e5e7eb' : '#e5e7eb'} strokeWidth="4" />
-                        <circle cx="46" cy="46" r={ringRadius} fill="none"
-                          stroke={ringFraction > 0.25 ? (isMe ? '#58cc02' : '#1cb0f6') : '#ef4444'}
-                          strokeWidth="4" strokeLinecap="round"
-                          strokeDasharray={ringCircumference} strokeDashoffset={ringOffset}
-                          style={{ transition: 'stroke-dashoffset 1s linear, stroke 0.3s' }}
-                        />
-                      </svg>
-                    )}
-                    <div className={`relative w-20 h-20 rounded-full border-4 shadow-lg overflow-hidden ${isMe ? 'border-duo-green bg-duo-green/10' : 'border-duo-blue bg-duo-blue/10'}`}>
-                      {(isMe ? character?.imageUrl : player.character.imageUrl) ? (
-                        <img src={isMe ? character?.imageUrl : player.character.imageUrl} alt={player.character.name} className="w-full h-full object-cover" />
-                      ) : (
-                        <div className={`w-full h-full flex items-center justify-center text-2xl font-black ${isMe ? 'text-duo-green-dark' : 'text-duo-blue'}`}>
-                          {player.character.name.charAt(0).toUpperCase()}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                  <div className="text-center">
-                    <div className="text-xs font-black text-duo-text truncate max-w-[90px]">{isMe ? 'You' : player.character.name}</div>
-                    <div className="text-[10px] font-bold text-duo-gray-dark">Tap to inspect</div>
-                  </div>
-                  <div className="h-6 flex items-center justify-center">
-                    {isLockedIn ? (
-                      <span className="inline-flex items-center gap-1 rounded-full bg-green-100 text-green-700 border border-green-200 px-2 py-0.5 text-[10px] font-black">
-                        <Check className="w-3 h-3" /> Locked in
-                      </span>
-                    ) : isTyping ? (
-                      <span className="inline-flex items-center gap-1 justify-center rounded-full bg-white/95 px-2 py-1 text-duo-blue shadow-sm border border-duo-blue/20">
-                        <TypingDots dotClassName="h-1.5 w-1.5" />
-                        {id.startsWith('bot_') && botRewriteAttempt > 0 && (
-                          <span className="inline-flex items-center justify-center w-4 h-4 rounded-full bg-yellow-400 text-[9px] font-black text-yellow-900">{botRewriteAttempt}</span>
-                        )}
-                      </span>
-                    ) : null}
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-        </div>
-
-        {!isTweakStage ? (
-          <div className="flex-1 flex flex-col items-center justify-center px-8 text-center text-duo-gray-dark">
-            <div className="w-24 h-24 rounded-full bg-duo-blue/10 text-duo-blue flex items-center justify-center mb-5">
-              <Users className="w-12 h-12" />
-            </div>
-            <h3 className="text-xl font-black text-duo-text">Avatar Review Phase</h3>
-            <p className="text-sm font-bold max-w-[22rem] mt-2">
-              Open every profile, find weaknesses, decide what needs changing in your profile. The 2 minute write period begins in {timerLabel}.
-            </p>
-            <button
-              onClick={() => {
-                socket.emit('skipArenaPreparationPreview');
-                headStartEnteredRef.current = true;
-                setMessages([{ role: 'model', text: `You have a ${remaining} second head start before the rewrite phase. Refine your legend now.` }]);
-                setInputText('');
-              }}
-              className="duo-btn duo-btn-blue mt-5 px-5 py-3"
-            >
-              Start rewrite now
-            </button>
-            {previewParticipantCount > 1 && previewSkippers > 0 && (
-              <p className="text-[11px] font-bold max-w-[22rem] mt-1 text-duo-blue">
-                {previewSkippers} of {previewParticipantCount} human players already started rewriting.
-              </p>
-            )}
-          </div>
-        ) : (
-          <>
-            <div className="flex-1 overflow-y-auto p-4 space-y-4">
-              {messages.length === 0 && (
-                <div className="flex justify-start">
-                  <div className="chat-bubble-them">
-                    <div className="markdown-body">
-                      <p>{isHeadStartRewrite ? 'You have a head start before the rewrite phase. Refine your legend now.' : 'You have one rewrite window before the duel. Refine your legend now.'}</p>
-                    </div>
-                  </div>
-                </div>
-              )}
-              {messages.map((msg, i) => {
-                if (!msg.text && msg.role === 'model') return null;
-                return (
-                  <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                    {msg.role === 'system' ? (
-                      <div className="w-full">
-                        <div className="text-center text-sm font-bold text-red-500 bg-red-50 border border-red-100 rounded-lg py-2 px-4 my-2 markdown-body">
-                          <Markdown rehypePlugins={[rehypeRaw]}>{msg.text}</Markdown>
-                        </div>
-                        <InlineMessageMedia message={msg} alt="Portrait generation" onImageClick={setExpandedImageUrl} />
-                      </div>
-                    ) : (
-                      <div className={msg.role === 'user' ? 'chat-bubble-me' : 'chat-bubble-them'}>
-                        <div className="markdown-body">
-                          <Markdown rehypePlugins={[rehypeRaw]}>{msg.text}</Markdown>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-              {isWaitingForChar && (messages.length === 0 || messages[messages.length - 1].role === 'user' || !messages[messages.length - 1].text) && (
-                <div className="flex justify-start">
-                  <div className="chat-bubble-them flex items-center gap-2">
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                    <span className="font-bold text-sm">Rewriting your legend...</span>
-                  </div>
-                </div>
-              )}
-              <div ref={chatEndRef} />
-            </div>
-            <div className="p-4 bg-white border-t-2 border-duo-gray flex gap-2">
-              <textarea
-                ref={charInputRef}
-                value={inputText}
-                onChange={(e) => {
-                  setInputText(e.target.value);
-                  updateTypingPresence('character', e.target.value);
-                  e.target.style.height = 'auto';
-                  e.target.style.height = Math.min(e.target.scrollHeight, window.innerHeight / 2) + 'px';
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && !e.shiftKey) {
-                    e.preventDefault();
-                    handleSendCharMessage();
-                  }
-                }}
-                placeholder="Describe exactly what you want to change before the duel starts..."
-                className="flex-1 bg-duo-gray rounded-2xl px-4 py-3 font-bold text-duo-text focus:outline-none focus:ring-2 focus:ring-duo-blue resize-none overflow-y-auto"
-                rows={1}
-                style={{ minHeight: '48px', maxHeight: '50vh', fontSize: '16px' }}
-                disabled={isWaitingForChar || isPrepLockedIn}
-              />
-              <button
-                onClick={() => {
-                  clearTypingPresence('character');
-                  socket.emit('passArenaPreparation');
-                }}
-                disabled={isWaitingForChar || isPrepLockedIn}
-                className="duo-btn duo-btn-gray px-4 flex items-center justify-center disabled:opacity-50 text-xs font-black"
-              >
-                Pass
-              </button>
-              <button
-                onClick={handleSendCharMessage}
-                disabled={isWaitingForChar || isPrepLockedIn || !inputText.trim()}
-                className="duo-btn duo-btn-blue px-6 flex items-center justify-center disabled:opacity-50"
-              >
-                <Send className="w-5 h-5" />
-              </button>
-            </div>
-          </>
-        )}
-      </div>
-    );
-  };
-
-  const renderBattle = () => {
-    const currentBattleLocationId = battleMapState.players.find(player => player.id === socket.id)?.locationId;
-    const currentBattleLocation = getWorldLocationById(worldData, currentBattleLocationId);
-    const battleConnectedLocations = (currentBattleLocation?.connections || [])
-      .map((locationId: string) => getWorldLocationById(worldData, locationId))
-      .filter(Boolean) as WorldLocation[];
-
-    return (
-      <div className="flex-1 flex flex-col bg-gray-50 overflow-hidden">
-        <div className="p-4 pb-2 bg-gray-50 border-b border-gray-200 flex-shrink-0">
-          <div className="flex items-start justify-between gap-3 mb-2">
-            <h1 className="text-2xl font-black text-duo-text">{explorationCombatReturn && getCurrentLocation()?.name ? `⚔️ ${getCurrentLocation()?.name}` : 'The Battle'}</h1>
-            {renderMinimap()}
-          </div>
-          {battleConnectedLocations.length > 0 && (
-            <div className="flex flex-wrap gap-1.5">
-              {battleConnectedLocations.map(location => (
-                <button
-                  key={location.id}
-                  onClick={() => handleBattleMapMove(location.id)}
-                  disabled={isLockedIn}
-                  className="text-[10px] font-bold bg-duo-blue/10 text-duo-blue border border-duo-blue/20 rounded-lg px-2 py-1 hover:bg-duo-blue/20 transition-colors disabled:opacity-50"
-                >
-                  ↔ {location.name}
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
-        <div className="flex-1 overflow-y-auto p-4 space-y-4">
-          {battleLogs.map((log, i) => {
-            const isStreamingThoughts = log.startsWith(BATTLE_STREAM_THOUGHTS_PREFIX);
-            const isStreamingAnswer = log.startsWith(BATTLE_STREAM_ANSWER_PREFIX);
-            const isThoughts = log.startsWith("> **Judge's Thoughts:**") || isStreamingThoughts;
-            const isStatusLog = log.startsWith('STATUS_');
-            const isImageUrl = log.startsWith('STATUS_IMAGE_URL::');
-            
-            // Check if it's a Player Actions bubble
-            const isPlayerActions = log.startsWith(BATTLE_PLAYER_ACTIONS_PREFIX);
-            const isPendingPlayerAction = log.startsWith(BATTLE_PENDING_ACTION_PREFIX);
-            const isNpcAllyAction = log.startsWith('NPC_ALLY_ACTION_');
-            
-            let content = log;
-            if (isStatusLog && !isImageUrl) content = log.replace(/^STATUS_[^:]+::/, '');
-            if (isImageUrl) content = log.substring('STATUS_IMAGE_URL::'.length);
-            if (isPlayerActions) content = log.substring(BATTLE_PLAYER_ACTIONS_PREFIX.length);
-            if (isPendingPlayerAction) content = log.substring(log.indexOf('::') + 2);
-            if (isNpcAllyAction) content = log.substring('NPC_ALLY_ACTION_'.length);
-            if (isStreamingThoughts) content = log.substring(BATTLE_STREAM_THOUGHTS_PREFIX.length);
-            if (isStreamingAnswer) content = log.substring(BATTLE_STREAM_ANSWER_PREFIX.length);
-
-            if (isImageUrl) {
-              return (
-                <div key={i} className="rounded-lg overflow-hidden border-2 border-duo-gray shadow-md my-2 cursor-pointer" onClick={() => setExpandedImageUrl(content)}>
-                  <img src={content} alt="Battle Scene" className="w-full" />
-                </div>
-              );
-            }
-
-            if (isStatusLog) {
-              return (
-                <div key={i} className="flex justify-start">
-                  <div className="chat-bubble-them max-w-[85%]">
-                    <div className="markdown-body text-sm">
-                      <Markdown rehypePlugins={[rehypeRaw]}>{content}</Markdown>
-                    </div>
-                  </div>
-                </div>
-              );
-            }
-
-            if (isNpcAllyAction) {
-              return (
-                <div key={i} className="duo-card p-3 text-sm bg-gray-100 border-gray-300 text-gray-500 italic">
-                  <div className="flex items-center gap-2 mb-1">
-                    <Users className="w-4 h-4 text-gray-400" />
-                    <span className="text-[9px] font-bold text-gray-400 uppercase">NPC Ally</span>
-                  </div>
-                  <div className="markdown-body">
-                    <Markdown rehypePlugins={[rehypeRaw]}>{content}</Markdown>
-                  </div>
-                </div>
-              );
-            }
-
-            if (isThoughts) {
-              const cleanContent = content.replace(/^> \*\*Judge's Thoughts:\*\*\n> /, "").replace(/\n> /g, "\n");
-              if (!cleanContent && isStreamingThoughts) return null;
-              
-              const isExpanded = expandedThoughts.has(i);
-              const thoughtTitle = getThoughtTitle(cleanContent);
-
-              return (
-                <div key={i} className="duo-card p-3 bg-duo-gray/20 border-dashed text-xs text-duo-text">
-                  <div 
-                    className="flex items-center gap-2 cursor-pointer select-none" 
-                    onClick={() => {
-                      const next = new Set(expandedThoughts);
-                      if (isExpanded) next.delete(i);
-                      else next.add(i);
-                      setExpandedThoughts(next);
-                    }}
-                  >
-                    <Loader2 className={`w-3 h-3 flex-shrink-0 ${isStreamingThoughts ? 'animate-spin' : ''}`} />
-                    <span className="font-bold text-duo-gray-dark flex-1">
-                      {thoughtTitle}
-                    </span>
-                    <ChevronDown className={`w-3 h-3 transition-transform ${isExpanded ? 'rotate-180' : ''}`} />
-                  </div>
-                  {isExpanded && (
-                    <div className="markdown-body mt-2 pt-2 border-t border-duo-gray/30">
-                      <Markdown rehypePlugins={[rehypeRaw]}>{cleanContent}</Markdown>
-                    </div>
-                  )}
-                </div>
-              );
-            }
-
-            if (!content.trim() && (isStreamingAnswer || isStreamingThoughts)) return null;
-
-            // Skip empty/whitespace-only log entries
-            if (!content.trim() && !isStreamingAnswer) return null;
-
-            if (isPendingPlayerAction) {
-              return (
-                <div key={i} className="flex justify-end w-full">
-                  <div className="flex items-start gap-2 w-full max-w-full flex-row-reverse">
-                    <div className="w-7 h-7 rounded-full bg-duo-green flex items-center justify-center text-white text-[10px] font-black flex-shrink-0 overflow-hidden">
-                      {character?.imageUrl ? <img src={character.imageUrl} className="w-full h-full object-cover" /> : character?.name?.charAt(0).toUpperCase() || '?'}
-                    </div>
-                    <div className="w-full">
-                      <span className="text-[10px] font-bold text-duo-gray-dark block text-right">Queued Action</span>
-                      <div className="chat-bubble-me w-full">
-                        <div className="markdown-body text-sm">
-                          <Markdown rehypePlugins={[rehypeRaw]}>{content}</Markdown>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              );
-            }
-
-            if (isPlayerActions) {
-              // Parse individual player actions and render as chat bubbles
-              const actionLines = content.split('\n\n').filter(Boolean);
-              return (
-                <div key={i} className="space-y-2">
-                  {actionLines.map((line, j) => {
-                    const nameMatch = line.match(/^\*\*(.+?):\*\*\s*(.*)$/s);
-                    const pName = nameMatch ? nameMatch[1] : '';
-                    const pAction = nameMatch ? nameMatch[2] : line;
-                    const isMyAction = pName === character?.name;
-                    return (
-                      <div key={j} className={`flex ${isMyAction ? 'justify-end' : 'justify-start'}`}>
-                        <div className={`flex items-start gap-2 max-w-[80%] ${isMyAction ? 'flex-row-reverse' : ''}`}>
-                          <div className={`w-7 h-7 rounded-full flex items-center justify-center text-white text-[10px] font-black flex-shrink-0 ${isMyAction ? 'bg-duo-green' : 'bg-duo-blue'}`}>
-                            {isMyAction && character?.imageUrl ? <img src={character.imageUrl} className="w-full h-full rounded-full object-cover" /> : pName.charAt(0).toUpperCase()}
-                          </div>
-                          <div>
-                            {!isMyAction && <span className="text-[10px] font-bold text-duo-gray-dark">{pName}</span>}
-                            <div className={isMyAction ? 'chat-bubble-me' : 'chat-bubble-them'}>
-                              <div className="markdown-body text-sm">
-                                <Markdown rehypePlugins={[rehypeRaw]}>{pAction}</Markdown>
-                              </div>
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              );
-            }
-
-            return (
-              <div key={i} className="duo-card p-3 text-sm">
-                <div className="markdown-body">
-                  <Markdown rehypePlugins={[rehypeRaw]}>{content}</Markdown>
-                  {isStreamingAnswer && <span className="inline-block w-2 h-4 ml-1 bg-duo-blue animate-pulse" />}
-                </div>
-              </div>
-            );
-          })}
-          <div ref={battleEndRef} />
-        </div>
-
-        <div className="px-3 py-1.5 bg-yellow-50 border-t-2 border-yellow-200 flex flex-wrap items-center justify-center gap-2">
-          {turnTimerRemaining != null && (
-            <span className={`text-[10px] font-black px-2 py-0.5 rounded-full border ${turnTimerRemaining <= 10 ? 'bg-red-100 text-red-700 border-red-200 animate-pulse' : turnTimerRemaining <= 20 ? 'bg-orange-100 text-orange-700 border-orange-200' : 'bg-blue-100 text-blue-700 border-blue-200'}`}>
-              ⏱️ {turnTimerRemaining}s
-            </span>
-          )}
-          <span className="text-[10px] font-black text-yellow-700 uppercase">Turn Status:</span>
-          {Object.keys(players).map(id => {
-            const p = players[id];
-            const isMe = id === socket.id;
-            const isLocked = p.lockedIn;
-            const isTyping = !isLocked && id !== socket.id && (roomTypingIds.includes(id) || localRoomTypingIds.includes(id));
-            return (
-              <span key={id} className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${isLocked ? 'bg-green-100 text-green-700 border-green-200' : 'bg-gray-100 text-gray-500 border-gray-200'}`}>
-                {isLocked ? '🔒' : isTyping ? <TypingDots className="mx-0.5 align-middle" dotClassName="h-1.5 w-1.5" /> : '⏳'} {isMe ? 'You' : p.character.name}
-              </span>
-            );
-          })}
-        </div>
-
-        <div className="p-3 bg-white border-t-2 border-duo-gray">
-          {/* Compact inventory in battle */}
-          {Object.keys(explorationState.inventory).length > 0 && (
-            <div className="flex flex-wrap gap-1 mb-2">
-              <span className="text-[9px] font-black text-duo-gray-dark">🎒</span>
-              {Object.entries(explorationState.inventory).map(([item, qty]) => (
-                <span key={item} className="text-[9px] font-bold bg-duo-gray rounded-full px-1.5 py-0.5 text-duo-gray-dark">{item}({qty})</span>
-              ))}
-            </div>
-          )}
-          <div className="flex gap-2">
-          <textarea
-            ref={battleInputRef}
-            value={battleInput}
-            onChange={(e) => {
-              setBattleInput(e.target.value);
-              updateTypingPresence('battle', e.target.value);
-              e.target.style.height = 'auto';
-              e.target.style.height = Math.min(e.target.scrollHeight, window.innerHeight / 2) + 'px';
-            }}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                handleSendBattleAction();
-              }
-            }}
-            placeholder={awaitingBattleImage ? "Type your next action while scene generates..." : isLockedIn ? "Waiting for opponent..." : "Describe your action..."}
-            className="flex-1 bg-duo-gray rounded-2xl px-3 py-2 text-sm font-bold text-duo-text focus:outline-none focus:ring-2 focus:ring-duo-blue resize-none overflow-y-auto"
-            rows={1}
-            style={{ minHeight: '40px', maxHeight: '50vh', fontSize: '16px' }}
-            disabled={isLockedIn}
-          />
-          {isLockedIn && !awaitingBattleImage ? (
-            <button 
-              onClick={handleBattleUnlock}
-              className="duo-btn duo-btn-gray px-4 flex items-center justify-center gap-1 text-xs font-bold"
-            >
-              🔓 Unlock
-            </button>
-          ) : (
-            <button 
-              onClick={handleSendBattleAction}
-              disabled={isLockedIn || awaitingBattleImage || !battleInput.trim()}
-              className="duo-btn duo-btn-blue px-4 flex items-center justify-center disabled:opacity-50"
-            >
-              <Send className="w-4 h-4" />
-            </button>
-          )}
-          </div>
-        </div>
-      </div>
-    );
-  };
-
-  // ============ EXPLORATION RENDER ============
-  const getNpcRoleEmoji = (role: string) => {
-    if (role === 'trader') return '🪙';
-    if (role === 'crafter') return '🔨';
-    if (role === 'mystic') return '✨';
-    if (role === 'quest_giver') return '❗';
-    return '🙂';
-  };
-
-  const [showSubZoneMap, setShowSubZoneMap] = useState(false);
-  const [showZoneDetail, setShowZoneDetail] = useState<string | null>(null);
-
-  const renderExplorationSubZoneMap = () => {
-    const currentLoc = worldData?.locations?.find((l: any) => l.id === explorationState.locationId);
-    const subZones = currentLoc?.subZones || [];
-    if (subZones.length === 0) return null;
-
-    const currentSubZoneId = explorationState.subZoneId || subZones[0]?.id;
-    const followerOccupantsBySubZone = worldNpcs
-      .filter(npc => npc.followTargetId === socket.id && npc.locationId === explorationState.locationId)
-      .reduce((acc, npc) => {
-        const zoneId = npc.subZoneId || subZones[0]?.id;
-        if (!zoneId) return acc;
-        if (!acc[zoneId]) acc[zoneId] = [];
-        acc[zoneId].push(npc);
-        return acc;
-      }, {} as Record<string, WorldNpc[]>);
-    const mapW = 140;
-    const mapH = 140;
-
-    const handleSubZoneTap = (szId: string) => {
-      if (showFullMap) {
-        const sz = subZones.find((s: any) => s.id === szId);
-        if (sz && szId !== currentSubZoneId) {
-          // Check if connected
-          const currentSz = subZones.find((s: any) => s.id === currentSubZoneId);
-          if (currentSz?.connections?.includes(szId)) {
-            setExplorationInput(`I move to ${sz.name}`);
-          }
-        }
-        setShowZoneDetail(showZoneDetail === szId ? null : szId);
-      } else {
-        setShowFullMap(true);
-      }
-    };
-
-    const renderSubZoneGraph = (w: number, h: number, interactive: boolean) => {
-      const gcx = w / 2;
-      const gcy = h / 2;
-      const gr = Math.min(w, h) / 2 - (interactive ? 60 : 22);
-      const positions: Record<string, { x: number; y: number }> = {};
-      subZones.forEach((sz: any, i: number) => {
-        const angle = (2 * Math.PI * i) / subZones.length - Math.PI / 2;
-        positions[sz.id] = {
-          x: gcx + gr * Math.cos(angle),
-          y: gcy + gr * Math.sin(angle),
-        };
-      });
-
-      return (
-        <svg width={w} height={h} viewBox={`0 0 ${w} ${h}`}>
-          {subZones.flatMap((sz: any) =>
-            (sz.connections || [])
-              .filter((connId: string) => connId > sz.id)
-              .map((connId: string) => {
-                const from = positions[sz.id];
-                const to = positions[connId];
-                if (!from || !to) return null;
-                return (
-                  <line
-                    key={`${sz.id}-${connId}`}
-                    x1={from.x} y1={from.y}
-                    x2={to.x} y2={to.y}
-                    stroke="rgba(255,255,255,0.3)"
-                    strokeWidth={interactive ? 2 : 1}
-                    strokeDasharray={interactive ? "6,3" : "3,2"}
-                  />
-                );
-              })
-          )}
-          {subZones.map((sz: any) => {
-            const pos = positions[sz.id];
-            if (!pos) return null;
-            const isCurrentSz = sz.id === currentSubZoneId;
-            const nodeRadius = interactive ? 28 : 12;
-            const isSelected = showZoneDetail === sz.id;
-            const followersHere = followerOccupantsBySubZone[sz.id] || [];
-            const occupantCount = (isCurrentSz ? 1 : 0) + followersHere.length;
-
-            return (
-              <g key={sz.id} onClick={() => handleSubZoneTap(sz.id)} style={{ cursor: interactive ? 'pointer' : 'default' }}>
-                <circle
-                  cx={pos.x} cy={pos.y} r={nodeRadius}
-                  fill={isCurrentSz ? 'rgba(34, 197, 94, 0.3)' : 'rgba(255, 255, 255, 0.1)'}
-                  stroke={isCurrentSz ? '#22c55e' : 'rgba(255, 255, 255, 0.4)'}
-                  strokeWidth={isSelected ? 3 : interactive ? 2 : 1}
-                />
-                <text
-                  x={pos.x} y={pos.y - (interactive ? 36 : 16)}
-                  textAnchor="middle"
-                  fontSize={interactive ? 11 : 5}
-                  fontWeight="bold"
-                  fill={isCurrentSz ? '#22c55e' : 'white'}
-                  opacity={interactive ? 1 : 0.8}
-                >
-                  {sz.name}
-                </text>
-                {isCurrentSz && (
-                  <circle
-                    cx={pos.x - (occupantCount > 1 ? (interactive ? 5 : 3) : 0)}
-                    cy={pos.y}
-                    r={interactive ? 5 : 2.5}
-                    fill="#22c55e" stroke="white" strokeWidth={0.5}
-                  />
-                )}
-                {followersHere.map((npc, index) => {
-                  const dotSpacing = interactive ? 10 : 6;
-                  const dotOffsetBase = isCurrentSz ? 1 : 0;
-                  const dotX = pos.x + ((index + dotOffsetBase) - (occupantCount - 1) / 2) * dotSpacing;
-                  return (
-                    <circle
-                      key={npc.id}
-                      cx={dotX}
-                      cy={pos.y}
-                      r={interactive ? 4.5 : 2.25}
-                      fill="#facc15"
-                      stroke="white"
-                      strokeWidth={0.5}
-                    />
-                  );
-                })}
-              </g>
-            );
-          })}
-        </svg>
-      );
-    };
-
-    return (
-      <div className="relative" style={{ width: mapW, height: mapH }}>
-        {!showFullMap && (
-          <div
-            className="bg-emerald-900/80 rounded-xl border-2 border-duo-gray overflow-hidden relative cursor-pointer"
-            style={{ width: mapW, height: mapH }}
-            onClick={() => setShowFullMap(true)}
-          >
-            {renderSubZoneGraph(mapW, mapH, false)}
-            <div className="absolute top-1 left-1 bg-white/80 rounded px-1">
-              <span className="text-emerald-900 text-[8px] font-bold">{currentLoc?.name}</span>
-            </div>
-            <div className="absolute bottom-1 left-1">
-              <button
-                onClick={(e) => { e.stopPropagation(); setShowSubZoneMap(false); }}
-                className="bg-white/80 rounded px-1 text-[8px] text-emerald-900 font-bold"
-              >
-                🗺️
-              </button>
-            </div>
-            <div className="absolute bottom-1 right-1 bg-white/80 rounded px-1">
-              <Maximize2 className="w-3 h-3 text-emerald-900" />
-            </div>
-          </div>
-        )}
-
-        {showFullMap && (
-          <div className="fixed inset-0 z-50 bg-black/60" onClick={() => { setShowFullMap(false); setShowZoneDetail(null); }}>
-            <div
-              className="absolute inset-4 bg-emerald-900/95 rounded-3xl border-2 border-duo-gray overflow-hidden flex flex-col"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <div className="flex items-center justify-between p-3">
-                <div>
-                  <span className="text-white font-black text-sm">{currentLoc?.name}</span>
-                  <span className="text-white/50 text-xs ml-2">Sub-Zones</span>
-                </div>
-                <div className="flex gap-2">
-                  <button onClick={() => { setShowSubZoneMap(false); }} className="bg-white/20 rounded-full px-3 py-1 text-white text-xs font-bold">
-                    🗺️ World
-                  </button>
-                  <button onClick={() => { setShowFullMap(false); setShowZoneDetail(null); }} className="bg-white rounded-full p-2 shadow-lg">
-                    <X className="w-5 h-5" />
-                  </button>
-                </div>
-              </div>
-              <div className="flex-1 relative">
-                {renderSubZoneGraph(window.innerWidth - 32, window.innerHeight - 140, true)}
-              </div>
-              {showZoneDetail && (() => {
-                const sz = subZones.find((s: any) => s.id === showZoneDetail);
-                if (!sz) return null;
-                const isConnected = subZones.find((s: any) => s.id === currentSubZoneId)?.connections?.includes(sz.id);
-                return (
-                  <div className="p-3 bg-emerald-950/80 border-t border-white/10 max-h-[40%] overflow-y-auto">
-                    <div className="text-white font-black text-sm">{sz.name}</div>
-                    <div className="text-white/70 text-sm mt-1 whitespace-pre-wrap">{sz.description}</div>
-                    {sz.id !== currentSubZoneId && isConnected && (
-                      <button
-                        onClick={() => {
-                          setExplorationInput(`I move to ${sz.name}`);
-                          setShowFullMap(false);
-                          setShowZoneDetail(null);
-                        }}
-                        className="mt-2 bg-emerald-600 text-white text-xs font-bold px-3 py-1 rounded-full"
-                      >
-                        Go here
-                      </button>
-                    )}
-                    {sz.id !== currentSubZoneId && !isConnected && (
-                      <div className="text-yellow-400/70 text-xs mt-1">Not directly connected — find a path first</div>
-                    )}
-                  </div>
-                );
-              })()}
-            </div>
-          </div>
-        )}
-      </div>
-    );
-  };
-
-  const renderBattleZoneMap = () => {
+  const renderBattleZoneMap = (showInline = true) => {
     const zones = battleMapState.zones || [];
     const combatantZones = battleMapState.combatantZones || {};
-    const mapW = 140;
-    const mapH = 140;
-
-    // Layout zones in a circle for the mini view
-    const cx = mapW / 2;
-    const cy = mapH / 2;
-    const radius = Math.min(mapW, mapH) / 2 - 22;
-    const zonePositions: Record<string, { x: number; y: number }> = {};
-    zones.forEach((zone, i) => {
-      const angle = (2 * Math.PI * i) / zones.length - Math.PI / 2;
-      zonePositions[zone.id] = {
-        x: cx + radius * Math.cos(angle),
-        y: cy + radius * Math.sin(angle),
-      };
-    });
-
+    const mapW = 140, mapH = 140;
+    const cx = mapW / 2, cy = mapH / 2, radius = Math.min(mapW, mapH) / 2 - 22;
+    const posMap: Record<string, { x: number; y: number }> = {};
+    zones.forEach((z, i) => { const a = (2 * Math.PI * i) / zones.length - Math.PI / 2; posMap[z.id] = { x: cx + radius * Math.cos(a), y: cy + radius * Math.sin(a) }; });
     const myId = socket.id || '';
-    const myZoneId = Object.entries(combatantZones).find(([name]) => {
-      const pid = Object.entries(players).find(([, p]) => p.character?.name === name)?.[0];
-      return pid === myId;
-    })?.[1];
-
-    // Get combatant info per zone
+    const myZoneId = Object.entries(combatantZones).find(([name]) => players[Object.entries(players).find(([, p]) => p.character?.name === name)?.[0] || '']?.id === myId)?.[1];
     const zoneOccupants: Record<string, { name: string; isMe: boolean; isAlly: boolean }[]> = {};
     for (const [charName, zoneId] of Object.entries(combatantZones)) {
       if (!zoneOccupants[zoneId]) zoneOccupants[zoneId] = [];
       const pid = Object.entries(players).find(([, p]) => p.character?.name === charName)?.[0];
-      const isAlly = !!pid && (players[pid]?.character?.isNpcAlly === true);
-      zoneOccupants[zoneId].push({ name: charName, isMe: pid === myId, isAlly });
+      zoneOccupants[zoneId].push({ name: charName, isMe: pid === myId, isAlly: !!pid && players[pid]?.character?.isNpcAlly });
     }
-
-    const handleZoneTap = (zoneId: string) => {
-      if (showFullMap) {
-        // In expanded view, tapping sends a move command
-        const zone = zones.find(z => z.id === zoneId);
-        if (zone && zoneId !== myZoneId) {
-          setBattleInput(`I move to ${zone.name}`);
-        }
-        setShowZoneDetail(showZoneDetail === zoneId ? null : zoneId);
-      } else {
-        // Open expanded map
-        setShowFullMap(true);
-      }
-    };
-
-    const renderZoneGraph = (w: number, h: number, scale: number, interactive: boolean) => {
-      const gcx = w / 2;
-      const gcy = h / 2;
-      const gr = Math.min(w, h) / 2 - (interactive ? 60 : 22);
-      const positions: Record<string, { x: number; y: number }> = {};
-      zones.forEach((zone, i) => {
-        const angle = (2 * Math.PI * i) / zones.length - Math.PI / 2;
-        positions[zone.id] = {
-          x: gcx + gr * Math.cos(angle),
-          y: gcy + gr * Math.sin(angle),
-        };
-      });
-
+    const renderZoneGraph = (w: number, h: number, interactive: boolean) => {
+      const gcx = w / 2, gcy = h / 2, gr = Math.min(w, h) / 2 - (interactive ? 60 : 22);
+      const subPosMap: Record<string, { x: number; y: number }> = {};
+      zones.forEach((z, i) => { const a = (2 * Math.PI * i) / zones.length - Math.PI / 2; subPosMap[z.id] = { x: gcx + gr * Math.cos(a), y: gcy + gr * Math.sin(a) }; });
       return (
         <svg width={w} height={h} viewBox={`0 0 ${w} ${h}`}>
-          {/* Connection lines */}
-          {zones.flatMap(zone =>
-            zone.connections
-              .filter(connId => connId > zone.id) // avoid duplicate lines
-              .map(connId => {
-                const from = positions[zone.id];
-                const to = positions[connId];
-                if (!from || !to) return null;
-                return (
-                  <line
-                    key={`${zone.id}-${connId}`}
-                    x1={from.x} y1={from.y}
-                    x2={to.x} y2={to.y}
-                    stroke="rgba(255,255,255,0.3)"
-                    strokeWidth={interactive ? 2 : 1}
-                    strokeDasharray={interactive ? "6,3" : "3,2"}
-                  />
-                );
-              })
-          )}
-          {/* Zone nodes */}
-          {zones.map(zone => {
-            const pos = positions[zone.id];
-            if (!pos) return null;
-            const occupants = zoneOccupants[zone.id] || [];
-            const isMyZone = zone.id === myZoneId;
-            const hasEnemy = occupants.some(o => !o.isMe);
-            const nodeRadius = interactive ? 28 : 12;
-            const isSelected = showZoneDetail === zone.id;
-
+          {zones.flatMap(z => z.connections.filter(c => c > z.id).map(c => <line key={`${z.id}-${c}`} x1={subPosMap[z.id].x} y1={subPosMap[z.id].y} x2={subPosMap[c].x} y2={subPosMap[c].y} stroke="rgba(255,255,255,0.3)" strokeWidth={interactive ? 2 : 1} />))}
+          {zones.map(z => {
+            const p = subPosMap[z.id], occ = zoneOccupants[z.id] || [], isMine = z.id === myZoneId;
             return (
-              <g key={zone.id} onClick={() => handleZoneTap(zone.id)} style={{ cursor: interactive ? 'pointer' : 'default' }}>
-                <circle
-                  cx={pos.x} cy={pos.y} r={nodeRadius}
-                  fill={isMyZone ? 'rgba(34, 197, 94, 0.3)' : hasEnemy ? 'rgba(239, 68, 68, 0.2)' : 'rgba(255, 255, 255, 0.1)'}
-                  stroke={isMyZone ? '#22c55e' : hasEnemy ? '#ef4444' : 'rgba(255, 255, 255, 0.4)'}
-                  strokeWidth={isSelected ? 3 : interactive ? 2 : 1}
-                />
-                {/* Zone name */}
-                <text
-                  x={pos.x} y={pos.y - (interactive ? 36 : 16)}
-                  textAnchor="middle"
-                  fontSize={interactive ? 11 : 5}
-                  fontWeight="bold"
-                  fill={isMyZone ? '#22c55e' : 'white'}
-                  opacity={interactive ? 1 : 0.8}
-                >
-                  {zone.name}
-                </text>
-                {/* Occupant dots */}
-                {occupants.map((occ, oi) => {
-                  const dotR = interactive ? 5 : 2.5;
-                  const dotX = pos.x + (oi - (occupants.length - 1) / 2) * (dotR * 2.5);
-                  const dotY = pos.y;
-                  const dotColor = occ.isMe ? '#22c55e' : occ.isAlly ? '#facc15' : '#1cb0f6';
-                  return (
-                    <circle
-                      key={occ.name}
-                      cx={dotX} cy={dotY} r={dotR}
-                      fill={dotColor}
-                      stroke="white" strokeWidth={0.5}
-                    />
-                  );
-                })}
-                {/* Occupant names in expanded view */}
-                {interactive && occupants.map((occ, oi) => (
-                  <text
-                    key={`name-${occ.name}`}
-                    x={pos.x}
-                    y={pos.y + nodeRadius + 12 + oi * 13}
-                    textAnchor="middle"
-                    fontSize={10}
-                    fontWeight="bold"
-                    fill={occ.isMe ? '#22c55e' : occ.isAlly ? '#facc15' : '#1cb0f6'}
-                  >
-                    {occ.name}
-                  </text>
-                ))}
+              <g key={z.id} onClick={() => { if (showFullMap) { if (z.id !== myZoneId) setBattleInput(`I move to ${z.name}`); } else setShowFullMap(true); }} style={{ cursor: interactive ? 'pointer' : 'default' }}>
+                <circle cx={p.x} cy={p.y} r={interactive ? 28 : 12} fill={isMine ? 'rgba(34,197,94,0.3)' : 'rgba(255,255,255,0.1)'} stroke={isMine ? '#22c55e' : 'rgba(255,255,255,0.4)'} strokeWidth={interactive ? 2 : 1} />
+                <text x={p.x} y={p.y - (interactive ? 36 : 16)} textAnchor="middle" fontSize={interactive ? 11 : 5} fill={isMine ? '#22c55e' : 'white'}>{z.name}</text>
+                {occ.map((o, i) => <circle key={o.name} cx={p.x + (i - (occ.length - 1) / 2) * (interactive ? 12 : 6)} cy={p.y} r={interactive ? 5 : 2.5} fill={o.isMe ? '#22c55e' : o.isAlly ? '#facc15' : '#1cb0f6'} stroke="white" strokeWidth={0.5} />)}
               </g>
             );
           })}
         </svg>
       );
     };
-
     return (
-      <div className="relative" style={{ width: mapW, height: mapH }}>
-        {!showFullMap && (
-          <div
-            className="bg-blue-900/80 rounded-xl border-2 border-duo-gray overflow-hidden relative cursor-pointer"
-            style={{ width: mapW, height: mapH }}
-            onClick={() => setShowFullMap(true)}
-          >
-            {renderZoneGraph(mapW, mapH, 1, false)}
-            <div className="absolute bottom-1 right-1 bg-white/80 rounded px-1">
-              <Maximize2 className="w-3 h-3 text-blue-900" />
-            </div>
-          </div>
-        )}
-
-        {showFullMap && (
-          <div className="fixed inset-0 z-50 bg-black/60" onClick={() => { setShowFullMap(false); setShowZoneDetail(null); }}>
-            <div
-              className="absolute inset-4 bg-blue-900/95 rounded-3xl border-2 border-duo-gray overflow-hidden flex flex-col"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <div className="flex items-center justify-between p-3">
-                <span className="text-white font-black text-sm">Battle Arena</span>
-                <button onClick={() => { setShowFullMap(false); setShowZoneDetail(null); }} className="bg-white rounded-full p-2 shadow-lg">
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
-              <div className="flex-1 relative">
-                {renderZoneGraph(window.innerWidth - 32, window.innerHeight - 140, 1, true)}
-              </div>
-              {showZoneDetail && (() => {
-                const zone = zones.find(z => z.id === showZoneDetail);
-                if (!zone) return null;
-                const occupants = zoneOccupants[zone.id] || [];
-                return (
-                  <div className="p-3 bg-blue-950/80 border-t border-white/10">
-                    <div className="text-white font-black text-sm">{zone.name}</div>
-                    <div className="text-white/70 text-xs mt-1">{zone.description}</div>
-                    {occupants.length > 0 && (
-                      <div className="text-white/50 text-xs mt-1">
-                        Occupants: {occupants.map(o => o.name).join(', ')}
-                      </div>
-                    )}
-                  </div>
-                );
-              })()}
-            </div>
-          </div>
-        )}
+      <div className="relative">
+        {!showFullMap && showInline && <div className="bg-blue-900/80 rounded-xl border-2 border-duo-gray overflow-hidden relative cursor-pointer" style={{ width: mapW, height: mapH }} onClick={() => setShowFullMap(true)}>{renderZoneGraph(mapW, mapH, false)}<div className="absolute bottom-1 right-1 bg-white/80 rounded px-1"><Maximize2 className="w-3 h-3 text-blue-900" /></div></div>}
+        {showFullMap && <div className="fixed inset-0 z-50 bg-black/60 flex flex-col p-4" onClick={() => setShowFullMap(false)}><div className="bg-blue-900/95 rounded-3xl border-2 border-duo-gray overflow-hidden flex flex-col flex-1" onClick={e => e.stopPropagation()}><div className="p-3 flex justify-between items-center text-white"><span className="font-black text-sm">Battle Arena</span><button onClick={() => setShowFullMap(false)} className="bg-white rounded-full p-2"><X className="w-5 h-5 text-duo-text" /></button></div><div className="flex-1 relative">{renderZoneGraph(window.innerWidth - 32, window.innerHeight - 140, true)}</div></div></div>}
       </div>
     );
   };
 
-  const renderMinimap = () => {
+  const renderMinimap = (showInline = true) => {
     if (!worldData) return null;
-
-    // Zone-based battle map (shown when battle zones exist)
-    const hasZones = gameState === 'battle' && battleMapState.zones && battleMapState.zones.length > 0 && battleMapState.combatantZones;
-    if (hasZones) {
-      return renderBattleZoneMap();
-    }
-
-    // Sub-zone map for exploration (when toggled and location has sub-zones)
-    const currentLocForSubZones = worldData?.locations?.find((l: any) => l.id === explorationState.locationId);
-    const hasSubZones = gameState === 'exploration' && currentLocForSubZones?.subZones?.length > 0;
-    if (hasSubZones && showSubZoneMap) {
-      return renderExplorationSubZoneMap();
-    }
-
-    const isBattleMap = gameState === 'battle' && (
-      battleMapState.discoveredLocations.length > 0 ||
-      battleMapState.players.length > 0 ||
-      battleMapState.npcs.length > 0
-    );
-    const activeBattlePlayer = isBattleMap
-      ? battleMapState.players.find(player => player.id === socket.id)
-      : null;
-    const activePosition = activeBattlePlayer || {
-      locationId: explorationState.locationId,
-      x: explorationState.x,
-      y: explorationState.y,
-    };
-    const activeLocationId = activePosition.locationId ?? explorationState.locationId;
-    const currentLoc = worldData.locations.find((loc: WorldLocation) => loc.id === activeLocationId) ?? getCurrentLocation();
-    const gridSize = worldData.meta.gridSize;
-    const mapW = 140;
-    const mapH = 140;
-    const fullMapW = window.innerWidth - 32;
-    const fullMapH = window.innerHeight - 32;
-
-    const miniScaleX = mapW / gridSize.width;
-    const miniScaleY = mapH / gridSize.height;
-    const fullScaleX = fullMapW / gridSize.width;
-    const fullScaleY = fullMapH / gridSize.height;
-    const currentMapX = typeof activePosition.x === 'number' && Number.isFinite(activePosition.x)
-      ? activePosition.x
-      : currentLoc?.x ?? gridSize.width / 2;
-    const currentMapY = typeof activePosition.y === 'number' && Number.isFinite(activePosition.y)
-      ? activePosition.y
-      : currentLoc?.y ?? gridSize.height / 2;
-    const playerPixelX = currentMapX * miniScaleX;
-    const playerPixelY = currentMapY * miniScaleY;
-    const miniOffsetX = mapW / 2 - playerPixelX;
-    const miniOffsetY = mapH / 2 - playerPixelY;
-    const centerFullMapOnCurrentPosition = (zoom: number) => {
-      const containerW = window.innerWidth - 32;
-      const containerH = window.innerHeight - 32;
-      setMapPan({
-        x: containerW / 2 - currentMapX * (containerW / gridSize.width) * zoom,
-        y: containerH / 2 - currentMapY * (containerH / gridSize.height) * zoom,
-      });
-    };
-
-    const discoveredLocationIds = isBattleMap ? battleMapState.discoveredLocations : explorationState.discoveredLocations;
-    const connectedLocationIds = new Set(currentLoc?.connections || []);
-    const discoveredLocations = worldData.locations.filter((loc: WorldLocation) => discoveredLocationIds.includes(loc.id));
-    const visibleNpcs = (isBattleMap ? battleMapState.npcs : worldNpcs)
-      .filter(npc => discoveredLocationIds.includes(npc.locationId) || npc.followTargetId === socket.id);
-    const visiblePlayers = (isBattleMap ? battleMapState.players : worldPlayers)
-      .filter(player => player.id !== socket.id);
-
-    const miniMarkerLayouts = layoutRepelledMarkers([
-      // "You" dot at current location
-      ...(currentLoc ? [{
-        id: 'mini-you',
-        anchorX: currentLoc.x * miniScaleX,
-        anchorY: currentLoc.y * miniScaleY,
-        width: 6,
-        height: 6,
-      }] : []),
-      // Location dots
-      ...discoveredLocations.map((loc: WorldLocation) => ({
-        id: `mini-dot-${loc.id}`,
-        anchorX: loc.x * miniScaleX,
-        anchorY: loc.y * miniScaleY,
-        width: loc.id === activeLocationId ? 4 : 3,
-        height: loc.id === activeLocationId ? 4 : 3,
-      })),
-      // Location labels
-      ...discoveredLocations.map((loc: WorldLocation) => ({
-        id: `mini-loc-${loc.id}`,
-        anchorX: loc.x * miniScaleX,
-        anchorY: loc.y * miniScaleY,
-        width: estimateMarkerLabelWidth(loc.name, 16, 44, 3.1),
-        height: 14,
-      })),
-      ...visibleNpcs.map(npc => ({
-        id: `mini-npc-${npc.id}`,
-        anchorX: npc.x * miniScaleX,
-        anchorY: npc.y * miniScaleY,
-        width: estimateMarkerLabelWidth(npc.name, 18, 54, 3.6),
-        height: 14,
-      })),
-      ...visiblePlayers.map(player => ({
-        id: `mini-player-${player.id}`,
-        anchorX: player.x * miniScaleX,
-        anchorY: player.y * miniScaleY,
-        width: estimateMarkerLabelWidth(player.name, 20, 58, 3.8),
-        height: 14,
-      })),
-    ], { width: mapW, height: mapH });
-
-    const fullMarkerLayouts = layoutRepelledMarkers([
-      // "You" marker at the current location
-      ...(currentLoc ? [{
-        id: 'full-you',
-        anchorX: currentLoc.x * fullScaleX,
-        anchorY: currentLoc.y * fullScaleY,
-        width: 28,
-        height: 28,
-      }] : []),
-      // Location dots (separate from labels to push them apart)
-      ...discoveredLocations.map((loc: WorldLocation) => ({
-        id: `full-dot-${loc.id}`,
-        anchorX: loc.x * fullScaleX,
-        anchorY: loc.y * fullScaleY,
-        width: loc.id === activeLocationId ? 12 : 8,
-        height: loc.id === activeLocationId ? 12 : 8,
-      })),
-      // Location labels
-      ...discoveredLocations.map((loc: WorldLocation) => {
-        const hasSubLabel = (loc.npcs?.length > 0 || loc.enemies?.length > 0);
-        return {
-          id: `full-loc-${loc.id}`,
-          anchorX: loc.x * fullScaleX,
-          anchorY: loc.y * fullScaleY,
-          width: estimateMarkerLabelWidth(loc.name, 44, 150, 6.8),
-          height: hasSubLabel ? 38 : 26,
-        };
-      }),
-      ...visibleNpcs.map(npc => ({
-        id: `full-npc-${npc.id}`,
-        anchorX: npc.x * fullScaleX,
-        anchorY: npc.y * fullScaleY,
-        width: estimateMarkerLabelWidth(npc.name, 40, 130, 6.3),
-        height: 22,
-      })),
-      ...visiblePlayers.map(player => ({
-        id: `full-player-${player.id}`,
-        anchorX: player.x * fullScaleX,
-        anchorY: player.y * fullScaleY,
-        width: estimateMarkerLabelWidth(player.name, 36, 120, 6.1),
-        height: 20,
-      })),
-    ], { width: fullMapW, height: fullMapH });
-
-    const renderMarkerConnector = (anchorX: number, anchorY: number, x: number, y: number, color: string, thickness = 1) => {
-      const dx = x - anchorX;
-      const dy = y - anchorY;
-      const distance = Math.hypot(dx, dy);
-      if (distance < 6) return null;
-
-      return (
-        <div
-          className="absolute pointer-events-none"
-          style={{
-            left: anchorX,
-            top: anchorY,
-            width: distance,
-            height: thickness,
-            backgroundColor: color,
-            opacity: 0.55,
-            transformOrigin: '0 50%',
-            transform: `translateY(-50%) rotate(${Math.atan2(dy, dx)}rad)`,
-          }}
-        />
-      );
-    };
-
+    if (gameState === 'battle' && battleMapState.zones && battleMapState.zones.length > 0) return renderBattleZoneMap(showInline);
+    const activePos = (gameState === 'battle' ? battleMapState.players.find(p => p.id === socket.id) : null) || { locationId: explorationState.locationId, x: explorationState.x, y: explorationState.y };
+    const mapW = 140, mapH = 140, gridSize = worldData.meta.gridSize;
+    const miniScaleX = mapW / gridSize.width, miniScaleY = mapH / gridSize.height;
+    const miniOffsetX = mapW / 2 - (activePos.x * miniScaleX), miniOffsetY = mapH / 2 - (activePos.y * miniScaleY);
+    const discovered = gameState === 'battle' ? battleMapState.discoveredLocations : explorationState.discoveredLocations;
     return (
-      <div className="relative" style={{ width: mapW, height: mapH }}>
-        {/* Small minimap (always visible as click target) */}
-        {!showFullMap && (
-          <div 
-            className="bg-blue-900/80 rounded-xl border-2 border-duo-gray overflow-hidden relative cursor-pointer"
-            style={{ width: mapW, height: mapH }}
-            onClick={() => {
-              if (worldData?.meta?.gridSize) {
-                setMapZoom(1);
-                centerFullMapOnCurrentPosition(1);
-              }
-              setShowFullMap(true);
-            }}
-          >
-            <div style={{ transform: `translate(${miniOffsetX}px, ${miniOffsetY}px)`, position: 'absolute', inset: 0 }}>
-            {worldData.islands.map((island: any) => {
-              return (
-                <div key={island.id} className="absolute rounded opacity-40" style={{
-                  left: island.bounds.x * miniScaleX, top: island.bounds.y * miniScaleY,
-                  width: island.bounds.width * miniScaleX, height: island.bounds.height * miniScaleY,
-                  backgroundColor: island.biome === 'volcanic' ? '#8B4513' : island.biome === 'enchanted_forest' ? '#2d5a27' : island.biome === 'coral_reef' ? '#00CED1' : '#228B22',
-                }}>
-                  <span className="absolute inset-0 flex items-center justify-center text-[4px] font-black text-white/60 pointer-events-none whitespace-nowrap overflow-hidden">{island.name}</span>
-                </div>
-              );
-            })}
-            {discoveredLocations.map((loc: WorldLocation) => {
-              const anchorX = loc.x * miniScaleX;
-              const anchorY = loc.y * miniScaleY;
-              const layout = miniMarkerLayouts[`mini-loc-${loc.id}`] || { x: anchorX, y: anchorY };
-              const isCurrent = loc.id === activeLocationId;
-              return (
-                <React.Fragment key={loc.id}>
-                  {renderMarkerConnector(anchorX, anchorY, layout.x, layout.y, isCurrent ? 'rgba(34, 197, 94, 0.75)' : 'rgba(255, 255, 255, 0.45)')}
-                  <div
-                    className={`absolute rounded-full pointer-events-none ${isCurrent ? 'bg-duo-green animate-pulse' : 'bg-white/70'}`}
-                    style={{ left: anchorX, top: anchorY, width: isCurrent ? 4 : 3, height: isCurrent ? 4 : 3, transform: 'translate(-50%, -50%)' }}
-                  />
-                  <div
-                    className="absolute flex flex-col items-center pointer-events-none transition-all duration-300 ease-out"
-                    style={{ left: layout.x, top: layout.y, transform: 'translate(-50%, -50%)' }}
-                    title={loc.name}
-                  >
-                    <span className="text-[5px] leading-none">{getLocationMarkerGlyph(loc.type)}</span>
-                    <span className={`text-[4px] font-black whitespace-nowrap ${isCurrent ? 'text-duo-green' : 'text-white/80'}`}>{loc.name}</span>
-                  </div>
-                </React.Fragment>
-              );
-            })}
-            {visibleNpcs.map(npc => {
-              const anchorX = npc.x * miniScaleX;
-              const anchorY = npc.y * miniScaleY;
-              const layout = miniMarkerLayouts[`mini-npc-${npc.id}`] || { x: anchorX, y: anchorY };
-              return (
-                <React.Fragment key={npc.id}>
-                  {renderMarkerConnector(anchorX, anchorY, layout.x, layout.y, 'rgba(250, 204, 21, 0.65)')}
-                  <div
-                    className="absolute rounded-full bg-yellow-200/80 pointer-events-none"
-                    style={{ left: anchorX, top: anchorY, width: 3, height: 3, transform: 'translate(-50%, -50%)' }}
-                  />
-                  <div
-                    className="absolute flex flex-col items-center pointer-events-none transition-all duration-300 ease-out"
-                    style={{ left: layout.x, top: layout.y, transform: 'translate(-50%, -50%)' }}
-                    title={npc.name}
-                  >
-                    <span className="text-[6px] leading-none">{getNpcRoleEmoji(npc.role)}</span>
-                    <span className="text-[5px] font-bold text-yellow-200 whitespace-nowrap">{npc.name}</span>
-                  </div>
-                </React.Fragment>
-              );
-            })}
-            {visiblePlayers.map(player => {
-              const anchorX = player.x * miniScaleX;
-              const anchorY = player.y * miniScaleY;
-              const layout = miniMarkerLayouts[`mini-player-${player.id}`] || { x: anchorX, y: anchorY };
-              return (
-                <React.Fragment key={player.id}>
-                  {renderMarkerConnector(anchorX, anchorY, layout.x, layout.y, 'rgba(59, 130, 246, 0.65)')}
-                  <div
-                    className="absolute rounded-full bg-duo-blue pointer-events-none"
-                    style={{ left: anchorX, top: anchorY, width: 3, height: 3, transform: 'translate(-50%, -50%)' }}
-                  />
-                  <div
-                    className="absolute flex flex-col items-center pointer-events-none transition-all duration-300 ease-out"
-                    style={{ left: layout.x, top: layout.y, transform: 'translate(-50%, -50%)' }}
-                  >
-                    <div className="rounded-full bg-duo-blue" style={{ width: 4, height: 4 }} />
-                    <span className="text-[5px] font-bold text-duo-blue whitespace-nowrap">{player.name}</span>
-                  </div>
-                </React.Fragment>
-              );
-            })}
-            </div>
-            {/* Center crosshair */}
-            <div className="absolute rounded-full border-2 border-duo-green/70" style={{ left: mapW/2 - 4, top: mapH/2 - 4, width: 8, height: 8, pointerEvents: 'none' }} />
-            <div className="absolute rounded-full bg-duo-green shadow-[0_0_10px_rgba(34,197,94,0.75)]" style={{ left: mapW / 2 - 2, top: mapH / 2 - 2, width: 4, height: 4, pointerEvents: 'none' }} />
-            {/* Compass */}
-            <span className="absolute top-0.5 left-1/2 -translate-x-1/2 text-[8px] font-black text-red-400/80 pointer-events-none">N</span>
-            <span className="absolute bottom-0.5 left-1/2 -translate-x-1/2 text-[8px] font-black text-white/50 pointer-events-none">S</span>
-            <span className="absolute left-0.5 top-1/2 -translate-y-1/2 text-[8px] font-black text-white/50 pointer-events-none">W</span>
-            <span className="absolute right-0.5 top-1/2 -translate-y-1/2 text-[8px] font-black text-white/50 pointer-events-none">E</span>
-            <div className="absolute bottom-1 right-1 bg-white/80 rounded px-1">
-              <Maximize2 className="w-3 h-3 text-blue-900" />
-            </div>
-            {hasSubZones && (
-              <button
-                onClick={(e) => { e.stopPropagation(); setShowSubZoneMap(true); }}
-                className="absolute bottom-1 left-1 bg-white/80 rounded px-1 text-[8px] text-emerald-700 font-bold"
-              >
-                📍
-              </button>
-            )}
-          </div>
-        )}
-
-        {/* Full-screen map overlay */}
-        {showFullMap && (
-          <div className="fixed inset-0 z-50 bg-black/60" onClick={() => setShowFullMap(false)}>
-            <div 
-              className="absolute inset-4 bg-blue-900/95 rounded-3xl border-2 border-duo-gray overflow-hidden"
-              style={{ touchAction: 'none' }}
-              onClick={(e) => e.stopPropagation()}
-              onWheel={(e) => {
-                e.stopPropagation();
-                const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                const mouseX = e.clientX - rect.left;
-                const mouseY = e.clientY - rect.top;
-                const oldZoom = mapZoom;
-                const newZoom = Math.min(5, Math.max(0.5, oldZoom + (e.deltaY > 0 ? -0.15 : 0.15)));
-                const scale = newZoom / oldZoom;
-                setMapZoom(newZoom);
-                setMapPan(p => ({
-                  x: mouseX - scale * (mouseX - p.x),
-                  y: mouseY - scale * (mouseY - p.y)
-                }));
-              }}
-              onPointerDown={(e) => {
-                if (mapDragRef.current.dragging) return; // ignore second finger
-                mapDragRef.current = { dragging: true, pointerId: e.pointerId, lastX: e.clientX, lastY: e.clientY };
-                (e.target as HTMLElement).setPointerCapture(e.pointerId);
-              }}
-              onPointerMove={(e) => {
-                if (!mapDragRef.current.dragging || e.pointerId !== mapDragRef.current.pointerId) return;
-                const dx = e.clientX - mapDragRef.current.lastX;
-                const dy = e.clientY - mapDragRef.current.lastY;
-                mapDragRef.current.lastX = e.clientX;
-                mapDragRef.current.lastY = e.clientY;
-                setMapPan(p => ({ x: p.x + dx, y: p.y + dy }));
-              }}
-              onPointerUp={(e) => {
-                if (e.pointerId === mapDragRef.current.pointerId) {
-                  mapDragRef.current.dragging = false;
-                  mapDragRef.current.pointerId = -1;
-                }
-              }}
-              onTouchStart={(e) => {
-                if (e.touches.length === 2) {
-                  // Stop single-finger drag when pinch starts
-                  mapDragRef.current.dragging = false;
-                  mapDragRef.current.pointerId = -1;
-                  const dx = e.touches[0].clientX - e.touches[1].clientX;
-                  const dy = e.touches[0].clientY - e.touches[1].clientY;
-                  const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
-                  const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2;
-                  mapPinchRef.current = { distance: Math.hypot(dx, dy), centerX: cx, centerY: cy };
-                }
-              }}
-              onTouchMove={(e) => {
-                if (e.touches.length === 2) {
-                  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                  const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
-                  const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2;
-                  const centerX = cx - rect.left;
-                  const centerY = cy - rect.top;
-                  const dx = e.touches[0].clientX - e.touches[1].clientX;
-                  const dy = e.touches[0].clientY - e.touches[1].clientY;
-                  const newDist = Math.hypot(dx, dy);
-                  const oldDist = mapPinchRef.current.distance;
-                  const panDx = cx - mapPinchRef.current.centerX;
-                  const panDy = cy - mapPinchRef.current.centerY;
-                  if (oldDist > 0) {
-                    const scaleFactor = newDist / oldDist;
-                    setMapZoom(z => {
-                      const newZoom = Math.min(5, Math.max(0.5, z * scaleFactor));
-                      const actualScale = newZoom / z;
-                      setMapPan(p => ({
-                        x: centerX - actualScale * (centerX - p.x) + panDx,
-                        y: centerY - actualScale * (centerY - p.y) + panDy,
-                      }));
-                      return newZoom;
-                    });
-                  }
-                  mapPinchRef.current = { distance: newDist, centerX: cx, centerY: cy };
-                }
-              }}
-            >
-              <div className="absolute top-2 left-2 z-10 flex gap-1">
-                <button onClick={() => setMapZoom(z => Math.min(5, z + 0.3))} className="bg-white/90 rounded-full w-7 h-7 text-sm font-black text-blue-900 shadow">+</button>
-                <button onClick={() => setMapZoom(z => Math.max(0.5, z - 0.3))} className="bg-white/90 rounded-full w-7 h-7 text-sm font-black text-blue-900 shadow">−</button>
-                <button onClick={() => {
-                  if (gridSize) {
-                    centerFullMapOnCurrentPosition(mapZoom);
-                  }
-                }} className="bg-white/90 rounded-full px-2 h-7 text-[10px] font-bold text-blue-900 shadow flex items-center gap-1">
-                  <Target className="w-3 h-3" /> Center
-                </button>
-              </div>
-              <button onClick={() => setShowFullMap(false)} className="absolute top-3 right-3 z-10 bg-white rounded-full p-2.5 shadow-lg">
-                <X className="w-6 h-6" />
-              </button>
-              {/* Pannable/zoomable content */}
-              <div style={{ transform: `translate(${mapPan.x}px, ${mapPan.y}px) scale(${mapZoom})`, transformOrigin: '0 0', position: 'absolute', inset: 0 }}>
-                {/* Islands */}
-                {worldData.islands.map((island: any) => {
-                  return (
-                    <div key={island.id} className="absolute rounded opacity-30" style={{
-                      left: island.bounds.x * fullScaleX, top: island.bounds.y * fullScaleY,
-                      width: island.bounds.width * fullScaleX, height: island.bounds.height * fullScaleY,
-                      backgroundColor: island.biome === 'volcanic' ? '#8B4513' : island.biome === 'enchanted_forest' ? '#2d5a27' : island.biome === 'coral_reef' ? '#00CED1' : '#228B22',
-                    }}>
-                      <span className="absolute inset-0 flex items-center justify-center text-[20px] font-black text-white/40 pointer-events-none whitespace-nowrap">{island.name}</span>
-                    </div>
-                  );
-                })}
-                {discoveredLocations.map((loc: WorldLocation) => {
-                  const anchorX = loc.x * fullScaleX;
-                  const anchorY = loc.y * fullScaleY;
-                  const layout = fullMarkerLayouts[`full-loc-${loc.id}`] || { x: anchorX, y: anchorY };
-                  const isCurrent = loc.id === activeLocationId;
-                  const isConnected = connectedLocationIds.has(loc.id);
-                  return (
-                    <React.Fragment key={loc.id}>
-                      {renderMarkerConnector(anchorX, anchorY, layout.x, layout.y, isCurrent ? 'rgba(34, 197, 94, 0.8)' : 'rgba(255, 255, 255, 0.4)', 1.5)}
-                      <div className="absolute" style={{ left: anchorX, top: anchorY, transform: 'translate(-50%, -50%)' }}>
-                        {isCurrent && (
-                          <Target className="w-5 h-5 text-duo-green animate-pulse mb-0.5 -translate-x-1/2 -translate-y-full absolute left-1/2 top-0" />
-                        )}
-                        <div
-                          className={`rounded-full cursor-pointer transition-all ${isCurrent ? 'bg-duo-green ring-2 ring-duo-green/50' : isConnected ? 'bg-yellow-400 hover:bg-yellow-300' : 'bg-white/60'}`}
-                          style={{ width: isCurrent ? 12 : 8, height: isCurrent ? 12 : 8 }}
-                          onClick={() => {
-                            if (!isCurrent && isConnected) {
-                              if (isBattleMap) {
-                                handleBattleMapMove(loc.id);
-                              } else {
-                                handleExplorationMove(loc.id);
-                              }
-                              setShowFullMap(false);
-                            }
-                          }}
-                        />
-                      </div>
-                      <div className="absolute flex flex-col items-center pointer-events-none transition-all duration-300 ease-out" style={{ left: layout.x, top: layout.y, transform: 'translate(-50%, -50%)' }}>
-                        <span className={`text-[8px] font-bold whitespace-nowrap ${isCurrent ? 'text-duo-green' : 'text-white/80'}`}>
-                          {getLocationMarkerGlyph(loc.type)} {loc.name}
-                        </span>
-                        {(loc.npcs?.length > 0 || loc.enemies?.length > 0) && (
-                          <span className="text-[8px] font-bold whitespace-nowrap">
-                            {loc.npcs?.length > 0 && <span className="text-yellow-300/80">👤{loc.npcs.length} NPC{loc.npcs.length > 1 ? 's' : ''} </span>}
-                            {loc.enemies?.length > 0 && <span className="text-red-400/80">⚔️{loc.enemies.length} Enem{loc.enemies.length > 1 ? 'ies' : 'y'}</span>}
-                          </span>
-                        )}
-                      </div>
-                    </React.Fragment>
-                  );
-                })}
-                {visibleNpcs.map(npc => {
-                  const anchorX = npc.x * fullScaleX;
-                  const anchorY = npc.y * fullScaleY;
-                  const layout = fullMarkerLayouts[`full-npc-${npc.id}`] || { x: anchorX, y: anchorY };
-                  return (
-                    <React.Fragment key={npc.id}>
-                      {renderMarkerConnector(anchorX, anchorY, layout.x, layout.y, 'rgba(250, 204, 21, 0.7)', 1.5)}
-                      <div className="absolute rounded-full bg-yellow-200/80" style={{ left: anchorX, top: anchorY, width: 5, height: 5, transform: 'translate(-50%, -50%)' }} />
-                      <div className="absolute flex flex-col items-center pointer-events-none transition-all duration-300 ease-out" style={{ left: layout.x, top: layout.y, transform: 'translate(-50%, -50%)' }}>
-                        <div className="text-sm">{getNpcRoleEmoji(npc.role)}</div>
-                        <span className="text-[8px] font-bold mt-0.5 whitespace-nowrap text-yellow-200">{npc.name}</span>
-                      </div>
-                    </React.Fragment>
-                  );
-                })}
-                <div
-                  className="absolute flex flex-col items-center pointer-events-none transition-all duration-300 ease-out"
-                  style={{ left: currentMapX * fullScaleX, top: currentMapY * fullScaleY, transform: 'translate(-50%, -50%)' }}
-                >
-                  <div className="rounded-full bg-duo-green ring-4 ring-duo-green/25 shadow-[0_0_18px_rgba(34,197,94,0.65)]" style={{ width: 10, height: 10 }} />
-                  <span className="text-[8px] font-black text-duo-green mt-1 whitespace-nowrap">You</span>
-                </div>
-                {visiblePlayers.map(player => {
-                  const anchorX = player.x * fullScaleX;
-                  const anchorY = player.y * fullScaleY;
-                  const layout = fullMarkerLayouts[`full-player-${player.id}`] || { x: anchorX, y: anchorY };
-                  return (
-                    <React.Fragment key={player.id}>
-                      {renderMarkerConnector(anchorX, anchorY, layout.x, layout.y, 'rgba(59, 130, 246, 0.7)', 1.5)}
-                      <div className="absolute rounded-full bg-duo-blue" style={{ left: anchorX, top: anchorY, width: 6, height: 6, transform: 'translate(-50%, -50%)' }} />
-                      <div className="absolute flex flex-col items-center pointer-events-none transition-all duration-300 ease-out" style={{ left: layout.x, top: layout.y, transform: 'translate(-50%, -50%)' }}>
-                        <div className="rounded-full bg-duo-blue" style={{ width: 6, height: 6 }} />
-                        <span className="text-[7px] font-bold text-duo-blue mt-0.5 whitespace-nowrap">{player.name}</span>
-                      </div>
-                    </React.Fragment>
-                  );
-                })}
-              </div>
-              <div className="absolute bottom-2 left-2 text-[10px] font-bold text-white/50">Scroll to zoom · Drag to pan</div>
-              {/* Compass rose */}
-              <div className="absolute bottom-3 right-3 z-10 w-12 h-12 rounded-full bg-black/40 border border-white/20 flex items-center justify-center pointer-events-none">
-                <span className="absolute top-0.5 text-[10px] font-black text-red-400">N</span>
-                <span className="absolute bottom-0.5 text-[10px] font-black text-white/60">S</span>
-                <span className="absolute left-1 text-[10px] font-black text-white/60">W</span>
-                <span className="absolute right-1 text-[10px] font-black text-white/60">E</span>
-                <div className="w-1 h-1 rounded-full bg-white/80" />
-              </div>
-            </div>
-          </div>
-        )}
+      <div className="bg-blue-900/80 rounded-xl border-2 border-duo-gray overflow-hidden relative cursor-pointer" style={{ width: mapW, height: mapH }} onClick={() => setShowFullMap(true)}>
+        <div style={{ transform: `translate(${miniOffsetX}px, ${miniOffsetY}px)`, position: 'absolute', inset: 0 }}>
+          {worldData.islands.map((i: any) => <div key={i.id} className="absolute rounded opacity-30" style={{ left: i.bounds.x * miniScaleX, top: i.bounds.y * miniScaleY, width: i.bounds.width * miniScaleX, height: i.bounds.height * miniScaleY, backgroundColor: i.biome === 'volcanic' ? '#8B4513' : '#228B22' }} />)}
+          {worldData.locations.filter((l: any) => discovered.includes(l.id)).map((loc: any) => <div key={loc.id} className={`absolute rounded-full ${loc.id === activePos.locationId ? 'bg-duo-green' : 'bg-white/70'}`} style={{ left: loc.x * miniScaleX, top: loc.y * miniScaleY, width: 4, height: 4, transform: 'translate(-50%,-50%)' }} />)}
+        </div>
+        <div className="absolute rounded-full bg-duo-green" style={{ left: mapW / 2 - 2, top: mapH / 2 - 2, width: 4, height: 4 }} />
       </div>
     );
   };
 
-  const renderSurvivalBars = () => (
-    <div className="flex gap-2 px-3 py-1.5 bg-gray-50 border-b border-duo-gray">
-      <div className="flex-1 space-y-0.5">
-        <div className="flex items-center gap-1 text-[9px] font-bold text-duo-gray-dark">
-          <Beef className="w-3 h-3" /> {explorationState.hunger}
-        </div>
-        <div className="h-1.5 bg-duo-gray rounded-full overflow-hidden">
-          <div className="h-full bg-orange-400 transition-all duration-500" style={{ width: `${explorationState.hunger}%` }} />
-        </div>
-      </div>
-      <div className="flex-1 space-y-0.5">
-        <div className="flex items-center gap-1 text-[9px] font-bold text-duo-gray-dark">
-          <GlassWater className="w-3 h-3" /> {explorationState.thirst}
-        </div>
-        <div className="h-1.5 bg-duo-gray rounded-full overflow-hidden">
-          <div className="h-full bg-blue-400 transition-all duration-500" style={{ width: `${explorationState.thirst}%` }} />
-        </div>
-      </div>
-      <div className="flex-1 space-y-0.5">
-        <div className="flex items-center gap-1 text-[9px] font-bold text-duo-gray-dark">
-          <Zap className="w-3 h-3" /> {explorationState.stamina}
-        </div>
-        <div className="h-1.5 bg-duo-gray rounded-full overflow-hidden">
-          <div className="h-full bg-yellow-400 transition-all duration-500" style={{ width: `${explorationState.stamina}%` }} />
+  const renderMenu = () => (
+    <div className="flex-1 flex flex-col items-center p-6 gap-8 overflow-y-auto">
+      <div className="text-center"><h1 className="text-8xl font-black text-duo-text tracking-tight">What If</h1><p className="text-duo-gray-dark font-bold">Learn to fight. Forever.</p></div>
+      <div className="flex flex-col gap-6 w-full max-w-xs">
+        <div className="flex flex-col items-center gap-3">
+          <div className="w-24 h-24 rounded-full bg-duo-gray border-4 border-white shadow-md overflow-hidden">{character?.imageUrl ? <img src={character.imageUrl} className="w-full h-full object-cover" /> : <User className="w-12 h-12 text-duo-gray-dark m-auto h-full" />}</div>
+          <button onClick={() => { if (character) setGameState('char_creation'); }} className="duo-btn duo-btn-blue w-full py-3">{character ? 'Tweak Legend' : 'Build Legend'}</button>
+          <button onClick={handleEnterArena} className="duo-btn duo-btn-green w-full py-3">Enter Arena</button>
+          <button onClick={handlePlayBot} className="duo-btn duo-btn-blue w-full py-3">1v1 vs Bot</button>
+          <button onClick={() => { socket.emit('enterExploration', {}); setGameState('exploration'); }} className="duo-btn duo-btn-blue w-full py-3">Explore World</button>
         </div>
       </div>
     </div>
   );
 
-  const renderExploration = () => {
-    const currentLoc = getCurrentLocation();
-    const connected = getConnectedLocations();
-    const activeExplorationThoughtId = activeExplorationStreamIdRef.current;
-    const explorationEntries = explorationLog.filter(msg => msg.text.trim() !== '' || (msg.kind === 'thought' && msg.streamId === activeExplorationThoughtId));
-
-    return (
-      <div className="flex-1 flex flex-col bg-gray-50 overflow-hidden">
-        {/* Exploration header with minimap */}
-        <div className="p-3 bg-white border-b-2 border-duo-gray flex items-start justify-between gap-3">
-          <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2 mb-1">
-              <button onClick={() => { setGameState('menu'); socket.emit('leaveExploration'); }} className="text-duo-gray-dark hover:text-duo-text">
-                <ArrowLeft className="w-5 h-5" />
-              </button>
-              <h2 className="text-sm font-black text-duo-text truncate">🗺️ {currentLoc?.name || 'Loading...'}</h2>
-            </div>
-            <p className="text-[10px] text-duo-gray-dark line-clamp-2">{currentLoc?.description || ''}</p>
-            <div className="flex gap-1 mt-1.5 flex-wrap">
-              <button 
-                onClick={() => setShowGoalsModal(true)}
-                className="flex items-center gap-1 bg-yellow-100 border border-yellow-300 rounded-full px-2 py-0.5 text-[9px] font-bold text-yellow-700 hover:bg-yellow-200 transition-colors"
-              >
-                <Star className="w-3 h-3 fill-yellow-500 text-yellow-500" />
-                {explorationState.goals[0] || 'No goals'}
-              </button>
-              <button 
-                onClick={() => setShowInventory(true)}
-                className="flex items-center gap-1 bg-duo-gray/50 rounded-full px-2 py-0.5 text-[9px] font-bold text-duo-gray-dark hover:bg-duo-gray transition-colors"
-              >
-                <Package className="w-3 h-3" />
-                {Object.keys(explorationState.inventory).length} items
-              </button>
-              <button 
-                onClick={handleVisualizeScene}
-                disabled={isVisualizingScene}
-                className="flex items-center gap-1 bg-purple-100 border border-purple-200 rounded-full px-2 py-0.5 text-[9px] font-bold text-purple-700 hover:bg-purple-200 transition-colors disabled:opacity-50"
-              >
-                {isVisualizingScene ? <Loader2 className="w-3 h-3 animate-spin" /> : <Eye className="w-3 h-3" />}
-                {isVisualizingScene ? 'Generating...' : 'Visualize'}
-              </button>
-            </div>
-          </div>
-          {renderMinimap()}
-        </div>
-
-        {renderSurvivalBars()}
-
-        {/* Direction buttons */}
-        <div className="px-3 py-2 bg-white border-b border-duo-gray">
-          <div className="flex gap-1.5 flex-wrap">
-            {connected.map(loc => (
-              <button
-                key={loc.id}
-                onClick={() => handleExplorationMove(loc.id)}
-                disabled={isExplorationProcessing}
-                className="text-[10px] font-bold bg-duo-green/10 text-duo-green-dark border border-duo-green/30 rounded-lg px-2 py-1 hover:bg-duo-green/20 transition-colors disabled:opacity-50"
-              >
-                → {loc.name}
-              </button>
-            ))}
-          </div>
-          {/* Nearby players */}
-          {worldPlayers.filter(p => p.id !== socket.id && p.locationId === explorationState.locationId).length > 0 && (
-            <div className="flex gap-1.5 flex-wrap mt-1.5 pt-1.5 border-t border-duo-gray/50">
-              <span className="text-[9px] font-bold text-duo-gray-dark self-center">Players here:</span>
-              {worldPlayers.filter(p => p.id !== socket.id && p.locationId === explorationState.locationId).map(p => (
-                <button
-                  key={p.id}
-                  onClick={() => {
-                    const draftedAction = `attack ${p.name}`;
-                    setExplorationInput(draftedAction);
-                    updateTypingPresence('exploration', draftedAction);
-                    requestAnimationFrame(() => {
-                      if (explorationInputRef.current) {
-                        explorationInputRef.current.focus();
-                        explorationInputRef.current.style.height = 'auto';
-                        explorationInputRef.current.style.height = Math.min(explorationInputRef.current.scrollHeight, window.innerHeight / 4) + 'px';
-                      }
-                    });
-                  }}
-                  className="text-[10px] font-bold bg-red-50 text-red-600 border border-red-200 rounded-lg px-2 py-1 hover:bg-red-100 transition-colors flex items-center gap-1"
-                >
-                  ⚔️ Target {p.name}
-                  {p.typing && <TypingDots dotClassName="h-1.5 w-1.5" />}
-                  {p.acting && <span className="inline-block w-1.5 h-1.5 rounded-full bg-yellow-500 animate-pulse" title="Acting..." />}
-                </button>
-              ))}
-            </div>
-          )}
-          {worldNpcs.filter(npc => npc.locationId === explorationState.locationId).length > 0 && (
-            <div className="flex gap-1.5 flex-wrap mt-1.5 pt-1.5 border-t border-duo-gray/50">
-              <span className="text-[9px] font-bold text-duo-gray-dark self-center">NPCs here:</span>
-              {worldNpcs.filter(npc => npc.locationId === explorationState.locationId).map(npc => (
-                <span
-                  key={npc.id}
-                  className="text-[10px] font-bold bg-yellow-50 text-yellow-700 border border-yellow-200 rounded-lg px-2 py-1 flex items-center gap-1"
-                >
-                  <span>{getNpcRoleEmoji(npc.role)}</span>
-                  {npc.name}
-                  {npc.followTargetId === socket.id && <span className="text-[9px] text-duo-green-dark">Following</span>}
-                </span>
-              ))}
-            </div>
-          )}
-        </div>
-
-        {/* Exploration log */}
-        <div className="flex-1 overflow-y-auto p-3 space-y-3">
-          {explorationEntries.map((msg, i) => {
-            const isOtherPlayer = msg.role === 'user' && msg.playerName;
-            const isMe = msg.role === 'user' && !msg.playerName;
-            const isThought = msg.kind === 'thought';
-            const thoughtId = msg.streamId || `explore-thought-${i}`;
-            const isStreamingThought = isThought && msg.streamId === activeExplorationThoughtId && isExplorationProcessing;
-            return (
-            <div key={i} className={`flex ${isMe ? 'justify-end' : 'justify-start'}`}>
-              {isThought ? (
-                <div className="duo-card p-3 bg-duo-gray/20 border-dashed text-xs text-duo-text w-full">
-                  <div
-                    className="flex items-center gap-2 cursor-pointer select-none"
-                    onClick={() => {
-                      const next = new Set(expandedExplorationThoughts);
-                      if (next.has(thoughtId)) next.delete(thoughtId);
-                      else next.add(thoughtId);
-                      setExpandedExplorationThoughts(next);
-                    }}
-                  >
-                    <Loader2 className={`w-3 h-3 flex-shrink-0 ${isStreamingThought ? 'animate-spin' : ''}`} />
-                    <span className="font-bold text-duo-gray-dark flex-1">{getThoughtTitle(msg.text)}</span>
-                    <ChevronDown className={`w-3 h-3 transition-transform ${expandedExplorationThoughts.has(thoughtId) ? 'rotate-180' : ''}`} />
-                  </div>
-                  {expandedExplorationThoughts.has(thoughtId) && msg.text.trim() && (
-                    <div className="markdown-body mt-2 pt-2 border-t border-duo-gray/30">
-                      <Markdown rehypePlugins={[rehypeRaw]}>{msg.text}</Markdown>
-                    </div>
-                  )}
-                </div>
-              ) : msg.role === 'system' ? (
-                <div className="w-full">
-                  <div className={`text-center text-sm font-bold rounded-lg py-2 px-4 my-1 markdown-body ${msg.text.includes('Allied with') ? 'text-yellow-700 bg-yellow-50 border border-yellow-200' : 'text-duo-blue bg-duo-blue/5 border border-duo-blue/10'}`}>
-                    <Markdown rehypePlugins={[rehypeRaw]}>{msg.text}</Markdown>
-                  </div>
-                  <InlineMessageMedia message={msg} alt="Inline scene" onImageClick={setExpandedImageUrl} />
-                </div>
-              ) : isOtherPlayer ? (
-                <div className="flex items-start gap-2 max-w-[80%]">
-                  <div className="w-7 h-7 rounded-full bg-duo-blue flex items-center justify-center text-white text-[10px] font-black flex-shrink-0">
-                    {msg.playerName!.charAt(0).toUpperCase()}
-                  </div>
-                  <div>
-                    <span className="text-[10px] font-bold text-duo-gray-dark">{msg.playerName}</span>
-                    <div className="chat-bubble-them w-fit min-w-[12rem]">
-                      <div className="markdown-body">
-                        <Markdown rehypePlugins={[rehypeRaw]}>{msg.text}</Markdown>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              ) : isMe ? (
-                <div className="flex items-start gap-2 max-w-[80%] flex-row-reverse">
-                  <div className="w-7 h-7 rounded-full bg-duo-green flex items-center justify-center text-white text-[10px] font-black flex-shrink-0 overflow-hidden">
-                    {character?.imageUrl ? <img src={character.imageUrl} className="w-full h-full object-cover" /> : character?.name?.charAt(0).toUpperCase() || '?'}
-                  </div>
-                  <div className="chat-bubble-me w-fit min-w-[12rem]">
-                    <div className="markdown-body">
-                      <Markdown rehypePlugins={[rehypeRaw]}>{msg.text}</Markdown>
-                    </div>
-                  </div>
-                </div>
-              ) : (
-                <div className={msg.role === 'model' ? 'chat-bubble-them' : 'chat-bubble-me'}>
-                  <div className="markdown-body">
-                    <Markdown rehypePlugins={[rehypeRaw]}>{msg.text}</Markdown>
-                  </div>
-                </div>
-              )}
-            </div>
-            );
-          })}
-          <div ref={explorationEndRef} />
-        </div>
-
-        {/* Lock-in status bar (multiplayer) */}
-        {explorationLockStatus.length > 0 && (
-          <div className="px-3 py-1.5 bg-yellow-50 border-t-2 border-yellow-200 flex flex-wrap items-center gap-2">
-            <span className="text-[10px] font-black text-yellow-700">TURN:</span>
-            {explorationLockStatus.map(p => (
-              <span key={p.id} className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${p.lockedIn ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-500'}`}>
-                {p.lockedIn ? '🔒' : '⏳'} {p.id === socket.id ? 'You' : p.name}
-              </span>
-            ))}
-            {explorationLockStatus.every(p => p.lockedIn) && (
-              <span className="text-[10px] font-bold text-duo-blue animate-pulse ml-auto">Processing...</span>
-            )}
-          </div>
-        )}
-
-        {/* Compacting indicator */}
-        {isCompacting && (
-          <div className="px-3 py-1 bg-purple-50 border-t border-purple-200 flex items-center gap-2">
-            <span className="inline-block w-3 h-3 rounded-full bg-purple-400 animate-pulse" />
-            <span className="text-[10px] font-bold text-purple-600">Compacting memory...</span>
-          </div>
-        )}
-
-        {/* Input */}
-        <div className="p-3 bg-white border-t-2 border-duo-gray flex gap-2">
-          <textarea
-            ref={explorationInputRef}
-            value={explorationInput}
-            onChange={(e) => {
-              setExplorationInput(e.target.value);
-              updateTypingPresence('exploration', e.target.value);
-              e.target.style.height = 'auto';
-              e.target.style.height = Math.min(e.target.scrollHeight, window.innerHeight / 2) + 'px';
-            }}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                handleExplorationSend();
-              }
-            }}
-            placeholder={isExplorationLockedIn ? "Waiting for other players..." : "What do you do? (gather, craft, talk, explore...)"}
-            className="flex-1 bg-duo-gray rounded-2xl px-3 py-2 text-sm font-bold text-duo-text focus:outline-none focus:ring-2 focus:ring-duo-blue resize-none overflow-y-auto"
-            rows={1}
-            style={{ minHeight: '40px', maxHeight: '50vh', fontSize: '16px' }}
-            disabled={isExplorationLockedIn}
-          />
-          {isExplorationLockedIn ? (
-            <button 
-              onClick={handleExplorationUnlock}
-              className="duo-btn duo-btn-gray px-4 flex items-center justify-center gap-1 text-xs font-bold"
-            >
-              🔓 Unlock
-            </button>
-          ) : (
-            <button 
-              onClick={handleExplorationSend}
-              disabled={isExplorationProcessing || !explorationInput.trim()}
-              className="duo-btn duo-btn-blue px-4 flex items-center justify-center disabled:opacity-50"
-            >
-              <Send className="w-4 h-4" />
-            </button>
-          )}
-        </div>
-
-        {/* Goals Modal */}
-        {showGoalsModal && (
-          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={() => setShowGoalsModal(false)}>
-            <div className="bg-white rounded-3xl p-6 w-full max-w-sm shadow-xl border-b-4 border-yellow-300" onClick={(e) => e.stopPropagation()}>
-              <h3 className="text-xl font-black text-duo-text mb-4 flex items-center gap-2">
-                <Star className="w-6 h-6 fill-yellow-500 text-yellow-500" /> Active Goals
-              </h3>
-              <div className="space-y-3">
-                {explorationState.goals.map((goal, i) => (
-                  <div key={i} className={`flex items-start gap-3 p-3 rounded-xl ${i === 0 ? 'bg-yellow-50 border-2 border-yellow-300' : 'bg-gray-50 border border-duo-gray'}`}>
-                    <span className="text-lg font-black text-duo-gray-dark w-6 text-center">{i + 1}</span>
-                    <span className="font-bold text-sm text-duo-text flex-1">{goal}</span>
-                    {i === 0 && <Star className="w-5 h-5 fill-yellow-500 text-yellow-500 flex-shrink-0" />}
-                  </div>
-                ))}
-              </div>
-              <button onClick={() => setShowGoalsModal(false)} className="duo-btn duo-btn-blue w-full py-3 mt-6">Close</button>
-            </div>
-          </div>
-        )}
-
-        {/* Inventory Modal */}
-        {showInventory && (
-          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={() => setShowInventory(false)}>
-            <div className="bg-white rounded-3xl p-6 w-full max-w-sm shadow-xl border-b-4 border-gray-200 max-h-[80vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
-              <h3 className="text-xl font-black text-duo-text mb-4 flex items-center gap-2">
-                <Package className="w-6 h-6" /> Inventory
-              </h3>
-              {Object.keys(explorationState.inventory).length === 0 ? (
-                <p className="text-duo-gray-dark font-bold text-sm text-center py-4">Your inventory is empty. Try gathering resources!</p>
-              ) : (
-                <div className="grid grid-cols-2 gap-2">
-                  {Object.entries(explorationState.inventory).map(([item, count]) => (
-                    <div key={item} className="bg-gray-50 rounded-xl p-3 border border-duo-gray">
-                      <div className="font-bold text-sm text-duo-text capitalize">{item.replace(/_/g, ' ')}</div>
-                      <div className="text-xs font-bold text-duo-gray-dark">×{count}</div>
-                    </div>
-                  ))}
-                </div>
-              )}
-              {explorationState.equippedWeapon && (
-                <div className="mt-4 p-3 bg-red-50 rounded-xl border border-red-200">
-                  <div className="text-xs font-bold text-red-500 uppercase">Equipped Weapon</div>
-                  <div className="font-bold text-sm text-duo-text capitalize">{explorationState.equippedWeapon.replace(/_/g, ' ')}</div>
-                </div>
-              )}
-              {explorationState.equippedArmor && (
-                <div className="mt-2 p-3 bg-blue-50 rounded-xl border border-blue-200">
-                  <div className="text-xs font-bold text-blue-500 uppercase">Equipped Armor</div>
-                  <div className="font-bold text-sm text-duo-text capitalize">{explorationState.equippedArmor.replace(/_/g, ' ')}</div>
-                </div>
-              )}
-              <button onClick={() => setShowInventory(false)} className="duo-btn duo-btn-blue w-full py-3 mt-6">Close</button>
-            </div>
-          </div>
-        )}
-
-        {/* PVP Challenge Modal */}
-      </div>
-    );
+  const getBattleSendBlockReason = () => {
+    if (!battleInput.trim()) return 'Action required';
+    if (awaitingBattleImage) return 'Scene generating...';
+    if (isLockedIn) return 'Locked';
+    return null;
   };
 
-  // ============ LEVEL SELECT (DUOLINGO STYLE) ============
-  const levelBots = [
-    { level: 1, name: "Training Dummy", difficulty: "Easy", color: "bg-duo-green", description: "A wooden practice target that barely fights back." },
-    { level: 2, name: "Village Brawler", difficulty: "Easy", color: "bg-duo-green", description: "A local tough guy who fights with his fists." },
-    { level: 3, name: "Bandit Scout", difficulty: "Easy", color: "bg-duo-green", description: "A sneaky thief with a rusty dagger." },
-    { level: 4, name: "Forest Wolf", difficulty: "Medium", color: "bg-duo-green", description: "A cunning predator that hunts in packs." },
-    { level: 5, name: "Tribal Warrior", difficulty: "Medium", color: "bg-duo-blue", description: "A seasoned fighter from the Fire Tribe." },
-    { level: 6, name: "Coral Guardian", difficulty: "Medium", color: "bg-duo-blue", description: "An animated coral construct that protects the reef." },
-    { level: 7, name: "Shadow Assassin", difficulty: "Hard", color: "bg-duo-blue", description: "A deadly killer who strikes from the darkness." },
-    { level: 8, name: "Stone Golem", difficulty: "Hard", color: "bg-purple-500", description: "An ancient construct of immovable stone." },
-    { level: 9, name: "Dragon Knight", difficulty: "Hard", color: "bg-purple-500", description: "A warrior bonded with dragon fire." },
-    { level: 10, name: "The Volcanic Wyrm", difficulty: "Hard", color: "bg-purple-500", description: "A colossal serpent of magma and destruction." },
-    { level: 11, name: "Abyssal Leviathan", difficulty: "Superintelligent", color: "bg-red-500", description: "A nightmare from the deepest ocean trenches." },
-    { level: 12, name: "The God of the Isles", difficulty: "Superintelligent", color: "bg-yellow-500", description: "The supreme deity. Reality bends to its will." },
-  ];
-
-  const renderLevelSelect = () => (
+  const renderArenaPreparation = () => (
     <div className="flex-1 flex flex-col bg-gray-50 overflow-hidden">
-      <div className="p-4 bg-white border-b-2 border-duo-gray flex items-center gap-2">
-        <button onClick={() => setGameState('menu')} className="text-duo-gray-dark hover:text-duo-text">
-          <ArrowLeft className="w-5 h-5" />
-        </button>
-        <h2 className="text-lg font-black text-duo-text">Battle Path</h2>
+      <div className="p-3 bg-white border-b border-duo-gray flex justify-between items-center"><h2 className="font-black">Prepare for Duel</h2><div className="bg-blue-50 px-3 py-1 rounded-xl text-blue-700 font-bold">{arenaPreparation?.remaining}s</div></div>
+      <div className="flex-1 p-6 flex flex-col items-center justify-center text-center">
+        <div className="duo-card p-6 w-full"><h3 className="text-lg font-black mb-2">Final Rewrite</h3><p className="text-sm text-duo-gray-dark mb-4">One pass to tweak based on opponent.</p><button onClick={() => setGameState('char_creation')} className="duo-btn duo-btn-blue w-full py-3">Open Architect</button></div>
       </div>
-      
-      <div className="flex-1 overflow-y-auto flex flex-col items-center py-8 relative">
-        {/* Vertical path line */}
-        <div className="absolute top-0 bottom-0 w-1 bg-duo-gray left-1/2 -translate-x-1/2" />
-        
-        {levelBots.map((bot, i) => {
-          const isLeft = i % 3 === 0;
-          const isRight = i % 3 === 2;
-          const offset = isLeft ? -40 : isRight ? 40 : 0;
-          const isTreasure = i === 4 || i === 8;
-          const isBoss = i === levelBots.length - 1;
-          
-          return (
-            <div key={bot.level} className="relative mb-4 flex flex-col items-center" style={{ marginLeft: offset }}>
-              <button
-                onClick={() => {
-                  const botProfile = `# ${bot.name}\n\n**Class:** Level ${bot.level} Opponent\n\n**Difficulty:** ${bot.difficulty}\n\n${bot.description}\n\n### Abilities\n- Scaled to difficulty level ${bot.level}\n\n### Strategy\n- Fights according to ${bot.difficulty} AI behavior`;
-                  socket.emit('startBotMatch', {
-                    difficulty: bot.difficulty,
-                    botProfile,
-                    botName: bot.name,
-                    unlimitedTurnTime: settingsRef.current.unlimitedTurnTime,
-                    arenaPreviewSeconds: settingsRef.current.arenaPreviewSeconds,
-                    arenaTweakSeconds: settingsRef.current.arenaTweakSeconds,
-                    battleTurnSeconds: settingsRef.current.battleTurnSeconds,
-                  });
-                }}
-                disabled={!character}
-                className={`relative w-16 h-16 rounded-full ${bot.color} flex items-center justify-center shadow-lg border-4 border-white hover:scale-110 transition-transform disabled:opacity-50`}
-              >
-                {isBoss ? (
-                  <Star className="w-8 h-8 text-white fill-white" />
-                ) : (
-                  <span className="text-white font-black text-lg">{bot.level}</span>
-                )}
-                {isBoss && <div className="absolute inset-0 rounded-full animate-ping bg-yellow-400/30" />}
-              </button>
-              <span className="text-[10px] font-bold text-duo-gray-dark mt-1 text-center max-w-[100px]">{bot.name}</span>
-              {isTreasure && <div className="mt-2 text-2xl">🎁</div>}
-            </div>
-          );
+    </div>
+  );
+
+  const renderBattle = () => (
+    <div className="flex-1 flex flex-col bg-gray-50 overflow-hidden">
+      <div className="p-2 bg-white border-b border-gray-200 flex justify-between items-center"><h1 className="font-black text-sm">Arena</h1>{renderMinimap(true)}</div>
+      <div ref={battleScrollContainerRef} onScroll={handleBattleScroll} className="flex-1 overflow-y-auto p-3 space-y-3">
+        {battleLogs.map((log, i) => {
+          if (log.startsWith('STATUS_IMAGE_URL::')) return <div key={i} className="rounded-xl overflow-hidden border-2 border-duo-gray shadow-md my-2"><img src={log.slice(18)} /></div>;
+          return <div key={i} className="duo-card p-3 text-sm markdown-body"><Markdown rehypePlugins={[rehypeRaw]}>{log}</Markdown></div>;
         })}
+        <div ref={battleEndRef} />
+      </div>
+      <div className="p-2 composer-safe bg-white border-t border-duo-gray flex gap-2">
+        <textarea ref={battleInputRef} value={battleInput} onChange={e => setBattleInput(e.target.value)} disabled={isLockedIn} placeholder={isLockedIn ? "Action locked..." : "Your move?"} className="flex-1 bg-duo-gray rounded-2xl px-3 py-2 text-sm focus:outline-none resize-none" rows={1} />
+        <button onClick={handleSendBattleAction} disabled={!!getBattleSendBlockReason()} className="duo-btn duo-btn-blue px-4 flex items-center"><Send className="w-4 h-4" /></button>
       </div>
     </div>
   );
 
-  const renderPostMatch = () => (
-    <div className="flex-1 flex flex-col items-center justify-center p-6 gap-8">
-      <div className="text-center space-y-2">
-        <h1 className="text-4xl font-black text-duo-text tracking-tight">Match Over!</h1>
-        {battleOutcome && (
-          <p className={`text-lg font-black ${battleOutcome === 'win' ? 'text-green-600' : 'text-red-500'}`}>
-            {battleOutcome === 'win' ? '🏆 Victory!' : '💀 Defeat...'}
-          </p>
-        )}
-        {explorationCombatReturn && battleOutcome === 'loss' && (
-          <p className="text-xs text-duo-gray-dark">You lost some gold from the defeat.</p>
-        )}
+  const renderExploration = () => (
+    <div className="flex-1 flex flex-col bg-gray-50 overflow-hidden">
+      <div className="p-2 bg-white border-b border-duo-gray flex justify-between items-center"><button onClick={() => setGameState('menu')}><ArrowLeft className="w-5 h-5" /></button>{renderMinimap(true)}</div>
+      <div ref={explorationScrollContainerRef} onScroll={handleExplorationScroll} className="flex-1 overflow-y-auto p-3 space-y-3">
+        {explorationLog.map((msg, i) => <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}><div className={msg.role === 'user' ? 'chat-bubble-me' : 'chat-bubble-them'}><div className="markdown-body"><Markdown rehypePlugins={[rehypeRaw]}>{msg.text}</Markdown></div></div></div>)}
+        <div ref={explorationEndRef} />
       </div>
-
-      <div className="flex flex-col gap-4 w-full max-w-xs">
-        {!explorationCombatReturn && (
-          <button 
-            onClick={() => {
-              // Reset character stats
-              if (character) {
-                setCharacter({ ...character, hp: 100, mana: 100 });
-              }
-              handleEnterArena();
-            }}
-            className="duo-btn duo-btn-green w-full py-4 text-lg"
-          >
-            New Opponent
-          </button>
-        )}
-        
-        <button 
-          onClick={() => {
-            setActiveTab('profile');
-            setGameState('char_creation');
-            setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 100);
-          }}
-          className="duo-btn duo-btn-blue w-full py-4 text-lg"
-        >
-          Tweak Character
-        </button>
-
-        <button 
-          onClick={() => {
-            if (explorationCombatReturn) {
-              setExplorationCombatReturn(false);
-              if (battleOutcome === 'win') {
-                // Victory: restore HP/mana, gain gold bonus, award loot
-                if (character) setCharacter({ ...character, hp: Math.max(character.hp, 50), mana: Math.max(character.mana, 30), gold: character.gold + 10 });
-                if (combatEnemyLoot.length > 0) {
-                  setExplorationState(prev => {
-                    const newInv = { ...prev.inventory };
-                    for (const item of combatEnemyLoot) { newInv[item] = (newInv[item] || 0) + 1; }
-                    return { ...prev, inventory: newInv };
-                  });
-                  setExplorationLog(prev => [...prev, { role: 'system', text: `🏆 You return victorious! +10 gold. Loot: ${combatEnemyLoot.join(', ')}` }]);
-                } else {
-                  setExplorationLog(prev => [...prev, { role: 'system', text: '🏆 You return victorious! +10 gold from the battle.' }]);
-                }
-              } else {
-                // Defeat: restore HP/mana but lose 25% gold
-                if (character) {
-                  const goldLost = Math.floor(character.gold * 0.25);
-                  setCharacter({ ...character, hp: Math.max(character.hp, 50), mana: Math.max(character.mana, 30), gold: Math.max(0, character.gold - goldLost) });
-                  setExplorationLog(prev => [...prev, { role: 'system', text: `💀 You return from defeat... Lost ${goldLost} gold.` }]);
-                }
-              }
-              setBattleOutcome(null);
-              setCombatEnemyLoot([]);
-              setGameState('exploration');
-            } else {
-              setActiveTab('home');
-              setGameState('menu');
-            }
-          }}
-          className="duo-btn duo-btn-gray w-full py-4 text-lg"
-        >
-          {explorationCombatReturn ? 'Return to World' : 'Home'}
-        </button>
+      <div className="p-2 composer-safe bg-white border-t border-duo-gray flex gap-2">
+        <textarea ref={explorationInputRef} value={explorationInput} onChange={e => setExplorationInput(e.target.value)} placeholder="Explore..." className="flex-1 bg-duo-gray rounded-2xl px-3 py-2 text-sm focus:outline-none resize-none" rows={1} />
+        <button onClick={() => { const a = explorationInput; setExplorationInput(''); socket.emit('explorationAction', { action: a, explorationState }); setExplorationLog(prev => [...prev, { role: 'user', text: a }]); }} className="duo-btn duo-btn-blue px-4 flex items-center"><Send className="w-4 h-4" /></button>
       </div>
     </div>
   );
+
+  const renderPostMatch = () => <div className="flex-1 flex flex-col items-center justify-center p-6"><h1 className="text-4xl font-black mb-8">Victory!</h1><button onClick={() => setGameState('menu')} className="duo-btn duo-btn-green w-full py-4 text-lg">Menu</button></div>;
+  const renderLevelSelect = () => <div className="p-6">Levels placeholder</div>;
+  const renderCharCreation = () => (
+    <div className="flex-1 flex flex-col bg-gray-50 overflow-hidden">
+      <div className="p-3 bg-white border-b border-duo-gray flex justify-between items-center"><button onClick={() => setGameState('menu')}><ArrowLeft className="w-5 h-5" /></button><h2 className="font-black">Legend Architect</h2><div /></div>
+      <div ref={chatScrollContainerRef} onScroll={handleChatScroll} className="flex-1 overflow-y-auto p-3 space-y-3">
+        {messages.map((msg, i) => <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}><div className={msg.role === 'user' ? 'chat-bubble-me' : 'chat-bubble-them'}><div className="markdown-body"><Markdown rehypePlugins={[rehypeRaw]}>{msg.text}</Markdown></div></div></div>)}
+        <div ref={chatEndRef} />
+      </div>
+      <div className="p-2.5 composer-safe bg-white border-t border-duo-gray flex gap-2">
+        <textarea ref={charInputRef} value={inputText} onChange={e => setInputText(e.target.value)} placeholder="Describe your legend..." className="flex-1 bg-duo-gray rounded-2xl px-4 py-3 font-bold focus:outline-none resize-none" rows={1} />
+        <button onClick={() => { const t = inputText; setInputText(''); setMessages(prev => [...prev, { role: 'user', text: t }]); }} className="duo-btn duo-btn-blue px-6 flex items-center"><Send className="w-5 h-5" /></button>
+      </div>
+    </div>
+  );
+
+  const renderMatchmaking = () => <div className="flex-1 flex flex-col items-center justify-center bg-gray-50"><Loader2 className="w-12 h-12 animate-spin text-duo-blue mb-4" /><h2 className="text-xl font-black text-duo-gray-dark uppercase tracking-widest">Searching...</h2></div>;
 
   return (
     <div className="h-safe-screen bg-duo-bg flex justify-center overflow-hidden">
-      <div className="w-full max-w-md bg-white h-full flex flex-col relative shadow-2xl">
+      <div className="w-full max-w-md bg-white h-full flex flex-col relative shadow-2xl overflow-hidden">
         {renderTopBar()}
-        
         {gameState === 'menu' && renderMenu()}
         {gameState === 'char_creation' && renderCharCreation()}
         {gameState === 'matchmaking' && renderMatchmaking()}
@@ -5895,336 +1057,26 @@ Be creative and concise.`;
         {gameState === 'post_match' && renderPostMatch()}
         {gameState === 'exploration' && renderExploration()}
         {gameState === 'level_select' && renderLevelSelect()}
-
         {renderBottomBar()}
-
-        {showSettings && (
-          <div className="fixed inset-0 bg-black/50 z-50 overflow-y-auto">
-            <div className="min-h-full flex items-center justify-center p-4">
-            <div className="bg-white rounded-3xl p-6 w-full max-w-sm shadow-xl border-b-4 border-gray-200">
-              <h3 className="text-2xl font-black text-duo-text mb-6 text-center">Settings</h3>
-              <div className="flex gap-2 mb-6">
-                <button
-                  onClick={() => setSettingsPage('general')}
-                  className={`flex-1 rounded-xl px-3 py-2 text-sm font-black transition-colors ${settingsPage === 'general' ? 'bg-duo-blue text-white' : 'bg-duo-gray text-duo-gray-dark'}`}
-                >
-                  General
-                </button>
-                <button
-                  onClick={() => setSettingsPage('debug')}
-                  className={`flex-1 rounded-xl px-3 py-2 text-sm font-black transition-colors ${settingsPage === 'debug' ? 'bg-duo-blue text-white' : 'bg-duo-gray text-duo-gray-dark'}`}
-                >
-                  Debug
-                </button>
-              </div>
-              
-              {settingsPage === 'general' ? (
-                <>
-                  <div className="space-y-4 mb-8">
-                    <div>
-                      <label className="block text-sm font-bold text-duo-gray-dark mb-1">
-                        API Key (Optional)
-                        {settings.apiKey?.trim() && <span className="ml-2 text-duo-green text-xs">✓ Custom Key Active</span>}
-                      </label>
-                      <input 
-                        type="password" 
-                        value={settings.apiKey}
-                        onChange={e => setSettings({...settings, apiKey: e.target.value})}
-                        className="w-full bg-duo-gray rounded-xl px-4 py-2 font-bold text-duo-text focus:outline-none focus:ring-2 focus:ring-duo-blue mb-2"
-                        placeholder="Leave blank to use default"
-                        style={{ fontSize: '16px' }}
-                      />
-                      <button
-                        onClick={async () => {
-                          if (window.aistudio && window.aistudio.openSelectKey) {
-                            await window.aistudio.openSelectKey();
-                          } else {
-                            alert("Platform API key selection is not available in this environment.");
-                          }
-                        }}
-                        className="w-full bg-duo-blue hover:bg-duo-blue-light text-white font-bold py-2 px-4 rounded-xl transition-colors"
-                      >
-                        Select AI Studio Platform Key
-                      </button>
-                      <p className="text-xs text-duo-gray-light mt-2">
-                        If you are hitting rate limits, click the button above to link your paid Google Cloud project.
-                      </p>
-                    </div>
-                    <div>
-                      <label className="block text-sm font-bold text-duo-gray-dark mb-1">Char Creator Model</label>
-                      <select 
-                        value={settings.charModel}
-                        onChange={e => setSettings({...settings, charModel: e.target.value})}
-                        className="w-full bg-duo-gray rounded-xl px-4 py-2 font-bold text-duo-text focus:outline-none focus:ring-2 focus:ring-duo-blue"
-                        style={{ fontSize: '16px' }}
-                      >
-                        <option value="gemini-3.1-pro-preview">gemini-3.1-pro-preview</option>
-                        <option value="gemini-3-flash-preview">gemini-3-flash-preview</option>
-                        <option value="gemini-2.5-pro">gemini-2.5-pro</option>
-                        <option value="gemini-2.5-flash">gemini-2.5-flash</option>
-                      </select>
-                    </div>
-                    <div>
-                      <label className="block text-sm font-bold text-duo-gray-dark mb-1">Exploration Model</label>
-                      <select 
-                        value={settings.explorationModel}
-                        onChange={e => setSettings({...settings, explorationModel: e.target.value})}
-                        className="w-full bg-duo-gray rounded-xl px-4 py-2 font-bold text-duo-text focus:outline-none focus:ring-2 focus:ring-duo-blue"
-                        style={{ fontSize: '16px' }}
-                      >
-                        <option value="gemini-3.1-pro-preview">gemini-3.1-pro-preview</option>
-                        <option value="gemini-3-flash-preview">gemini-3-flash-preview</option>
-                        <option value="gemini-2.5-pro">gemini-2.5-pro</option>
-                        <option value="gemini-2.5-flash">gemini-2.5-flash</option>
-                      </select>
-                    </div>
-                    <div>
-                      <label className="block text-sm font-bold text-duo-gray-dark mb-1">Battle Model</label>
-                      <select 
-                        value={settings.battleModel}
-                        onChange={e => setSettings({...settings, battleModel: e.target.value})}
-                        className="w-full bg-duo-gray rounded-xl px-4 py-2 font-bold text-duo-text focus:outline-none focus:ring-2 focus:ring-duo-blue"
-                        style={{ fontSize: '16px' }}
-                      >
-                        <option value="gemini-3.1-pro-preview">gemini-3.1-pro-preview</option>
-                        <option value="gemini-3-flash-preview">gemini-3-flash-preview</option>
-                        <option value="gemini-2.5-pro">gemini-2.5-pro</option>
-                        <option value="gemini-2.5-flash">gemini-2.5-flash</option>
-                      </select>
-                    </div>
-                    <div>
-                      <label className="block text-sm font-bold text-duo-gray-dark mb-1">Bot Model</label>
-                      <select 
-                        value={settings.botModel}
-                        onChange={e => setSettings({...settings, botModel: e.target.value})}
-                        className="w-full bg-duo-gray rounded-xl px-4 py-2 font-bold text-duo-text focus:outline-none focus:ring-2 focus:ring-duo-blue"
-                        style={{ fontSize: '16px' }}
-                      >
-                        <option value="gemini-3.1-pro-preview">gemini-3.1-pro-preview</option>
-                        <option value="gemini-3-flash-preview">gemini-3-flash-preview</option>
-                        <option value="gemini-2.5-pro">gemini-2.5-pro</option>
-                        <option value="gemini-2.5-flash">gemini-2.5-flash</option>
-                      </select>
-                    </div>
-                  </div>
-
-                  {/* Account Section */}
-                  <div className="border-t-2 border-duo-gray pt-4 mt-4">
-                    <label className="block text-sm font-bold text-duo-gray-dark mb-2">Cloud Account</label>
-                    {authUser ? (
-                      <div className="flex items-center justify-between bg-duo-green/10 border border-duo-green/30 rounded-xl p-3">
-                        <div>
-                          <div className="font-bold text-sm text-duo-text">Logged in as {authUser}</div>
-                          <div className="text-[10px] text-duo-green-dark font-bold">Characters synced to cloud ☁️</div>
-                        </div>
-                        <button onClick={handleLogout} className="text-xs font-bold text-red-500 hover:underline">Logout</button>
-                      </div>
-                    ) : dbAvailable ? (
-                      <button
-                        onClick={() => { setShowAuthModal(true); setShowSettings(false); }}
-                        className="duo-btn duo-btn-blue w-full py-2 text-sm"
-                      >
-                        Sign In / Register
-                      </button>
-                    ) : (
-                      <p className="text-xs text-duo-gray-dark">Database not connected. Characters saved locally.</p>
-                    )}
-                  </div>
-                </>
-              ) : (
-                <div className="space-y-4 mb-8">
-                  <div className="rounded-2xl border border-duo-gray bg-duo-gray/30 p-4">
-                    <div className="flex items-start justify-between gap-4">
-                      <div>
-                        <h4 className="text-sm font-black text-duo-text">Unlimited Turn Times</h4>
-                        <p className="text-xs text-duo-gray-dark mt-1">
-                          Disable arena turn countdowns for queue PvP and bot fights while debugging shared combat systems.
-                        </p>
-                      </div>
-                      <button
-                        onClick={() => setSettings({ ...settings, unlimitedTurnTime: !settings.unlimitedTurnTime })}
-                        className={`relative inline-flex h-8 w-14 items-center rounded-full p-1 transition-colors ${settings.unlimitedTurnTime ? 'bg-duo-green' : 'bg-duo-gray-dark/30'}`}
-                        aria-pressed={settings.unlimitedTurnTime}
-                      >
-                        <span
-                          className={`block h-6 w-6 rounded-full bg-white shadow transition-transform ${settings.unlimitedTurnTime ? 'translate-x-6' : 'translate-x-0'}`}
-                        />
-                      </button>
-                    </div>
-                    <div className="mt-3 text-[11px] font-bold text-duo-gray-dark">
-                      Current state: {settings.unlimitedTurnTime ? 'Timers disabled for new arena rooms' : 'Standard timed turns'}
-                    </div>
-                  </div>
-                  <div className="rounded-2xl border border-duo-gray bg-duo-gray/30 p-4">
-                    <h4 className="text-sm font-black text-duo-text mb-2">Arena Phase Durations</h4>
-                    <p className="text-xs text-duo-gray-dark mb-3">
-                      Configure the read (preview) and write (tweak) phase timers for new arena matches.
-                    </p>
-                    <div className="flex gap-3">
-                      <div className="flex-1">
-                        <label className="block text-[11px] font-bold text-duo-gray-dark mb-1">Read Phase (s)</label>
-                        <input
-                          type="number"
-                          min={1}
-                          max={300}
-                          value={settings.arenaPreviewSeconds}
-                          onChange={e => setSettings({ ...settings, arenaPreviewSeconds: Math.max(1, Math.min(300, parseInt(e.target.value) || 15)) })}
-                          className="w-full bg-duo-gray rounded-xl px-3 py-2 font-bold text-duo-text focus:outline-none focus:ring-2 focus:ring-duo-blue"
-                          style={{ fontSize: '16px' }}
-                        />
-                      </div>
-                      <div className="flex-1">
-                        <label className="block text-[11px] font-bold text-duo-gray-dark mb-1">Write Phase (s)</label>
-                        <input
-                          type="number"
-                          min={1}
-                          max={600}
-                          value={settings.arenaTweakSeconds}
-                          onChange={e => setSettings({ ...settings, arenaTweakSeconds: Math.max(1, Math.min(600, parseInt(e.target.value) || 120)) })}
-                          className="w-full bg-duo-gray rounded-xl px-3 py-2 font-bold text-duo-text focus:outline-none focus:ring-2 focus:ring-duo-blue"
-                          style={{ fontSize: '16px' }}
-                        />
-                      </div>
-                      <div className="flex-1">
-                        <label className="block text-[11px] font-bold text-duo-gray-dark mb-1">Turn Time (s)</label>
-                        <input
-                          type="number"
-                          min={10}
-                          max={600}
-                          value={settings.battleTurnSeconds}
-                          onChange={e => setSettings({ ...settings, battleTurnSeconds: Math.max(10, Math.min(600, parseInt(e.target.value) || 60)) })}
-                          className="w-full bg-duo-gray rounded-xl px-3 py-2 font-bold text-duo-text focus:outline-none focus:ring-2 focus:ring-duo-blue"
-                          style={{ fontSize: '16px' }}
-                        />
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              <button 
-                onClick={() => setShowSettings(false)}
-                className="duo-btn duo-btn-blue w-full py-3 mt-4"
-              >
-                Done
-              </button>
-            </div>
-            </div>
-          </div>
-        )}
-
-        {/* Auth Modal */}
-        {showAuthModal && (
-          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={() => setShowAuthModal(false)}>
-            <div className="bg-white rounded-3xl p-6 w-full max-w-sm shadow-xl border-b-4 border-duo-blue" onClick={e => e.stopPropagation()}>
-              <h3 className="text-2xl font-black text-duo-text mb-2 text-center">
-                {authMode === 'login' ? 'Sign In' : 'Create Account'}
-              </h3>
-              <p className="text-xs text-duo-gray-dark text-center mb-6">
-                Sync your characters across devices
-              </p>
-              
-              {authError && (
-                <div className="bg-red-50 border border-red-200 rounded-xl p-3 mb-4 text-sm font-bold text-red-600">
-                  {authError}
-                </div>
-              )}
-              
-              <div className="space-y-3 mb-6">
-                <input
-                  type="text"
-                  value={authUsername}
-                  onChange={e => setAuthUsername(e.target.value)}
-                  placeholder="Username"
-                  className="w-full bg-duo-gray rounded-xl px-4 py-3 font-bold text-duo-text focus:outline-none focus:ring-2 focus:ring-duo-blue"
-                  style={{ fontSize: '16px' }}
-                />
-                <input
-                  type="password"
-                  value={authPassword}
-                  onChange={e => setAuthPassword(e.target.value)}
-                  onKeyDown={e => e.key === 'Enter' && handleAuth()}
-                  placeholder="Password"
-                  className="w-full bg-duo-gray rounded-xl px-4 py-3 font-bold text-duo-text focus:outline-none focus:ring-2 focus:ring-duo-blue"
-                  style={{ fontSize: '16px' }}
-                />
-              </div>
-              
-              <button
-                onClick={handleAuth}
-                disabled={authLoading || !authUsername.trim() || !authPassword.trim()}
-                className="duo-btn duo-btn-green w-full py-3 mb-3 disabled:opacity-50 flex items-center justify-center gap-2"
-              >
-                {authLoading && <Loader2 className="w-4 h-4 animate-spin" />}
-                {authMode === 'login' ? 'Sign In' : 'Create Account'}
-              </button>
-              
-              <button
-                onClick={() => { setAuthMode(authMode === 'login' ? 'register' : 'login'); setAuthError(''); }}
-                className="w-full text-center text-sm font-bold text-duo-blue hover:underline"
-              >
-                {authMode === 'login' ? "Don't have an account? Register" : 'Already have an account? Sign In'}
-              </button>
-            </div>
-          </div>
-        )}
       </div>
-      {showProfileModal && profileToView && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-[100] p-4 backdrop-blur-sm">
-          <div className="bg-white rounded-3xl w-full max-w-2xl max-h-[80vh] flex flex-col shadow-2xl border-b-8 border-duo-gray overflow-hidden">
-            <div className="p-4 border-b-2 border-duo-gray flex justify-between items-center bg-duo-blue text-white">
-              <h3 className="text-xl font-black tracking-tight">Legend Profile</h3>
-              <button 
-                onClick={() => setShowProfileModal(false)}
-                className="p-2 hover:bg-white/20 rounded-full transition-colors"
-              >
-                <ArrowLeft className="w-6 h-6 rotate-180" />
-              </button>
-            </div>
-            <div className="flex-1 overflow-y-auto p-6 prose prose-slate max-w-none">
-              <div className="markdown-body">
-                <Markdown rehypePlugins={[rehypeRaw]}>{profileToView}</Markdown>
+      {showSettings && (
+          <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+            <div className="bg-white rounded-3xl p-6 w-full max-w-sm shadow-xl border-b-4 border-gray-200">
+              <h3 className="text-2xl font-black text-center mb-6">Settings</h3>
+              <div className="space-y-4 mb-8">
+                <div><label className="block text-xs font-black uppercase mb-1">API Key</label><input type="password" value={settings.apiKey} onChange={e => setSettings({ ...settings, apiKey: e.target.value })} className="w-full bg-duo-gray rounded-xl px-4 py-2 font-bold focus:outline-none" /></div>
               </div>
-            </div>
-            <div className="p-4 border-t-2 border-duo-gray bg-gray-50 flex justify-end">
-              <button 
-                onClick={() => setShowProfileModal(false)}
-                className="duo-btn duo-btn-blue px-8 py-2"
-              >
-                Close
-              </button>
+              <button onClick={() => setShowSettings(false)} className="duo-btn duo-btn-blue w-full py-3">Done</button>
             </div>
           </div>
-        </div>
       )}
-      {showCharImage && character?.imageUrl && (
-        <div 
-          className="fixed inset-0 bg-black/80 flex items-center justify-center z-[100] p-6 backdrop-blur-sm cursor-pointer"
-          onClick={() => setShowCharImage(false)}
-        >
-          <div className="relative max-w-full max-h-full animate-in zoom-in-95">
-            <img 
-              src={character.imageUrl} 
-              alt={character.name} 
-              className="max-w-full max-h-[80vh] rounded-3xl shadow-2xl border-4 border-white/20 object-contain"
-            />
-            <div className="absolute bottom-4 left-0 right-0 text-center">
-              <span className="bg-black/60 text-white font-black text-lg px-4 py-2 rounded-full">{character.name}</span>
+      {showProfileModal && profileToView && (
+          <div className="fixed inset-0 bg-black/60 z-[100] flex items-center justify-center p-4 backdrop-blur-sm" onClick={() => setShowProfileModal(false)}>
+            <div className="bg-white rounded-3xl w-full max-w-2xl max-h-[80vh] flex flex-col shadow-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
+              <div className="p-4 bg-duo-blue text-white flex justify-between items-center"><h3 className="text-xl font-black">Legend Profile</h3><button onClick={() => setShowProfileModal(false)}><X className="w-6 h-6" /></button></div>
+              <div className="flex-1 overflow-y-auto p-6 markdown-body"><Markdown rehypePlugins={[rehypeRaw]}>{profileToView}</Markdown></div>
             </div>
           </div>
-        </div>
-      )}
-      {expandedImageUrl && (
-        <div 
-          className="fixed inset-0 bg-black/80 flex items-center justify-center z-[100] p-4 backdrop-blur-sm cursor-pointer"
-          onClick={() => setExpandedImageUrl(null)}
-        >
-          <img 
-            src={expandedImageUrl} 
-            alt="Expanded" 
-            className="max-w-full max-h-[90vh] rounded-2xl shadow-2xl object-contain"
-          />
-        </div>
       )}
     </div>
   );
