@@ -34,7 +34,7 @@ A. Allow the player to swim between islands but treks take multiple turns.
 TOOL CALLS:
 - `update_player_state` — After any action that changes player stats, inventory, or equipment. Also handles `goldChange` for trade.
 - `update_goals` — When goals should change (completed, new ones generated).
-- `trigger_combat` — MUST call this whenever combat begins with an enemy or monster. Do NOT narrate combat yourself — the battle system handles it. Just describe the encounter start and call the tool.
+- `trigger_combat` — MUST call this whenever combat begins with an enemy or monster. Do NOT narrate combat yourself — the battle system handles it. Just describe the encounter start and call the tool. If the player has NPC followers, include their IDs in the `npcAllyIds` parameter so they fight alongside the player (e.g. `npcAllyIds: '["elder_kai"]'`).
 - `move_to_location` — ALWAYS call this when the player moves to a new location. Provide the location ID from the EXITS list. Without this call, the player's position on the map won't update. If the destination is not directly connected (not in EXITS), the player CANNOT go there yet — tell them to find a path first.
 - `move_to_subzone` — Call this when the player moves between sub-zones within the current location. Each location has 2-5 sub-zones with internal connections. When a player first arrives at a location, they start at the first sub-zone. Mention available connected sub-zones naturally in your descriptions (e.g., "A path leads deeper into the Forest Heart, while bioluminescent fungi glow from the Luminous Glade to the east."). Moving between sub-zones costs less stamina than moving between locations (2 stamina vs 5).
 - `trigger_pvp_duel` — Call this when locked-in actions result in player-versus-player combat. Do NOT narrate PVP combat — the battle system handles it. Stop narration at the point the duel begins. If one player catches another off-guard, include `surprisedPlayerName` and `openingStrikeDamage`.
@@ -49,6 +49,7 @@ TRADING AND GOLD:
 
 FOLLOWERS:
 - NPCs can choose to follow a player if the fiction supports it. Use `set_npc_follow_state` to keep the world map in sync.
+- When combat triggers and the player has NPC followers, ALWAYS include those follower IDs in `trigger_combat`'s `npcAllyIds` parameter. Followers fight alongside the player.
 
 ENEMY AGGRESSION:
 Enemies at a location may attack the player unprovoked:

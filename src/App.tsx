@@ -218,12 +218,12 @@ const ImageSequencePreview = ({ frames, fps = 60, alt }: { frames: string[]; fps
   return <img src={frames[frameIndex] || frames[0]} alt={alt} className="w-full" />;
 };
 
-const InlineMessageMedia = ({ message, alt }: { message: Message; alt: string }) => {
+const InlineMessageMedia = ({ message, alt, onImageClick }: { message: Message; alt: string; onImageClick?: (url: string) => void }) => {
   const frames = message.imageFrames?.length ? message.imageFrames : message.imageUrl ? [message.imageUrl] : [];
   if (!frames.length) return null;
 
   return (
-    <div className="mt-2 rounded-lg overflow-hidden border-2 border-duo-gray bg-white">
+    <div className="mt-2 rounded-lg overflow-hidden border-2 border-duo-gray bg-white cursor-pointer" onClick={() => onImageClick?.(frames[0])}>
       {frames.length > 1 ? (
         <>
           <ImageSequencePreview frames={frames} fps={message.imageFrameFps || 60} alt={alt} />
@@ -253,6 +253,7 @@ interface WorldNpc {
   name: string;
   role: string;
   locationId: string;
+  subZoneId?: string | null;
   x: number;
   y: number;
   followTargetId?: string | null;
@@ -355,7 +356,7 @@ const getZoneHopDistance = (zones: BattleZone[], fromId: string, toId: string): 
   return Infinity;
 };
 
-const buildBattleMapContext = (worldData: any, mapState?: BattleMapState, roomPlayers?: Record<string, any>) => {
+const buildBattleMapContext = (worldData: any, mapState?: BattleMapState, roomPlayers?: Record<string, any>, options?: { isJudge?: boolean }) => {
   if (!worldData || !mapState || mapState.players.length === 0) return '';
 
   let context = '';
@@ -402,11 +403,19 @@ const buildBattleMapContext = (worldData: any, mapState?: BattleMapState, roomPl
 
   // Fallback: legacy grid-based context
   context += 'BATTLE MAP STATE:\n';
-  context += 'No battle zones have been set up yet. Call setup_battle_zones on this first turn to create the spatial arena layout.\n';
+  if (options?.isJudge) {
+    context += 'No battle zones have been set up yet. Call setup_battle_zones on this first turn to create the spatial arena layout.\n';
+  } else {
+    context += 'The battlefield layout has not been established yet.\n';
+  }
   for (const player of mapState.players) {
     const location = getWorldLocationById(worldData, player.locationId);
     const playerName = roomPlayers?.[player.id]?.character?.name || player.name;
     context += `- ${playerName} starts near ${location?.name || player.locationId}.\n`;
+  }
+  for (const npc of (mapState.npcs || [])) {
+    const location = getWorldLocationById(worldData, npc.locationId);
+    context += `- ${npc.name} (NPC Ally) starts near ${location?.name || npc.locationId}.\n`;
   }
 
   return context;
@@ -774,6 +783,7 @@ export default function App() {
   const [isExplorationProcessing, setIsExplorationProcessing] = useState(false);
   const [worldPlayers, setWorldPlayers] = useState<WorldPlayer[]>([]);
   const [worldNpcs, setWorldNpcs] = useState<WorldNpc[]>([]);
+  const followingNpcIdsRef = useRef<Set<string>>(new Set());
   const [explorationLockStatus, setExplorationLockStatus] = useState<{id: string; name: string; lockedIn: boolean}[]>([]);
   const [isExplorationLockedIn, setIsExplorationLockedIn] = useState(false);
   const [explorationSummary, setExplorationSummary] = useState('');
@@ -912,12 +922,23 @@ export default function App() {
   const [isBotMatch, setIsBotMatch] = useState(false);
   const [battleOutcome, setBattleOutcome] = useState<'win' | 'loss' | null>(null);
   const [isGeneratingBattleImage, setIsGeneratingBattleImage] = useState(false);
+  const battleImageAbortRef = useRef<AbortController | null>(null);
   const [hasVisualizedThisTurn, setHasVisualizedThisTurn] = useState(false);
+  const [awaitingBattleImage, setAwaitingBattleImage] = useState(false);
+  const pendingBotRoomRef = useRef<any>(null);
+  const npcAllyActionsInFlightRef = useRef<Set<string>>(new Set());
+  const npcAllyActionRequestIdsRef = useRef<Record<string, number>>({});
+  const npcAllyLastActionTurnRef = useRef<Record<string, number>>({});
+  const botActionInFlightRef = useRef(false);
+  const botLastActionTurnRef = useRef<number | null>(null);
+  const autonomousTurnSequenceRef = useRef(0);
+  const botSystemPromptRef = useRef<string | null>(null);
   const [turnTimerRemaining, setTurnTimerRemaining] = useState<number | null>(null);
   const [isVisualizingScene, setIsVisualizingScene] = useState(false);
   const isBotMatchRef = useRef(false);
   const [showProfileModal, setShowProfileModal] = useState(false);
   const [profileToView, setProfileToView] = useState<string | null>(null);
+  const [expandedImageUrl, setExpandedImageUrl] = useState<string | null>(null);
   useEffect(() => { isBotMatchRef.current = isBotMatch; }, [isBotMatch]);
   const difficultyLabels = ['Easy', 'Medium', 'Hard', 'Superintelligent'];
   const avatarSyncKeysRef = useRef<Record<string, string>>({});
@@ -925,6 +946,14 @@ export default function App() {
   useEffect(() => {
     playersRef.current = players;
   }, [players]);
+
+  const getBotSystemPrompt = async () => {
+    if (botSystemPromptRef.current) return botSystemPromptRef.current;
+    const botPromptRes = await fetch(`${BACKEND_URL}/api/prompts/bot_player.txt`);
+    const botSysPrompt = await botPromptRes.text();
+    botSystemPromptRef.current = botSysPrompt;
+    return botSysPrompt;
+  };
 
   useEffect(() => {
     gameStateRef.current = gameState;
@@ -1344,8 +1373,13 @@ export default function App() {
     };
   }, [arenaPreparation?.isBotMatch, getAIClient, roomId]);
 
-  const generateBotAction = async (currentRoom: any) => {
+  const generateBotAction = async (currentRoom: any, turnId?: number) => {
     if (!currentRoom || !currentRoom.isBotMatch) return;
+    if (botActionInFlightRef.current) return;
+    if (typeof turnId === 'number' && botLastActionTurnRef.current === turnId) {
+      console.log('[FollowerBattle] Skipping duplicate bot generation for turn', turnId);
+      return;
+    }
     
     const playerIds = Object.keys(currentRoom.players);
     const botId = playerIds.find(id => id.startsWith('bot_'));
@@ -1358,11 +1392,15 @@ export default function App() {
 
     if (p2Data.lockedIn) return;
 
+    if (typeof turnId === 'number') {
+      botLastActionTurnRef.current = turnId;
+    }
+    console.log('[FollowerBattle] Generating bot action', { turnId, botId, botName: p2Data.character.name });
+    botActionInFlightRef.current = true;
     setLocalRoomTypingIds(prev => prev.includes(botId) ? prev : [...prev, botId]);
     try {
       const aiClient = getAIClient();
-      const botPromptRes = await fetch(`${BACKEND_URL}/api/prompts/bot_player.txt`);
-      const botSysPrompt = await botPromptRes.text();
+      const botSysPrompt = await getBotSystemPrompt();
       
       const cleanLogs = battleLogsRef.current.filter(log => !log.startsWith("> **Judge's Thoughts:**"));
       const fullLogText = cleanLogs.join('\n\n');
@@ -1390,18 +1428,118 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         },
       });
       
-      const action = botRes.text || "I do nothing.";
+      const rawAction = botRes.text || "I do nothing.";
+      // Strip any hallucinated tool calls (e.g., "setup_battle_zones([...])")
+      const action = rawAction.replace(/^\s*\w+\([\s\S]*?\)\s*$/gm, '').trim() || rawAction.trim() || "I attack!";
+      console.log('[FollowerBattle] Bot action ready', { turnId, botId, action });
       socket.emit('playerAction', { playerId: botId, action });
     } catch (error) {
       console.error("Error generating bot action:", error);
       // Fallback: send a generic attack so the battle doesn't stall
+      console.log('[FollowerBattle] Bot action fallback', { turnId, botId });
       socket.emit('playerAction', {
         playerId: botId,
         action: `${currentRoom.players[botId!]?.character?.name || 'The enemy'} attacks with a basic strike!`,
       });
     } finally {
+      botActionInFlightRef.current = false;
       setLocalRoomTypingIds(prev => prev.filter(id => id !== botId));
     }
+  };
+
+  const generateNpcAllyActions = async (currentRoom: any, turnId?: number) => {
+    if (!currentRoom) return;
+    const npcAllyIds = Object.keys(currentRoom.players).filter(id => id.startsWith('npc_ally_'));
+    if (npcAllyIds.length === 0) {
+      console.log('[FollowerBattle] No NPC allies available for turn', turnId);
+      return;
+    }
+
+    console.log('[FollowerBattle] Starting NPC ally generation', { turnId, npcAllyIds });
+
+    const cleanLogs = battleLogsRef.current.filter(log => !log.startsWith("> **Judge's Thoughts:**"));
+    const logLines = cleanLogs.join('\n\n').split('\n');
+    const totalLines = logLines.length;
+    const battleMapContext = buildBattleMapContext(worldDataRef.current, currentRoom.mapState, currentRoom.players);
+
+    await Promise.all(npcAllyIds.map(async (npcId) => {
+      const npcData = currentRoom.players[npcId];
+      if (!npcData) return;
+      if (typeof turnId === 'number' && npcAllyLastActionTurnRef.current[npcId] === turnId) {
+        console.log('[FollowerBattle] Skipping duplicate NPC ally generation', { turnId, npcId });
+        return;
+      }
+      if (npcData.lockedIn || npcAllyActionsInFlightRef.current.has(npcId)) {
+        console.log('[FollowerBattle] NPC ally already locked or generating', { turnId, npcId, lockedIn: npcData.lockedIn });
+        return;
+      }
+
+      const requestId = Date.now() + Math.random();
+      if (typeof turnId === 'number') {
+        npcAllyLastActionTurnRef.current[npcId] = turnId;
+      }
+      npcAllyActionsInFlightRef.current.add(npcId);
+      npcAllyActionRequestIdsRef.current[npcId] = requestId;
+      upsertBattleStatusLog(`npc-ally-${npcId}`, `🤝 ${npcData.character.name} is choosing an action...`);
+      console.log('[FollowerBattle] Generating NPC ally action', { turnId, npcId, npcName: npcData.character.name });
+      setLocalRoomTypingIds(prev => prev.includes(npcId) ? prev : [...prev, npcId]);
+      const actionAbort = new AbortController();
+      const actionTimeout = window.setTimeout(() => actionAbort.abort(), 12_000);
+      try {
+        const aiClient = getAIClient();
+        const sysPrompt = await getBotSystemPrompt();
+
+        const enemyId = Object.keys(currentRoom.players).find(id => id.startsWith('bot_'));
+        const enemyData = enemyId ? currentRoom.players[enemyId] : null;
+        const playerData = Object.entries(currentRoom.players)
+          .find(([id, p]: any) => !id.startsWith('bot_') && !p.character?.isNpcAlly)?.[1] as any;
+
+        const prompt = `
+YOU ARE AN NPC ALLY fighting alongside the player.
+YOU ARE PLAYING AS: ${npcData.character.name}
+YOUR STATE: HP ${npcData.character.hp}/${npcData.character.maxHp}, Mana ${npcData.character.mana}/${npcData.character.maxMana}
+YOUR PROFILE:\n${npcData.character.profileMarkdown}
+${enemyData ? `ENEMY: ${enemyData.character.name} (HP: ${enemyData.character.hp})` : ''}
+${playerData ? `YOUR ALLY (the player): ${playerData.character.name} (HP: ${playerData.character.hp})` : ''}
+${battleMapContext ? `${battleMapContext}\n` : ''}
+LATEST BATTLE EVENTS:
+${totalLines > 0 ? logLines.slice(Math.max(0, totalLines - 10)).join('\n') : "The battle has just begun."}
+
+What is your action? Stay in character. Support your ally. Keep it short and tactical.
+`;
+        const res = await aiClient.models.generateContent({
+          model: settingsRef.current.botModel,
+          contents: prompt,
+          config: {
+            systemInstruction: sysPrompt,
+            temperature: 0.8,
+            abortSignal: actionAbort.signal,
+          },
+        });
+        const rawAction = res.text || `${npcData.character.name} attacks!`;
+        const action = rawAction.replace(/^\s*\w+\([\s\S]*?\)\s*$/gm, '').trim() || `${npcData.character.name} attacks!`;
+        if (npcAllyActionRequestIdsRef.current[npcId] === requestId) {
+          console.log('[FollowerBattle] NPC ally action ready', { turnId, npcId, action });
+          socket.emit('playerAction', { playerId: npcId, action });
+        }
+      } catch (error) {
+        if (npcAllyActionRequestIdsRef.current[npcId] === requestId) {
+          console.error(`Error generating NPC ally action for ${npcId}:`, error);
+          console.log('[FollowerBattle] NPC ally action fallback', { turnId, npcId });
+          socket.emit('playerAction', {
+            playerId: npcId,
+            action: `${npcData.character.name} attacks the enemy!`,
+          });
+        }
+      } finally {
+        window.clearTimeout(actionTimeout);
+        if (npcAllyActionRequestIdsRef.current[npcId] === requestId) {
+          delete npcAllyActionRequestIdsRef.current[npcId];
+          npcAllyActionsInFlightRef.current.delete(npcId);
+          setLocalRoomTypingIds(prev => prev.filter(id => id !== npcId));
+        }
+      }
+    }));
   };
 
   useEffect(() => {
@@ -1515,7 +1653,14 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       setIsLockedIn(false);
       setHasVisualizedThisTurn(false);
       if (data.isBotMatch) {
-        generateBotAction(data);
+        const turnId = ++autonomousTurnSequenceRef.current;
+        console.log('[FollowerBattle] matchFound autonomous turn start', {
+          turnId,
+          players: Object.keys(data.players || {}),
+          npcAllies: Object.keys(data.players || {}).filter((id: string) => id.startsWith('npc_ally_')),
+        });
+        generateNpcAllyActions(data, turnId);
+        generateBotAction(data, turnId);
       }
     });
 
@@ -1581,7 +1726,8 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       let profiles = "";
       for (const pid of playerIds) {
         const pData = room.players[pid];
-        profiles += `Profile for ${pData.character.name}:\n${pData.character.profileMarkdown}\n\n`;
+        const label = pData.character.isNpcAlly ? 'NPC Ally' : 'Player';
+        profiles += `${label} Profile for ${pData.character.name}:\n${pData.character.profileMarkdown}\n\n`;
       }
 
       const sysPromptRes = await fetch(`${BACKEND_URL}/api/prompts/battle_judge.txt`);
@@ -1591,9 +1737,10 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       let prompt = `BATTLE STATE (TURN START):\n`;
       for (const pid of playerIds) {
         const pData = room.players[pid];
-        prompt += `Player (${pData.character.name}):\nHP: ${pData.character.hp}, Mana: ${pData.character.mana}\nAction: ${pData.action}\n\n`;
+        const label = pData.character.isNpcAlly ? 'NPC Ally' : 'Player';
+        prompt += `${label} (${pData.character.name}):\nHP: ${pData.character.hp}/${pData.character.maxHp || pData.character.hp}, Mana: ${pData.character.mana}/${pData.character.maxMana || pData.character.mana}\nAction: ${pData.action}\n\n`;
       }
-      prompt += buildBattleMapContext(worldDataRef.current, room.mapState, room.players);
+      prompt += buildBattleMapContext(worldDataRef.current, room.mapState, room.players, { isJudge: true });
       prompt += `The battle log currently has ${totalLines} lines. You can use the read_battle_history tool to read it if you need context from previous turns. Otherwise, resolve the turn simultaneously.`;
 
       const readBattleHistory = {
@@ -1621,7 +1768,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
             },
             combatantZones: {
               type: "STRING",
-              description: "JSON string mapping each combatant name to their starting zone id. Format: {\"CharName1\": \"zone_id\", \"CharName2\": \"zone_id\"}"
+              description: "JSON string mapping EVERY combatant name (players AND NPC allies) to their starting zone id. Format: {\"CharName1\": \"zone_id\", \"CharName2\": \"zone_id\", \"NpcAllyName\": \"zone_id\"}"
             }
           },
           required: ["zones", "combatantZones"]
@@ -1640,7 +1787,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
             },
             combatantZones: {
               type: "STRING",
-              description: "JSON string mapping each combatant name to their current zone id after this turn. Format: {\"CharName1\": \"zone_id\", \"CharName2\": \"zone_id\"}"
+              description: "JSON string mapping EVERY combatant name (players AND NPC allies) to their current zone id after this turn. Format: {\"CharName1\": \"zone_id\", \"NpcAllyName\": \"zone_id\"}"
             },
             zoneUpdates: {
               type: "STRING",
@@ -1660,6 +1807,8 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       let hasEmittedStart = false;
       let finalThoughts = "";
       let finalAnswer = "";
+      let displayedThoughts = "";
+      let displayedAnswer = "";
 
       let attempts = 0;
       clearBattleStatusLog('battle-retry');
@@ -1733,11 +1882,17 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
                     }
                     
                     // With native tool calling, the answer text IS the battle log directly (no XML tags)
-                    let displayThoughts = finalThoughts + streamedThoughts;
-                    let displayAnswer = (finalAnswer + streamedAnswer).trim();
+                    const nextThoughts = finalThoughts + streamedThoughts;
+                    const nextAnswer = (finalAnswer + streamedAnswer).trim();
+                    if (nextThoughts.length >= displayedThoughts.length) {
+                      displayedThoughts = nextThoughts;
+                    }
+                    if (nextAnswer.length >= displayedAnswer.length) {
+                      displayedAnswer = nextAnswer;
+                    }
                     
-                    socket.emit('streamTurnResolutionChunk', { type: 'thought', text: "REFRESH:" + displayThoughts });
-                    socket.emit('streamTurnResolutionChunk', { type: 'answer', text: "REFRESH:" + displayAnswer });
+                    socket.emit('streamTurnResolutionChunk', { type: 'thought', text: "REFRESH:" + displayedThoughts });
+                    socket.emit('streamTurnResolutionChunk', { type: 'answer', text: "REFRESH:" + displayedAnswer });
                   }
                 }
               }
@@ -1749,6 +1904,8 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
 
             finalThoughts += streamedThoughts;
             finalAnswer += streamedAnswer;
+            displayedThoughts = finalThoughts;
+            displayedAnswer = finalAnswer.trim();
 
             if (hasToolCall && toolCallPart) {
               const functionCall = toolCallPart.functionCall;
@@ -1964,7 +2121,21 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     });
 
     socket.on('turnResolved', (data) => {
+      // Cancel any in-progress image generation from the previous turn
+      if (battleImageAbortRef.current) {
+        battleImageAbortRef.current.abort();
+        battleImageAbortRef.current = null;
+      }
       setHasVisualizedThisTurn(false);
+      clearBattleStatusLog('battle-image-generation');
+      npcAllyActionsInFlightRef.current.clear();
+      npcAllyActionRequestIdsRef.current = {};
+      botActionInFlightRef.current = false;
+      for (const id of Object.keys(data.players || {})) {
+        if (id.startsWith('npc_ally_')) {
+          clearBattleStatusLog(`npc-ally-${id}`);
+        }
+      }
       setBattleLogs(prev => {
         const filtered = removePendingBattleActionLogs(removeBattleStreamPlaceholders(prev));
         const thoughts = data.thoughts || "";
@@ -1996,20 +2167,23 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
             return { ...prev, battles: b, wins: w, losses: l, profileMarkdown: counterLine + '\n' + md };
           });
           setBattleLogs(prev => [...prev, `**GAME OVER!** ${winnerName} is victorious!`]);
+          setIsLockedIn(false);
         } else {
-          // If it's a bot match, trigger next bot action
+          const turnId = ++autonomousTurnSequenceRef.current;
+          // Store bot room data for after image completes
           const room = {
             id: roomIdRef.current,
             players: data.players,
             mapState: data.mapState ?? battleMapState,
             isBotMatch: isBotMatchRef.current,
             botDifficulty: botDifficultyRef.current,
+            turnId,
           };
-          if (room.isBotMatch) {
-            generateBotAction(room);
-          }
+          pendingBotRoomRef.current = room.isBotMatch ? room : null;
+          // Unlock typing immediately; awaitingBattleImage still blocks sending until the scene finishes.
+          setIsLockedIn(false);
+          setAwaitingBattleImage(true);
         }
-      setIsLockedIn(false);
       // Auto-generate battle scene image after turn resolution (each client generates their own)
       setTimeout(() => handleGenerateBattleImageRef.current?.(), 500);
     });
@@ -2104,6 +2278,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     });
 
     socket.on('npcAllyAction', (data: { npcId: string; npcName: string; action: string }) => {
+      upsertBattleStatusLog(`npc-ally-${data.npcId}`, `🤝 ${data.npcName} locked in an action.`);
       setBattleLogs(prev => [...prev, `NPC_ALLY_ACTION_**${data.npcName}:** ${data.action}`]);
     });
 
@@ -2166,6 +2341,9 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     });
 
     socket.on('explorationNpcStatesUpdated', (npcs) => {
+      followingNpcIdsRef.current = new Set((npcs || [])
+        .filter((npc: WorldNpc) => npc.followTargetId === socket.id)
+        .map((npc: WorldNpc) => npc.id));
       setWorldNpcs(npcs || []);
     });
 
@@ -2305,19 +2483,28 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
             
             // Parse NPC allies
             let npcAllies: any[] = [];
+            const explicitNpcAllyIds: string[] = [];
             if (tc.args.npcAllyIds) {
               try {
                 const allyIds = typeof tc.args.npcAllyIds === 'string' ? JSON.parse(tc.args.npcAllyIds) : tc.args.npcAllyIds;
-                const wd = worldDataRef.current;
-                npcAllies = (allyIds || []).map((npcId: string) => {
-                  const npc = wd?.npcs?.[npcId];
-                  return npc ? { id: npcId, name: npc.name, hp: 80, profileMarkdown: npc.profileMarkdown } : null;
-                }).filter(Boolean);
+                explicitNpcAllyIds.push(...(allyIds || []));
               } catch (e) { console.error("Failed to parse npcAllyIds", e); }
             }
+            const localFollowerIds = Array.from(followingNpcIdsRef.current);
+            const mergedNpcAllyIds = Array.from(new Set([...explicitNpcAllyIds, ...localFollowerIds]));
+            const wd = worldDataRef.current;
+            npcAllies = mergedNpcAllyIds.map((npcId: string) => {
+              const npc = wd?.npcs?.[npcId];
+              if (!npc) return null;
+              return { id: npcId, name: npc.name, hp: npc.hp || 60, mana: npc.mana || 40, profileMarkdown: npc.profileMarkdown };
+            }).filter(Boolean);
+            console.log('[FollowerBattle] trigger_combat local ally merge', {
+              explicitNpcAllyIds,
+              localFollowerIds,
+              mergedNpcAllyIds,
+            });
             
             // Build enemy profile from world data if available
-            const wd = worldDataRef.current;
             const enemy = wd?.enemies?.[tc.args.enemyId];
             setCombatEnemyLoot(enemy?.loot || []);
             const fullProfile = enemy
@@ -2335,10 +2522,21 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
               battleTurnSeconds: settingsRef.current.battleTurnSeconds,
             });
             toolBadges.push(`⚔️ **Combat Initiated** — engaging ${enemyName}!`);
+            for (const ally of npcAllies) {
+              toolBadges.push(`🤝 **Allied with ${ally.name}!**`);
+            }
           } else if (tc.name === 'move_to_location') {
             const loc = worldDataRef.current?.locations?.find((l: any) => l.id === tc.args.locationId);
             if (loc) {
               moveExplorationStateToLocation(loc.id, loc.x, loc.y);
+              setWorldNpcs(prev => prev.map(npc => {
+                if (npc.followTargetId !== socket.id) return npc;
+                return {
+                  ...npc,
+                  locationId: loc.id,
+                  subZoneId: null,
+                };
+              }));
             }
             toolBadges.push(`🗺️ **Moved** — traveled to ${loc?.name || tc.args.locationId}`);
           } else if (tc.name === 'move_to_subzone') {
@@ -2347,6 +2545,13 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
             const subZone = loc?.subZones?.find((sz: any) => sz.id === subZoneId);
             if (subZone) {
               setExplorationState(prev => ({ ...prev, subZoneId }));
+              setWorldNpcs(prev => prev.map(npc => {
+                if (npc.followTargetId !== socket.id || npc.locationId !== explorationState.locationId) return npc;
+                return {
+                  ...npc,
+                  subZoneId,
+                };
+              }));
             }
             toolBadges.push(`📍 **Moved** — went to ${subZone?.name || subZoneId}`);
           } else if (tc.name === 'trigger_pvp_duel') {
@@ -2357,10 +2562,30 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
               toolBadges.push(`⚔️ **PVP Duel** — ${tc.args.targetPlayerName}`);
             }
           } else if (tc.name === 'set_npc_follow_state') {
-            const npcName = worldDataRef.current?.npcs?.[tc.args.npcId]?.name || tc.args.npcId;
+            const resolvedNpcByName = Object.values(worldDataRef.current?.npcs || {}).find((npc: any) => npc?.name?.toLowerCase() === String(tc.args.npcId || '').toLowerCase()) as any;
+            const npcId = worldDataRef.current?.npcs?.[tc.args.npcId]?.id || resolvedNpcByName?.id || tc.args.npcId;
+            const npcName = worldDataRef.current?.npcs?.[npcId]?.name || tc.args.npcId;
             if (tc.args.mode === 'follow') {
+              const isFollowingMe = !tc.args.followPlayerName
+                || tc.args.followPlayerName?.toLowerCase() === characterRef.current?.name?.toLowerCase();
+              if (isFollowingMe && socket.id) {
+                followingNpcIdsRef.current = new Set([...followingNpcIdsRef.current, npcId]);
+                setWorldNpcs(prev => prev.map(npc => {
+                  if (npc.id !== npcId) return npc;
+                  return {
+                    ...npc,
+                    followTargetId: socket.id,
+                    locationId: explorationState.locationId,
+                    subZoneId: explorationState.subZoneId,
+                  };
+                }));
+              }
               toolBadges.push(`🤝 **Follower Joined** — ${npcName} is now following ${tc.args.followPlayerName || 'you'}`);
             } else {
+              const nextFollowingNpcIds = new Set(followingNpcIdsRef.current);
+              nextFollowingNpcIds.delete(npcId);
+              followingNpcIdsRef.current = nextFollowingNpcIds;
+              setWorldNpcs(prev => prev.map(npc => npc.id === npcId ? { ...npc, followTargetId: null } : npc));
               toolBadges.push(`👋 **Follower Left** — ${npcName} returned to their own route`);
             }
           }
@@ -3067,8 +3292,19 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
   // ============ END EXPLORATION HANDLERS ============
 
   const handleGenerateBattleImage = async () => {
-    if (isGeneratingBattleImage || hasVisualizedThisTurn) return;
+    if (hasVisualizedThisTurn) {
+      // Already visualized — still signal ready in case server is waiting
+      setAwaitingBattleImage(false);
+      setIsLockedIn(false);
+      socket.emit('readyForNextTurn');
+      return;
+    }
+    // Cancel any in-progress image generation
+    if (battleImageAbortRef.current) battleImageAbortRef.current.abort();
+    const imageAbort = new AbortController();
+    battleImageAbortRef.current = imageAbort;
     setIsGeneratingBattleImage(true);
+    upsertBattleStatusLog('battle-image-generation', '🎨 Generating battle image...');
     try {
       const aiClient = getAIClient();
       // Extract the most recent player actions (what players actually declared)
@@ -3084,15 +3320,35 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         const c = p.character;
         return `${c.name} (HP: ${c.hp}/${c.maxHp}, Mana: ${c.mana}/${c.maxMana})`;
       }).join(' vs ');
-      const prompt = `Generate a dramatic battle scene illustration showing EXACTLY what is described below. Focus on the SPECIFIC ACTIONS — do NOT draw a generic standoff.\n\nCombatants: ${playerDescriptions}\n\n${playerActions ? `CRITICAL — Players declared these actions (SHOW THESE):\n${playerActions}\n\n` : ''}What happened this turn:\n${narrativeLogs}\n\nStyle: Dynamic fantasy RPG battle art. Show the SPECIFIC attacks, grapples, spells, and physical interactions described above — characters should be in direct contact/action, NOT standing apart. Dramatic action poses, magical effects, vibrant colors, cinematic composition. No text, no UI, no health bars, no labels.`;
+      const prompt = `Generate a dramatic battle scene illustration showing EXACTLY what is described below. Focus on the SPECIFIC ACTIONS — do NOT draw a generic standoff.\n\nCombatants: ${playerDescriptions}\n\n${playerActions ? `CRITICAL — Players declared these actions (SHOW THESE):\n${playerActions}\n\n` : ''}What happened this turn:\n${narrativeLogs}\n\nBelow are reference images of the combatants. Use them to accurately depict each character's appearance.\n\nStyle: Dynamic fantasy RPG battle art. Show the SPECIFIC attacks, grapples, spells, and physical interactions described above — characters should be in direct contact/action, NOT standing apart. Dramatic action poses, magical effects, vibrant colors, cinematic composition. No text, no UI, no health bars, no labels.`;
 
+      // Build multimodal content parts: text prompt + avatar images
+      const contentParts: any[] = [{ text: prompt }];
+      Object.values(players).forEach((p: any) => {
+        const avatarUrl = p.character?.imageUrl;
+        if (avatarUrl && avatarUrl.startsWith('data:')) {
+          const match = avatarUrl.match(/^data:(image\/\w+);base64,(.+)$/);
+          if (match) {
+            contentParts.push({
+              text: `Reference image for ${p.character.name}:`,
+            });
+            contentParts.push({
+              inlineData: { mimeType: match[1], data: match[2] },
+            });
+          }
+        }
+      });
+
+      if (imageAbort.signal.aborted) throw new Error('Aborted');
       const response = await aiClient.models.generateContent({
         model: 'gemini-3-pro-image-preview',
-        contents: prompt,
+        contents: [{ role: 'user', parts: contentParts }],
         config: {
           responseModalities: ['IMAGE', 'TEXT'],
+          abortSignal: imageAbort.signal,
         },
       });
+      if (imageAbort.signal.aborted) throw new Error('Aborted');
 
       const parts = response.candidates?.[0]?.content?.parts || [];
       for (const part of parts) {
@@ -3105,9 +3361,26 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         }
       }
     } catch (error: any) {
-      console.error("Battle image error:", error);
+      if (error?.name !== 'AbortError' && error?.name !== 'APIUserAbortError' && error?.message !== 'Aborted') {
+        console.error("Battle image error:", error);
+      }
     } finally {
       setIsGeneratingBattleImage(false);
+      // Image done (success or fail) — unlock turn, signal server, trigger bot if needed
+      setAwaitingBattleImage(false);
+      setIsLockedIn(false);
+      socket.emit('readyForNextTurn');
+      const pendingRoom = pendingBotRoomRef.current;
+      pendingBotRoomRef.current = null;
+      if (pendingRoom) {
+        console.log('[FollowerBattle] post-image autonomous turn start', {
+          turnId: pendingRoom.turnId,
+          players: Object.keys(pendingRoom.players || {}),
+          npcAllies: Object.keys(pendingRoom.players || {}).filter((id: string) => id.startsWith('npc_ally_')),
+        });
+        generateNpcAllyActions(pendingRoom, pendingRoom.turnId);
+        generateBotAction(pendingRoom, pendingRoom.turnId);
+      }
     }
   };
   handleGenerateBattleImageRef.current = handleGenerateBattleImage;
@@ -3151,7 +3424,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
 
   const handleSendBattleAction = () => {
     const action = battleInput.trim();
-    if (!action || isLockedIn) return;
+    if (!action || isLockedIn || awaitingBattleImage) return;
     clearTypingPresence('battle');
 
     const socketId = socket.id;
@@ -3365,6 +3638,7 @@ Be creative and concise.`;
       alert(`Failed to generate bot using model ${settingsRef.current.botModel}. Error: ${err.message}`);
     } finally {
       setIsGeneratingBot(false);
+      clearBattleStatusLog('battle-image-generation');
     }
   };
 
@@ -3621,7 +3895,7 @@ Be creative and concise.`;
                   <div className="text-center text-sm font-bold text-red-500 bg-red-50 border border-red-100 rounded-lg py-2 px-4 my-2 markdown-body">
                     <Markdown rehypePlugins={[rehypeRaw]}>{msg.text}</Markdown>
                   </div>
-                  <InlineMessageMedia message={msg} alt="Portrait generation" />
+                  <InlineMessageMedia message={msg} alt="Portrait generation" onImageClick={setExpandedImageUrl} />
                 </div>
               ) : (
                 <div className={msg.role === 'user' ? 'chat-bubble-me' : 'chat-bubble-them'}>
@@ -3871,7 +4145,7 @@ Be creative and concise.`;
                         <div className="text-center text-sm font-bold text-red-500 bg-red-50 border border-red-100 rounded-lg py-2 px-4 my-2 markdown-body">
                           <Markdown rehypePlugins={[rehypeRaw]}>{msg.text}</Markdown>
                         </div>
-                        <InlineMessageMedia message={msg} alt="Portrait generation" />
+                        <InlineMessageMedia message={msg} alt="Portrait generation" onImageClick={setExpandedImageUrl} />
                       </div>
                     ) : (
                       <div className={msg.role === 'user' ? 'chat-bubble-me' : 'chat-bubble-them'}>
@@ -3948,13 +4222,13 @@ Be creative and concise.`;
 
     return (
       <div className="flex-1 flex flex-col bg-gray-50 overflow-hidden">
-        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        <div className="p-4 pb-2 bg-gray-50 border-b border-gray-200 flex-shrink-0">
           <div className="flex items-start justify-between gap-3 mb-2">
             <h1 className="text-2xl font-black text-duo-text">{explorationCombatReturn && getCurrentLocation()?.name ? `⚔️ ${getCurrentLocation()?.name}` : 'The Battle'}</h1>
             {renderMinimap()}
           </div>
           {battleConnectedLocations.length > 0 && (
-            <div className="flex flex-wrap gap-1.5 mb-3">
+            <div className="flex flex-wrap gap-1.5">
               {battleConnectedLocations.map(location => (
                 <button
                   key={location.id}
@@ -3967,6 +4241,8 @@ Be creative and concise.`;
               ))}
             </div>
           )}
+        </div>
+        <div className="flex-1 overflow-y-auto p-4 space-y-4">
           {battleLogs.map((log, i) => {
             const isStreamingThoughts = log.startsWith(BATTLE_STREAM_THOUGHTS_PREFIX);
             const isStreamingAnswer = log.startsWith(BATTLE_STREAM_ANSWER_PREFIX);
@@ -3990,7 +4266,7 @@ Be creative and concise.`;
 
             if (isImageUrl) {
               return (
-                <div key={i} className="rounded-lg overflow-hidden border-2 border-duo-gray shadow-md my-2">
+                <div key={i} className="rounded-lg overflow-hidden border-2 border-duo-gray shadow-md my-2 cursor-pointer" onClick={() => setExpandedImageUrl(content)}>
                   <img src={content} alt="Battle Scene" className="w-full" />
                 </div>
               );
@@ -4056,6 +4332,9 @@ Be creative and concise.`;
             }
 
             if (!content.trim() && (isStreamingAnswer || isStreamingThoughts)) return null;
+
+            // Skip empty/whitespace-only log entries
+            if (!content.trim() && !isStreamingAnswer) return null;
 
             if (isPendingPlayerAction) {
               return (
@@ -4152,14 +4431,6 @@ Be creative and concise.`;
             </div>
           )}
           <div className="flex gap-2">
-          <button
-            onClick={handleGenerateBattleImage}
-            disabled={isGeneratingBattleImage || hasVisualizedThisTurn || battleLogs.length < 2}
-            className={`duo-btn px-3 flex items-center justify-center disabled:opacity-50 transition-all ${isGeneratingBattleImage ? 'bg-duo-gray border-b-0 translate-y-1' : (hasVisualizedThisTurn ? 'bg-duo-gray cursor-not-allowed grayscale' : 'duo-btn-gray')}`}
-            title={hasVisualizedThisTurn ? "Already visualized this turn" : "Visualize Battle"}
-          >
-            {isGeneratingBattleImage ? <Loader2 className="w-4 h-4 animate-spin" /> : <Eye className="w-4 h-4" />}
-          </button>
           <textarea
             ref={battleInputRef}
             value={battleInput}
@@ -4175,13 +4446,13 @@ Be creative and concise.`;
                 handleSendBattleAction();
               }
             }}
-            placeholder={isLockedIn ? "Waiting for opponent..." : "Describe your action..."}
+            placeholder={awaitingBattleImage ? "Type your next action while scene generates..." : isLockedIn ? "Waiting for opponent..." : "Describe your action..."}
             className="flex-1 bg-duo-gray rounded-2xl px-3 py-2 text-sm font-bold text-duo-text focus:outline-none focus:ring-2 focus:ring-duo-blue resize-none overflow-y-auto"
             rows={1}
             style={{ minHeight: '40px', maxHeight: '50vh', fontSize: '16px' }}
             disabled={isLockedIn}
           />
-          {isLockedIn ? (
+          {isLockedIn && !awaitingBattleImage ? (
             <button 
               onClick={handleBattleUnlock}
               className="duo-btn duo-btn-gray px-4 flex items-center justify-center gap-1 text-xs font-bold"
@@ -4191,7 +4462,7 @@ Be creative and concise.`;
           ) : (
             <button 
               onClick={handleSendBattleAction}
-              disabled={isLockedIn || !battleInput.trim()}
+              disabled={isLockedIn || awaitingBattleImage || !battleInput.trim()}
               className="duo-btn duo-btn-blue px-4 flex items-center justify-center disabled:opacity-50"
             >
               <Send className="w-4 h-4" />
@@ -4221,6 +4492,15 @@ Be creative and concise.`;
     if (subZones.length === 0) return null;
 
     const currentSubZoneId = explorationState.subZoneId || subZones[0]?.id;
+    const followerOccupantsBySubZone = worldNpcs
+      .filter(npc => npc.followTargetId === socket.id && npc.locationId === explorationState.locationId)
+      .reduce((acc, npc) => {
+        const zoneId = npc.subZoneId || subZones[0]?.id;
+        if (!zoneId) return acc;
+        if (!acc[zoneId]) acc[zoneId] = [];
+        acc[zoneId].push(npc);
+        return acc;
+      }, {} as Record<string, WorldNpc[]>);
     const mapW = 140;
     const mapH = 140;
 
@@ -4280,6 +4560,8 @@ Be creative and concise.`;
             const isCurrentSz = sz.id === currentSubZoneId;
             const nodeRadius = interactive ? 28 : 12;
             const isSelected = showZoneDetail === sz.id;
+            const followersHere = followerOccupantsBySubZone[sz.id] || [];
+            const occupantCount = (isCurrentSz ? 1 : 0) + followersHere.length;
 
             return (
               <g key={sz.id} onClick={() => handleSubZoneTap(sz.id)} style={{ cursor: interactive ? 'pointer' : 'default' }}>
@@ -4301,10 +4583,28 @@ Be creative and concise.`;
                 </text>
                 {isCurrentSz && (
                   <circle
-                    cx={pos.x} cy={pos.y} r={interactive ? 5 : 2.5}
+                    cx={pos.x - (occupantCount > 1 ? (interactive ? 5 : 3) : 0)}
+                    cy={pos.y}
+                    r={interactive ? 5 : 2.5}
                     fill="#22c55e" stroke="white" strokeWidth={0.5}
                   />
                 )}
+                {followersHere.map((npc, index) => {
+                  const dotSpacing = interactive ? 10 : 6;
+                  const dotOffsetBase = isCurrentSz ? 1 : 0;
+                  const dotX = pos.x + ((index + dotOffsetBase) - (occupantCount - 1) / 2) * dotSpacing;
+                  return (
+                    <circle
+                      key={npc.id}
+                      cx={dotX}
+                      cy={pos.y}
+                      r={interactive ? 4.5 : 2.25}
+                      fill="#facc15"
+                      stroke="white"
+                      strokeWidth={0.5}
+                    />
+                  );
+                })}
               </g>
             );
           })}
@@ -4366,9 +4666,9 @@ Be creative and concise.`;
                 if (!sz) return null;
                 const isConnected = subZones.find((s: any) => s.id === currentSubZoneId)?.connections?.includes(sz.id);
                 return (
-                  <div className="p-3 bg-emerald-950/80 border-t border-white/10">
+                  <div className="p-3 bg-emerald-950/80 border-t border-white/10 max-h-[40%] overflow-y-auto">
                     <div className="text-white font-black text-sm">{sz.name}</div>
-                    <div className="text-white/70 text-xs mt-1">{sz.description}</div>
+                    <div className="text-white/70 text-sm mt-1 whitespace-pre-wrap">{sz.description}</div>
                     {sz.id !== currentSubZoneId && isConnected && (
                       <button
                         onClick={() => {
@@ -4420,11 +4720,12 @@ Be creative and concise.`;
     })?.[1];
 
     // Get combatant info per zone
-    const zoneOccupants: Record<string, { name: string; isMe: boolean }[]> = {};
+    const zoneOccupants: Record<string, { name: string; isMe: boolean; isAlly: boolean }[]> = {};
     for (const [charName, zoneId] of Object.entries(combatantZones)) {
       if (!zoneOccupants[zoneId]) zoneOccupants[zoneId] = [];
       const pid = Object.entries(players).find(([, p]) => p.character?.name === charName)?.[0];
-      zoneOccupants[zoneId].push({ name: charName, isMe: pid === myId });
+      const isAlly = !!pid && (players[pid]?.character?.isNpcAlly === true);
+      zoneOccupants[zoneId].push({ name: charName, isMe: pid === myId, isAlly });
     }
 
     const handleZoneTap = (zoneId: string) => {
@@ -4510,11 +4811,12 @@ Be creative and concise.`;
                   const dotR = interactive ? 5 : 2.5;
                   const dotX = pos.x + (oi - (occupants.length - 1) / 2) * (dotR * 2.5);
                   const dotY = pos.y;
+                  const dotColor = occ.isMe ? '#22c55e' : occ.isAlly ? '#facc15' : '#1cb0f6';
                   return (
                     <circle
                       key={occ.name}
                       cx={dotX} cy={dotY} r={dotR}
-                      fill={occ.isMe ? '#22c55e' : '#1cb0f6'}
+                      fill={dotColor}
                       stroke="white" strokeWidth={0.5}
                     />
                   );
@@ -4528,7 +4830,7 @@ Be creative and concise.`;
                     textAnchor="middle"
                     fontSize={10}
                     fontWeight="bold"
-                    fill={occ.isMe ? '#22c55e' : '#1cb0f6'}
+                    fill={occ.isMe ? '#22c55e' : occ.isAlly ? '#facc15' : '#1cb0f6'}
                   >
                     {occ.name}
                   </text>
@@ -5259,10 +5561,10 @@ Be creative and concise.`;
                 </div>
               ) : msg.role === 'system' ? (
                 <div className="w-full">
-                  <div className="text-center text-sm font-bold text-duo-blue bg-duo-blue/5 border border-duo-blue/10 rounded-lg py-2 px-4 my-1 markdown-body">
+                  <div className={`text-center text-sm font-bold rounded-lg py-2 px-4 my-1 markdown-body ${msg.text.includes('Allied with') ? 'text-yellow-700 bg-yellow-50 border border-yellow-200' : 'text-duo-blue bg-duo-blue/5 border border-duo-blue/10'}`}>
                     <Markdown rehypePlugins={[rehypeRaw]}>{msg.text}</Markdown>
                   </div>
-                  <InlineMessageMedia message={msg} alt="Inline scene" />
+                  <InlineMessageMedia message={msg} alt="Inline scene" onImageClick={setExpandedImageUrl} />
                 </div>
               ) : isOtherPlayer ? (
                 <div className="flex items-start gap-2 max-w-[80%]">
@@ -5912,7 +6214,18 @@ Be creative and concise.`;
           </div>
         </div>
       )}
+      {expandedImageUrl && (
+        <div 
+          className="fixed inset-0 bg-black/80 flex items-center justify-center z-[100] p-4 backdrop-blur-sm cursor-pointer"
+          onClick={() => setExpandedImageUrl(null)}
+        >
+          <img 
+            src={expandedImageUrl} 
+            alt="Expanded" 
+            className="max-w-full max-h-[90vh] rounded-2xl shadow-2xl object-contain"
+          />
+        </div>
+      )}
     </div>
   );
 }
-

@@ -390,6 +390,27 @@ async function startServer() {
     io.to(roomId).emit("battleActionsSubmitted", { log: `PLAYER_ACTIONS_${log}` });
   }
 
+  function requestTurnResolutionIfReady(roomId: string) {
+    const room = rooms[roomId];
+    if (!room) return;
+
+    const playerIds = Object.keys(room.players || {});
+    if (playerIds.length === 0) return;
+
+    const allLockedIn = playerIds.every((id) => room.players[id].lockedIn);
+    if (!allLockedIn) return;
+
+    const now = Date.now();
+    if (typeof room.lastResolutionRequestAt === 'number' && now - room.lastResolutionRequestAt < 3_000) {
+      return;
+    }
+
+    room.lastResolutionRequestAt = now;
+    clearRoomTimer(roomId);
+    emitBattleActionsSubmitted(roomId, room);
+    io.to(room.host).emit("requestTurnResolution", room);
+  }
+
   function endBattleDueToInactivity(roomId: string, room: { players: Record<string, any> }) {
     clearRoomTimer(roomId);
     io.to(roomId).emit("battleEndedByInactivity", {
@@ -426,13 +447,12 @@ async function startServer() {
     if (anyAutoLocked) {
       const allLockedIn = playerIds.every((id) => room.players[id].lockedIn);
       if (allLockedIn) {
-        emitBattleActionsSubmitted(roomId, room);
         const everyoneMissedTurn = playerIds.every((id) => room.players[id].autoLockedThisTurn);
         if (everyoneMissedTurn) {
           endBattleDueToInactivity(roomId, room);
           return;
         }
-        io.to(room.host).emit("requestTurnResolution", room);
+        requestTurnResolutionIfReady(roomId);
       }
     }
   }
@@ -457,6 +477,7 @@ async function startServer() {
     name: string;
     role: string;
     locationId: string;
+    subZoneId: string | null;
     x: number;
     y: number;
     homeLocationId: string;
@@ -537,6 +558,7 @@ async function startServer() {
         name: (npc as any).name,
         role: (npc as any).role || 'npc',
         locationId: location.id,
+        subZoneId: location.subZones?.[0]?.id || null,
         homeLocationId: location.id,
         x: location.x + offset.x,
         y: location.y + offset.y,
@@ -554,6 +576,7 @@ async function startServer() {
       name: npc.name,
       role: npc.role,
       locationId: npc.locationId,
+      subZoneId: npc.subZoneId,
       x: npc.x,
       y: npc.y,
       followTargetId: npc.followTargetId,
@@ -569,6 +592,7 @@ async function startServer() {
       const target = explorationPlayers[followTargetId];
       const offset = getNpcOffset(npcId);
       npc.locationId = target.locationId;
+      npc.subZoneId = target.subZoneId;
       npc.x = target.x + offset.x;
       npc.y = target.y + offset.y;
     } else {
@@ -576,6 +600,7 @@ async function startServer() {
       const offset = getNpcOffset(npcId);
       if (homeLocation) {
         npc.locationId = homeLocation.id;
+        npc.subZoneId = homeLocation.subZones?.[0]?.id || null;
         npc.x = homeLocation.x + offset.x;
         npc.y = homeLocation.y + offset.y;
       }
@@ -904,7 +929,7 @@ async function startServer() {
   const resolveControlledRoomPlayerId = (room: any, requesterId: string, requestedPlayerId?: string) => {
     if (!requestedPlayerId || requestedPlayerId === requesterId) return requesterId;
     if (!room?.isBotMatch || room.host !== requesterId || !room.players?.[requestedPlayerId]) return null;
-    if (requestedPlayerId.startsWith('bot_')) return requestedPlayerId;
+    if (requestedPlayerId.startsWith('bot_') || requestedPlayerId.startsWith('npc_ally_')) return requestedPlayerId;
     return null;
   };
 
@@ -943,9 +968,7 @@ async function startServer() {
     const playerIds = Object.keys(room.players);
     const allLockedIn = playerIds.every((id) => room.players[id].lockedIn);
     if (allLockedIn) {
-      clearRoomTimer(roomId);
-      emitBattleActionsSubmitted(roomId, room);
-      io.to(room.host).emit("requestTurnResolution", room);
+      requestTurnResolutionIfReady(roomId);
     }
   };
 
@@ -1551,6 +1574,10 @@ async function startServer() {
     const es = primary.explorationState;
     const c = primary.character;
 
+    // Get NPCs following this player
+    const followingNpcs = Object.values(explorationNpcs)
+      .filter(npc => npc.followTargetId === primary.socketId);
+
     // Sub-zone context
     const subZones = currentLoc?.subZones || [];
     const currentSubZoneId = es?.subZoneId || (subZones.length > 0 ? subZones[0].id : null);
@@ -1574,6 +1601,7 @@ EXITS: ${connectedLocs.map((l: any) => `${l.name} (${l.id})`).join(', ')}
 NPCs HERE: ${npcsAtLocation.map((n: any) => `${n?.name} - ${n?.role}`).join(', ') || 'none'}
 ENEMIES HERE: ${enemiesAtLocation.map((e: any) => `${e?.name} (HP:${e?.hp}, DMG:${e?.damage})`).join(', ') || 'none'}
 OTHER PLAYERS HERE: ${[...otherPlayersHere, ...playerContexts.slice(1).map(p => p.playerName)].join(', ') || 'none'}
+NPC FOLLOWERS (with you): ${followingNpcs.map(n => `${n.name} (${n.id})`).join(', ') || 'none'}
 ${subZoneContext}
 PLAYER STATE:
 - HP: ${c?.hp}/${c?.maxHp}, Mana: ${c?.mana}/${c?.maxMana}
@@ -1705,6 +1733,7 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
                   if (npc.followTargetId === primary.socketId) {
                     const offset = getNpcOffset(npc.id);
                     npc.locationId = locId;
+                    npc.subZoneId = null;
                     npc.x = loc.x + offset.x;
                     npc.y = loc.y + offset.y;
                   }
@@ -1724,13 +1753,22 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
               const validSubZone = currentLoc?.subZones?.find((sz: any) => sz.id === subZoneId);
               if (validSubZone) {
                 ep.subZoneId = subZoneId;
+                for (const npc of Object.values(explorationNpcs)) {
+                  if (npc.followTargetId === primary.socketId) {
+                    npc.locationId = ep.locationId;
+                    npc.subZoneId = subZoneId;
+                  }
+                }
+                emitExplorationNpcStatesUpdated();
               } else {
                 console.warn(`[SubZone] Invalid subZoneId "${subZoneId}" for location "${ep.locationId}" — ignoring`);
               }
             }
             processedToolCalls.push({ name: tc.name, args: tc.args });
           } else if (tc.name === 'set_npc_follow_state') {
-            const npcId = tc.args?.npcId;
+            const npcIdentifier = tc.args?.npcId;
+            const resolvedNpcByName = Object.values(worldData?.npcs || {}).find((npc: any) => npc?.name?.toLowerCase() === String(npcIdentifier || '').toLowerCase()) as any;
+            const npcId = worldData?.npcs?.[npcIdentifier]?.id || resolvedNpcByName?.id;
             const mode = tc.args?.mode;
             const followPlayerName = tc.args?.followPlayerName;
             let followTargetId: string | null = null;
@@ -1742,7 +1780,7 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
             }
 
             if (npcId && setNpcFollowState(npcId, mode === 'follow' ? followTargetId : null)) {
-              processedToolCalls.push({ name: tc.name, args: { ...tc.args, followPlayerName: followPlayerName || primary.playerName } });
+              processedToolCalls.push({ name: tc.name, args: { ...tc.args, npcId, followPlayerName: followPlayerName || primary.playerName } });
             }
           } else if (tc.name === 'trigger_pvp_duel') {
             const targetName = tc.args?.targetPlayerName;
@@ -1769,8 +1807,31 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
               }
             }
           } else if (tc.name === 'trigger_combat') {
-            // Just forward to client for processing (startBotMatch)
-            processedToolCalls.push({ name: tc.name, args: tc.args });
+            const explicitNpcAllyIds = (() => {
+              try {
+                if (!tc.args?.npcAllyIds) return [];
+                return typeof tc.args.npcAllyIds === 'string' ? JSON.parse(tc.args.npcAllyIds) : tc.args.npcAllyIds;
+              } catch {
+                return [];
+              }
+            })();
+
+            const followerNpcIds = followingNpcs.map(npc => npc.id);
+            const npcAllyIds = Array.from(new Set([...(explicitNpcAllyIds || []), ...followerNpcIds]));
+
+            // Forward to client for processing (startBotMatch), always carrying current followers.
+            console.log('[FollowerBattle][server] trigger_combat', {
+              playerId: primary.socketId,
+              enemyId: tc.args?.enemyId,
+              npcAllyIds,
+            });
+            processedToolCalls.push({
+              name: tc.name,
+              args: {
+                ...tc.args,
+                npcAllyIds,
+              },
+            });
           } else {
             // update_player_state, update_goals — forward to client
             processedToolCalls.push({ name: tc.name, args: tc.args });
@@ -1898,6 +1959,7 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
           name: npc.name,
           role: npc.role,
           locationId: npc.locationId,
+          subZoneId: npc.subZoneId,
           x: npc.x,
           y: npc.y,
           followTargetId: npc.followTargetId,
@@ -1920,12 +1982,14 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
       
       delete explorationLockedActions[socket.id];
       ep.locationId = data.locationId;
+      ep.subZoneId = null;
       ep.x = location.x;
       ep.y = location.y;
       for (const npc of Object.values(explorationNpcs)) {
         if (npc.followTargetId === socket.id) {
           const offset = getNpcOffset(npc.id);
           npc.locationId = data.locationId;
+          npc.subZoneId = null;
           npc.x = location.x + offset.x;
           npc.y = location.y + offset.y;
         }
@@ -2294,8 +2358,33 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
         [botId]: { lockedIn: false, action: "", character: botCharacter },
       };
 
-      // Add NPC allies if provided
-      const npcAllies = data.npcAllies || [];
+      // Add explicit NPC allies from the client plus any NPCs currently following this player in exploration.
+      const explicitNpcAllies = Array.isArray(data.npcAllies) ? data.npcAllies : [];
+      const followingNpcAllies = Object.values(explorationNpcs)
+        .filter((npc) => npc.followTargetId === socket.id)
+        .map((npc) => {
+          const npcProfile = worldData?.npcs?.[npc.id];
+          return {
+            id: npc.id,
+            name: npc.name,
+            hp: npcProfile?.hp || 60,
+            mana: npcProfile?.mana || 40,
+            profileMarkdown: npcProfile?.profileMarkdown || `# ${npc.name}`,
+          };
+        });
+      const npcAlliesById = new Map<string, any>();
+      for (const npc of [...explicitNpcAllies, ...followingNpcAllies]) {
+        if (!npc?.id) continue;
+        npcAlliesById.set(npc.id, npc);
+      }
+      const npcAllies = Array.from(npcAlliesById.values());
+      console.log('[FollowerBattle][server] startBotMatch ally merge', {
+        socketId: socket.id,
+        explicitNpcAllies: explicitNpcAllies.map((npc: any) => npc?.id),
+        followingNpcAllies: followingNpcAllies.map((npc) => npc.id),
+        mergedNpcAllies: npcAllies.map((npc: any) => npc.id),
+      });
+
       for (const npc of npcAllies) {
         const npcId = `npc_ally_${npc.id}`;
         roomPlayers[npcId] = {
@@ -2303,10 +2392,10 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
           action: "",
           character: {
             name: npc.name,
-            hp: npc.hp || 80,
-            maxHp: npc.hp || 80,
-            mana: 50,
-            maxMana: 50,
+            hp: npc.hp || 60,
+            maxHp: npc.hp || 60,
+            mana: npc.mana || 40,
+            maxMana: npc.mana || 40,
             profileMarkdown: npc.profileMarkdown,
             isNpcAlly: true
           }
@@ -2504,20 +2593,6 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
 
       const botId = `bot_${socket.id}`;
       applyPlayerLockedAction(roomId, botId, data.action);
-
-      // Auto-lock NPC allies with auto-generated actions
-      const npcAllyIds = room.npcAllyIds || [];
-      for (const npcId of npcAllyIds) {
-        if (room.players[npcId] && !room.players[npcId].lockedIn) {
-          const npcChar = room.players[npcId].character;
-          applyPlayerLockedAction(
-            roomId,
-            npcId,
-            data.npcActions?.[npcId] || `${npcChar.name} attacks the enemy with their signature ability.`,
-            { emitNpcAction: true }
-          );
-        }
-      }
     });
 
     socket.on("playerAction", (payload) => {
@@ -2536,22 +2611,18 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
       const targetPlayerId = resolveControlledRoomPlayerId(room, socket.id, requestedPlayerId);
       if (!targetPlayerId) return;
 
-      applyPlayerLockedAction(roomId, targetPlayerId, actionText.trim());
-
-      if (room.isBotMatch && targetPlayerId.startsWith('bot_')) {
-        const npcAllyIds = room.npcAllyIds || [];
-        for (const npcId of npcAllyIds) {
-          if (room.players[npcId] && !room.players[npcId].lockedIn) {
-            const npcChar = room.players[npcId].character;
-            applyPlayerLockedAction(
-              roomId,
-              npcId,
-              payload?.npcActions?.[npcId] || `${npcChar.name} attacks the enemy with their signature ability.`,
-              { emitNpcAction: true }
-            );
-          }
-        }
+      if (targetPlayerId.startsWith('npc_ally_')) {
+        console.log('[FollowerBattle][server] npc ally action received', {
+          roomId,
+          requesterId: socket.id,
+          npcId: targetPlayerId,
+          action: actionText.trim(),
+        });
       }
+
+      applyPlayerLockedAction(roomId, targetPlayerId, actionText.trim(), {
+        emitNpcAction: targetPlayerId.startsWith('npc_ally_'),
+      });
     });
 
     socket.on("playerUnlock", () => {
@@ -2564,6 +2635,23 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
   room.players[socket.id].autoLockedThisTurn = false;
       io.to(roomId).emit("playerUnlocked", socket.id);
       startRoomTimer(roomId);
+    });
+
+    socket.on("readyForNextTurn", () => {
+      const roomId = players[socket.id]?.room;
+      if (!roomId) return;
+      const room = rooms[roomId];
+      if (!room?.pendingReadyPlayers) return;
+      room.pendingReadyPlayers.delete(socket.id);
+      // For bot matches, also mark autonomous combatants as ready
+      for (const pid of Object.keys(room.players)) {
+        if (pid.startsWith('bot_') || pid.startsWith('npc_ally_')) room.pendingReadyPlayers.delete(pid);
+      }
+      if (room.pendingReadyPlayers.size === 0) {
+        if (room.readyTimeout) { clearTimeout(room.readyTimeout); delete room.readyTimeout; }
+        delete room.pendingReadyPlayers;
+        startRoomTimer(roomId);
+      }
     });
 
     socket.on("battleZonesSetup", (data: { zones: any[]; combatantZones: Record<string, string> }) => {
@@ -2582,6 +2670,8 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
 
       const room = rooms[roomId];
       if (!room) return;
+
+      delete room.lastResolutionRequestAt;
 
       const newState = data.state;
 
@@ -2632,9 +2722,16 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
       });
 
       // Start timer for next turn if game continues (more than 1 player alive)
+      // Timer is deferred until players signal readyForNextTurn (after scene image generates)
       const alivePlayers = Object.values(room.players).filter((p: any) => p.character.hp > 0);
       if (alivePlayers.length > 1) {
-        startRoomTimer(roomId);
+        room.pendingReadyPlayers = new Set(Object.keys(room.players).filter(pid => alivePlayers.some((a: any) => a === room.players[pid])));
+        // Safety timeout: start timer after 30s even if no readyForNextTurn received
+        room.readyTimeout = setTimeout(() => {
+          delete room.pendingReadyPlayers;
+          delete room.readyTimeout;
+          if (rooms[roomId]) startRoomTimer(roomId);
+        }, 30_000);
       } else {
         clearRoomTimer(roomId);
       }
