@@ -310,9 +310,12 @@ interface BattleMapState {
 
 interface ArenaPreparationState {
   stage: 'preview' | 'tweak';
-  remaining: number;
+  remaining: number | null;
   isBotMatch: boolean;
   skipVotes: string[];
+  playerRemaining?: Record<string, number | null>;
+  tweakDuration?: number | null;
+  unlimited?: boolean;
 }
 
 interface MapMarkerLayoutInput {
@@ -989,6 +992,30 @@ export default function App() {
     }
   }, [explorationAutoScroll]);
 
+  const pauseChatAutoScrollOnIntent = useCallback(() => {
+    const container = chatScrollContainerRef.current;
+    if (!container || !charAutoScroll) return;
+    if (container.scrollHeight > container.clientHeight) {
+      setCharAutoScroll(false);
+    }
+  }, [charAutoScroll]);
+
+  const pauseBattleAutoScrollOnIntent = useCallback(() => {
+    const container = battleScrollContainerRef.current;
+    if (!container || !battleAutoScroll) return;
+    if (container.scrollHeight > container.clientHeight) {
+      setBattleAutoScroll(false);
+    }
+  }, [battleAutoScroll]);
+
+  const pauseExplorationAutoScrollOnIntent = useCallback(() => {
+    const container = explorationScrollContainerRef.current;
+    if (!container || !explorationAutoScroll) return;
+    if (container.scrollHeight > container.clientHeight) {
+      setExplorationAutoScroll(false);
+    }
+  }, [explorationAutoScroll]);
+
   const updateTypingPresence = useCallback((channel: 'character' | 'battle' | 'exploration', value: string) => {
     const timeoutId = typingStopTimeoutsRef.current[channel];
     if (timeoutId) {
@@ -1160,19 +1187,19 @@ export default function App() {
 
   useEffect(() => {
     if (charAutoScroll) {
-      chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      chatEndRef.current?.scrollIntoView();
     }
   }, [charAutoScroll, messages]);
 
   useEffect(() => {
     if (battleAutoScroll) {
-      battleEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      battleEndRef.current?.scrollIntoView();
     }
   }, [battleAutoScroll, battleLogs]);
 
   useEffect(() => {
     if (explorationAutoScroll) {
-      explorationEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      explorationEndRef.current?.scrollIntoView();
     }
   }, [explorationAutoScroll, explorationLog]);
 
@@ -1424,7 +1451,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       setGameState('matchmaking');
     });
 
-    socket.on('arenaPreparationState', (data: { roomId: string; players: Record<string, any>; isBotMatch: boolean; stage: 'preview' | 'tweak'; remaining: number; skipVotes?: string[] }) => {
+    socket.on('arenaPreparationState', (data: { roomId: string; players: Record<string, any>; isBotMatch: boolean; stage: 'preview' | 'tweak'; remaining: number | null; skipVotes?: string[]; playerRemaining?: Record<string, number | null>; tweakDuration?: number | null; unlimited?: boolean }) => {
       setRoomId(data.roomId);
       setPlayers(data.players);
       setIsBotMatch(data.isBotMatch);
@@ -1433,6 +1460,9 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         remaining: data.remaining,
         isBotMatch: data.isBotMatch,
         skipVotes: data.skipVotes || [],
+        playerRemaining: data.playerRemaining || {},
+        tweakDuration: data.tweakDuration ?? null,
+        unlimited: !!data.unlimited,
       });
       setBattleLogs([]);
       setBattleInput('');
@@ -3524,7 +3554,7 @@ Be creative and concise.`;
         ) : <div className="w-12" />}
       </div>
       <div className="flex-1 relative min-h-0">
-        <div ref={chatScrollContainerRef} onScroll={handleChatLogScroll} className="h-full overflow-y-auto p-3 space-y-3">
+        <div ref={chatScrollContainerRef} onScroll={handleChatLogScroll} onWheelCapture={pauseChatAutoScrollOnIntent} onTouchStart={pauseChatAutoScrollOnIntent} className="h-full overflow-y-auto p-3 space-y-3">
           {messages.map((msg, i) => {
             if (!msg.text && msg.role === 'model') return null;
             return (
@@ -3643,8 +3673,9 @@ Be creative and concise.`;
   const renderArenaPreparation = () => {
     const prepPlayers = Object.entries(players);
     const activeTypingIds = new Set([...roomTypingIds, ...localRoomTypingIds]);
-    const remaining = arenaPreparation?.remaining ?? 0;
-    const timerLabel = `${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, '0')}`;
+    const remaining = arenaPreparation?.remaining;
+    const timerLabel = remaining == null ? '∞' : `${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, '0')}`;
+    const isUnlimitedPrepTime = !!arenaPreparation?.unlimited;
     const hasLocalRewriteAccess = !!(socket.id && players[socket.id]?.prepSkippedPreview);
     const isTweakStage = arenaPreparation?.stage === 'tweak' || hasLocalRewriteAccess;
     const isHeadStartRewrite = arenaPreparation?.stage === 'preview' && hasLocalRewriteAccess;
@@ -3673,6 +3704,7 @@ Be creative and concise.`;
             <div className={`rounded-2xl px-3 py-2 border text-center min-w-[88px] ${isTweakStage ? 'bg-yellow-50 text-yellow-700 border-yellow-200' : 'bg-blue-50 text-duo-blue border-blue-200'}`}>
               <div className="text-[9px] font-black uppercase">{isTweakStage ? (isHeadStartRewrite ? 'Head Start' : 'Tweak') : 'Preview'}</div>
               <div className="text-lg font-black leading-none mt-1">{timerLabel}</div>
+              {isUnlimitedPrepTime && <div className="text-[9px] font-black uppercase mt-1">No limit</div>}
             </div>
           </div>
           <div className="flex flex-wrap justify-center gap-5 pt-1">
@@ -3748,7 +3780,7 @@ Be creative and concise.`;
         ) : (
           <>
             <div className="flex-1 relative min-h-0">
-              <div ref={chatScrollContainerRef} onScroll={handleChatLogScroll} className="h-full overflow-y-auto p-4 space-y-4">
+              <div ref={chatScrollContainerRef} onScroll={handleChatLogScroll} onWheelCapture={pauseChatAutoScrollOnIntent} onTouchStart={pauseChatAutoScrollOnIntent} className="h-full overflow-y-auto p-4 space-y-4">
                 {messages.map((msg, i) => {
                   if (!msg.text && msg.role === 'model') return null;
                   return (
@@ -3963,7 +3995,7 @@ Be creative and concise.`;
         )}
 
         <div className="flex-1 relative min-h-0">
-          <div ref={battleScrollContainerRef} onScroll={handleBattleLogScroll} className="h-full overflow-y-auto p-3 space-y-3">
+          <div ref={battleScrollContainerRef} onScroll={handleBattleLogScroll} onWheelCapture={pauseBattleAutoScrollOnIntent} onTouchStart={pauseBattleAutoScrollOnIntent} className="h-full overflow-y-auto p-3 space-y-3">
             {battleLogs.map((log, i) => {
             const isStreamingThoughts = log.startsWith(BATTLE_STREAM_THOUGHTS_PREFIX);
             const isStreamingAnswer = log.startsWith(BATTLE_STREAM_ANSWER_PREFIX);
@@ -4817,7 +4849,7 @@ Be creative and concise.`;
 
         {/* Exploration log */}
         <div className="flex-1 relative min-h-0">
-          <div ref={explorationScrollContainerRef} onScroll={handleExplorationLogScroll} className="h-full overflow-y-auto p-3 space-y-3">
+          <div ref={explorationScrollContainerRef} onScroll={handleExplorationLogScroll} onWheelCapture={pauseExplorationAutoScrollOnIntent} onTouchStart={pauseExplorationAutoScrollOnIntent} className="h-full overflow-y-auto p-3 space-y-3">
             {explorationEntries.map((msg, i) => {
             const isOtherPlayer = msg.role === 'user' && msg.playerName;
             const isMe = msg.role === 'user' && !msg.playerName;
@@ -5292,7 +5324,7 @@ Be creative and concise.`;
                       <div>
                         <h4 className="text-sm font-black text-duo-text">Unlimited Turn Times</h4>
                         <p className="text-xs text-duo-gray-dark mt-1">
-                          Disable arena turn countdowns for queue PvP and bot fights while debugging shared combat systems.
+                          Disable countdowns across arena preview, rewrite, and battle phases for new PvP rooms and bot fights.
                         </p>
                       </div>
                       <button
@@ -5306,7 +5338,7 @@ Be creative and concise.`;
                       </button>
                     </div>
                     <div className="mt-3 text-[11px] font-bold text-duo-gray-dark">
-                      Current state: {settings.unlimitedTurnTime ? 'Timers disabled for new arena rooms' : 'Standard timed turns'}
+                      Current state: {settings.unlimitedTurnTime ? 'All arena phase timers disabled for new rooms' : 'Standard timed arena phases'}
                     </div>
                   </div>
                 </div>

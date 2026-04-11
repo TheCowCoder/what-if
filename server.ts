@@ -336,7 +336,7 @@ async function startServer() {
   let matchmakingQueue: Record<string, QueuePlayer> = {};
   const rooms: Record<string, any> = {};
   const roomTimers: Record<string, { interval: NodeJS.Timeout; remaining: number }> = {};
-  const arenaPreparationTimers: Record<string, { interval: NodeJS.Timeout; stage: 'preview' | 'tweak'; remaining: number; skipVotes: string[]; playerPaused: Record<string, boolean>; playerBonusSeconds: Record<string, number>; tweakDuration: number }> = {};
+  const arenaPreparationTimers: Record<string, { interval: NodeJS.Timeout | null; stage: 'preview' | 'tweak'; remaining: number | null; skipVotes: string[]; playerPaused: Record<string, boolean>; playerBonusSeconds: Record<string, number>; tweakDuration: number | null; unlimited: boolean }> = {};
   const typingChannelMembers: Record<string, Set<string>> = {};
   const typingChannelBySocket: Record<string, string> = {};
   const typingTimeouts: Record<string, NodeJS.Timeout> = {};
@@ -890,7 +890,9 @@ async function startServer() {
   const clearArenaPreparationTimer = (roomId: string) => {
     const timer = arenaPreparationTimers[roomId];
     if (!timer) return;
-    clearInterval(timer.interval);
+    if (timer.interval) {
+      clearInterval(timer.interval);
+    }
     delete arenaPreparationTimers[roomId];
   };
 
@@ -908,12 +910,17 @@ async function startServer() {
     const timer = arenaPreparationTimers[roomId] || room?.pausedArenaPreparation;
     if (!room || !timer) return null;
 
-    const playerRemaining: Record<string, number> = {};
-    if (timer.stage === 'tweak') {
+    const playerRemaining: Record<string, number | null> = {};
+    if (timer.unlimited) {
+      const participantIds = getArenaPreparationParticipantIds(room);
+      for (const playerId of participantIds) {
+        playerRemaining[playerId] = null;
+      }
+    } else if (timer.stage === 'tweak') {
       const participantIds = getArenaPreparationParticipantIds(room);
       for (const playerId of participantIds) {
         const bonus = timer.playerBonusSeconds[playerId] || 0;
-        playerRemaining[playerId] = Math.max(0, timer.remaining + bonus);
+        playerRemaining[playerId] = Math.max(0, (timer.remaining || 0) + bonus);
       }
     }
 
@@ -923,6 +930,7 @@ async function startServer() {
       playerRemaining,
       tweakDuration: timer.tweakDuration,
       skipVotes: timer.skipVotes,
+      unlimited: !!timer.unlimited,
     };
   };
 
@@ -940,6 +948,7 @@ async function startServer() {
       playerRemaining: timer.playerRemaining,
       tweakDuration: timer.tweakDuration,
       skipVotes: timer.skipVotes,
+      unlimited: !!timer.unlimited,
     });
   };
 
@@ -1050,12 +1059,17 @@ async function startServer() {
     const timer = arenaPreparationTimers[roomId];
     if (!timer) return;
 
+    if (timer.unlimited) {
+      emitArenaPreparationState(roomId);
+      return;
+    }
+
     timer.interval = setInterval(() => {
       const activeTimer = arenaPreparationTimers[roomId];
       const activeRoom = rooms[roomId];
       if (!activeTimer || !activeRoom) return;
 
-      activeTimer.remaining -= 1;
+      activeTimer.remaining = (activeTimer.remaining || 0) - 1;
 
       if (activeTimer.stage === 'tweak') {
         for (const playerId of Object.keys(activeTimer.playerPaused)) {
@@ -1065,7 +1079,7 @@ async function startServer() {
         }
       }
 
-      if (activeTimer.remaining <= 0) {
+      if ((activeTimer.remaining || 0) <= 0) {
         if (activeTimer.stage === 'preview') {
           startArenaPreparationTweakStage(roomId);
           return;
@@ -1074,7 +1088,7 @@ async function startServer() {
         const participantIds = getArenaPreparationParticipantIds(activeRoom);
         const allExpired = participantIds.every(playerId => {
           const bonus = activeTimer.playerBonusSeconds[playerId] || 0;
-          const effectiveRemaining = activeTimer.remaining + bonus;
+          const effectiveRemaining = (activeTimer.remaining || 0) + bonus;
           return effectiveRemaining <= 0 && !activeTimer.playerPaused[playerId];
         });
 
@@ -1106,6 +1120,7 @@ async function startServer() {
         playerPaused: { ...prepTimer.playerPaused },
         playerBonusSeconds: { ...prepTimer.playerBonusSeconds },
         tweakDuration: prepTimer.tweakDuration,
+        unlimited: !!prepTimer.unlimited,
       };
       clearArenaPreparationTimer(roomId);
     }
@@ -1138,13 +1153,14 @@ async function startServer() {
 
     if (room.pausedArenaPreparation) {
       arenaPreparationTimers[roomId] = {
-        interval: null as any,
+        interval: null,
         stage: room.pausedArenaPreparation.stage,
         remaining: room.pausedArenaPreparation.remaining,
         skipVotes: [...room.pausedArenaPreparation.skipVotes],
         playerPaused: { ...room.pausedArenaPreparation.playerPaused },
         playerBonusSeconds: { ...room.pausedArenaPreparation.playerBonusSeconds },
         tweakDuration: room.pausedArenaPreparation.tweakDuration,
+        unlimited: !!room.pausedArenaPreparation.unlimited,
       };
       delete room.pausedArenaPreparation;
       emitArenaPreparationState(roomId);
@@ -1165,9 +1181,10 @@ async function startServer() {
     if (!room || !timer) return;
 
     timer.stage = 'tweak';
+    timer.unlimited = !!room.unlimitedTurnTime;
     const tweakDuration = (typeof room.arenaTweakSeconds === 'number' && room.arenaTweakSeconds >= 1) ? room.arenaTweakSeconds : ARENA_TWEAK_SECONDS;
-    timer.remaining = tweakDuration;
-    timer.tweakDuration = tweakDuration;
+    timer.remaining = timer.unlimited ? null : tweakDuration;
+    timer.tweakDuration = timer.unlimited ? null : tweakDuration;
     timer.skipVotes = [];
     timer.playerPaused = {};
     timer.playerBonusSeconds = {};
@@ -1224,13 +1241,14 @@ async function startServer() {
     }
     const previewDuration = (typeof room.arenaPreviewSeconds === 'number' && room.arenaPreviewSeconds >= 1) ? room.arenaPreviewSeconds : ARENA_PREVIEW_SECONDS;
     arenaPreparationTimers[roomId] = {
-      interval: null as any,
+      interval: null,
       stage: 'preview',
-      remaining: previewDuration,
+      remaining: room.unlimitedTurnTime ? null : previewDuration,
       skipVotes: [],
       playerPaused: {},
       playerBonusSeconds: {},
-      tweakDuration: 0,
+      tweakDuration: room.unlimitedTurnTime ? null : 0,
+      unlimited: !!room.unlimitedTurnTime,
     };
 
     emitArenaPreparationState(roomId);
