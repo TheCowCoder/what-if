@@ -40,6 +40,22 @@ const socket: Socket = io(BACKEND_URL || undefined, {
   reconnectionDelayMax: 5_000,
 });
 
+// Debug logging helper
+const log = (context: string, message: string, data?: any) => {
+  const timestamp = new Date().toLocaleTimeString();
+  const logMsg = `[${timestamp}] [${context}] ${message}`;
+  if (data) {
+    console.log(logMsg, data);
+  } else {
+    console.log(logMsg);
+  }
+};
+
+socket.on('connect', () => log('SOCKET', '✓ Connected', { id: socket.id }));
+socket.on('disconnect', (reason) => log('SOCKET', '✗ Disconnected', { reason }));
+socket.on('connect_error', (error) => log('SOCKET', '✗ Connection error', error));
+socket.on('error', (msg) => log('SOCKET', '✗ Socket error', msg));
+
 type Tab = 'home' | 'profile' | 'social';
 type GameState = 'menu' | 'char_creation' | 'matchmaking' | 'arena_prep' | 'battle' | 'post_match' | 'exploration' | 'level_select';
 
@@ -737,13 +753,30 @@ export default function App() {
   useEffect(() => { characterRef.current = character; }, [character]);
 
   const handleEnterArena = () => {
-    if (!character) { setActiveTab('profile'); setGameState('char_creation'); if (messages.length === 0) setMessages([{ role: 'model', text: "Welcome! character?" }]); return; }
+    log('BTN', 'Enter Arena clicked');
+    if (!character) { 
+      log('BTN', 'No character, going to char creation', { character });
+      setActiveTab('profile'); 
+      setGameState('char_creation'); 
+      if (messages.length === 0) setMessages([{ role: 'model', text: "Welcome! character?" }]); 
+      return; 
+    }
+    log('BTN', 'Emitting enterArena', { character: character.name });
     socket.emit('enterArena', { unlimitedTurnTime: settingsRef.current.unlimitedTurnTime, arenaPreviewSeconds: settingsRef.current.arenaPreviewSeconds, arenaTweakSeconds: settingsRef.current.arenaTweakSeconds, battleTurnSeconds: settingsRef.current.battleTurnSeconds });
   };
 
   const handlePlayBot = () => {
-    if (!character) { setActiveTab('profile'); setGameState('char_creation'); if (messages.length === 0) setMessages([{ role: 'model', text: "Welcome! character?" }]); return; }
+    log('BTN', '1v1 vs Bot clicked');
+    if (!character) { 
+      log('BTN', 'No character, going to char creation', { character });
+      setActiveTab('profile'); 
+      setGameState('char_creation'); 
+      if (messages.length === 0) setMessages([{ role: 'model', text: "Welcome! character?" }]); 
+      return; 
+    }
+    log('BTN', 'Setting matchmaking state');
     setGameState('matchmaking');
+    log('BTN', 'Emitting startBotMatch', { difficulty: 'Medium' });
     socket.emit('startBotMatch', { difficulty: 'Medium', unlimitedTurnTime: settingsRef.current.unlimitedTurnTime, arenaPreviewSeconds: settingsRef.current.arenaPreviewSeconds, arenaTweakSeconds: settingsRef.current.arenaTweakSeconds, battleTurnSeconds: settingsRef.current.battleTurnSeconds });
   };
 
