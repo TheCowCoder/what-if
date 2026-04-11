@@ -63,6 +63,7 @@ This file summarizes the most recent implemented changes so test planning can ta
 59. Bot prep now uses a short preview-phase fallback timeout so slow rewrites still lock in during preview.
 60. Arena prep now starts the match immediately once every rewrite-capable participant is locked in, even if the room is still in preview.
 61. Bot prep saves and bot combat actions now route through the same shared prep-save and player-action helpers used by human PvP flows.
+62. Battle resolution now logs judge tool calls live and falls back to a submitted-actions summary when the model returns only thoughts plus a tool call.
 
 Suggested high-priority test areas:
 

@@ -1422,6 +1422,18 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       let attempts = 0;
       clearBattleStatusLog('battle-retry');
 
+      const buildFallbackBattleNarrative = () => {
+        const submittedActions = Object.values(room.players)
+          .map((player: any) => `- **${player.character.name}:** ${player.action || 'No action submitted.'}`)
+          .join('\n');
+        return [
+          '⚠️ The judge returned a state update without narrative text.',
+          '',
+          '**Submitted actions**',
+          submittedActions,
+        ].join('\n');
+      };
+
       while (true) {
         if (signal.aborted) break;
         setBattleError(null);
@@ -1503,6 +1515,10 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
                 const start = Math.max(1, args.startLine || 1);
                 const end = Math.min(totalLines, args.endLine || totalLines);
                 const resultText = logLines.slice(start - 1, end).join('\n');
+                socket.emit('streamTurnResolutionChunk', {
+                  type: 'tool',
+                  text: `⚙️ Judge called read_battle_history(${start}, ${end})`,
+                });
                 
                 contents.push({ role: 'model', parts: modelParts });
                 contents.push({
@@ -1543,7 +1559,11 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
                 );
                 
                 let thoughts = finalThoughts.trim();
-                let markdownLog = finalAnswer.trim();
+                let markdownLog = finalAnswer.trim() || buildFallbackBattleNarrative();
+                socket.emit('streamTurnResolutionChunk', {
+                  type: 'tool',
+                  text: '⚙️ Judge called submit_battle_result',
+                });
                 
                 socket.emit('submitTurnResolution', {
                   log: markdownLog,
@@ -1591,7 +1611,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
               let markdownLog = finalAnswer
                 .replace(/<BATTLE_STATE>[\s\S]*?(?:<\/BATTLE_STATE>|$)/, "")
                 .replace(/<BATTLE_POSITIONS>[\s\S]*?(?:<\/BATTLE_POSITIONS>|$)/, "")
-                .trim();
+                .trim() || buildFallbackBattleNarrative();
               
               socket.emit('submitTurnResolution', {
                 log: markdownLog,
@@ -1697,8 +1717,12 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       setBattleLogs(prev => ensureBattleStreamPlaceholders(prev));
     });
 
-    socket.on('streamTurnResolutionChunk', (data: { type: 'thought' | 'answer', text: string }) => {
+    socket.on('streamTurnResolutionChunk', (data: { type: 'thought' | 'answer' | 'tool', text: string }) => {
       setBattleLogs(prev => {
+        if (data.type === 'tool') {
+          return appendBattleLogIfMissing(prev, `STATUS_TOOL::${data.text}`);
+        }
+
         const newLogs = ensureBattleStreamPlaceholders(prev);
         const isRefresh = data.text.startsWith('REFRESH:');
         const textToAppend = isRefresh ? data.text.substring('REFRESH:'.length) : data.text;
