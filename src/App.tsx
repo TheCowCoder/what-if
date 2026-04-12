@@ -5,6 +5,20 @@ import rehypeRaw from 'rehype-raw';
 import { Home, User, Users, Shield, Heart, Send, Check, Loader2, Sword, Settings, ChevronDown, ArrowLeft, AlertTriangle, Info, Compass, Map, Star, ChevronUp, Maximize2, Minimize2, Target, Beef, GlassWater, Zap, Package, X, Eye, Coins, Orbit } from 'lucide-react';
 import { classifyAIError, createAIClient, formatAIError, getAIRetryDelaySeconds } from '../ai';
 
+// ErrorBoundary to prevent white-screen crashes from markdown rendering errors
+class MarkdownErrorBoundary extends React.Component<{ children: React.ReactNode; fallback: string }, { hasError: boolean }> {
+  state = { hasError: false };
+  static getDerivedStateFromError() { return { hasError: true }; }
+  componentDidCatch(error: Error) { console.error('[MarkdownErrorBoundary]', error.message); }
+  render() { return this.state.hasError ? <span>{this.props.fallback}</span> : this.props.children; }
+}
+
+const SafeMarkdown = ({ children }: { children: string }) => (
+  <MarkdownErrorBoundary fallback={children}>
+    <Markdown rehypePlugins={[rehypeRaw]}>{children}</Markdown>
+  </MarkdownErrorBoundary>
+);
+
 declare global {
   interface Window {
     aistudio?: {
@@ -1550,6 +1564,8 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
   };
 
   useEffect(() => {
+    let portraitAborted = false;
+    let portraitTimeoutId: ReturnType<typeof setTimeout> | null = null;
     socket.on('characterSaved', (state: Character) => {
       const existingCharacter = charactersRef.current.find(entry => entry.name === state.name)
         || (characterRef.current?.name === state.name ? characterRef.current : null);
@@ -1566,7 +1582,8 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         lastSyncedCharRef.current = stateStr;
         // Auto-generate character portrait
         if (!normalizedState.imageUrl && gameStateRef.current !== 'arena_prep') {
-          setTimeout(async () => {
+          portraitTimeoutId = setTimeout(async () => {
+            if (portraitAborted) return;
             const generationMessageId = `avatar-generation-${state.name}-${Date.now()}`;
             try {
               console.log("[Portrait Auto] Starting generation for:", state.name);
@@ -1578,10 +1595,12 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
                 contents: prompt,
                 config: { responseModalities: ['IMAGE', 'TEXT'] },
               });
+              if (portraitAborted) return;
               const imgParts = imgRes.candidates?.[0]?.content?.parts || [];
               const imageFrames = extractInlineImageFrames(imgParts);
               if (imageFrames.length > 0) {
                 const optimizedImageUrl = await optimizeCharacterAvatar(imageFrames[imageFrames.length - 1]);
+                if (portraitAborted) return;
                 setCharacter(prev => prev ? { ...prev, imageUrl: optimizedImageUrl } : prev);
                 setMessages(prev => {
                   const filtered = prev.filter(message => message.streamId !== generationMessageId);
@@ -1600,7 +1619,9 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
             } catch (err: any) {
               console.error("[Portrait Auto] Error:", err.message);
             } finally {
-              setMessages(prev => prev.filter(message => message.streamId !== generationMessageId));
+              if (!portraitAborted) {
+                setMessages(prev => prev.filter(message => message.streamId !== generationMessageId));
+              }
             }
           }, 500);
         }
@@ -2674,6 +2695,8 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     });
 
     return () => {
+      portraitAborted = true;
+      if (portraitTimeoutId) clearTimeout(portraitTimeoutId);
       socket.off('characterSaved');
       socket.off('waitingForOpponent');
       socket.off('arenaPreparationState');
@@ -3965,14 +3988,14 @@ Be creative and concise.`;
                 {msg.role === 'system' ? (
                   <div className="w-full">
                     <div className="text-center text-sm font-bold text-red-500 bg-red-50 border border-red-100 rounded-lg py-2 px-4 my-2 markdown-body">
-                      <Markdown rehypePlugins={[rehypeRaw]}>{msg.text}</Markdown>
+                      <SafeMarkdown>{msg.text}</SafeMarkdown>
                     </div>
                     <InlineMessageMedia message={msg} alt="Portrait generation" />
                   </div>
                 ) : (
                   <div className={msg.role === 'user' ? 'chat-bubble-me' : 'chat-bubble-them'}>
                     <div className="markdown-body">
-                      <Markdown rehypePlugins={[rehypeRaw]}>{msg.text}</Markdown>
+                      <SafeMarkdown>{msg.text}</SafeMarkdown>
                     </div>
                   </div>
                 )}
@@ -4187,14 +4210,14 @@ Be creative and concise.`;
                       {msg.role === 'system' ? (
                         <div className="w-full">
                           <div className="text-center text-sm font-bold text-red-500 bg-red-50 border border-red-100 rounded-lg py-2 px-4 my-2 markdown-body">
-                            <Markdown rehypePlugins={[rehypeRaw]}>{msg.text}</Markdown>
+                            <SafeMarkdown>{msg.text}</SafeMarkdown>
                           </div>
                           <InlineMessageMedia message={msg} alt="Portrait generation" />
                         </div>
                       ) : (
                         <div className={msg.role === 'user' ? 'chat-bubble-me' : 'chat-bubble-them'}>
                           <div className="markdown-body">
-                            <Markdown rehypePlugins={[rehypeRaw]}>{msg.text}</Markdown>
+                            <SafeMarkdown>{msg.text}</SafeMarkdown>
                           </div>
                         </div>
                       )}
@@ -4471,7 +4494,7 @@ Be creative and concise.`;
                 <div key={i} className="flex justify-start">
                   <div className="chat-bubble-them max-w-[85%]">
                     <div className="markdown-body text-sm">
-                      <Markdown rehypePlugins={[rehypeRaw]}>{content}</Markdown>
+                      <SafeMarkdown>{content}</SafeMarkdown>
                     </div>
                   </div>
                 </div>
@@ -4486,7 +4509,7 @@ Be creative and concise.`;
                     <span className="text-[9px] font-bold text-gray-400 uppercase">NPC Ally</span>
                   </div>
                   <div className="markdown-body">
-                    <Markdown rehypePlugins={[rehypeRaw]}>{content}</Markdown>
+                    <SafeMarkdown>{content}</SafeMarkdown>
                   </div>
                 </div>
               );
@@ -4518,7 +4541,7 @@ Be creative and concise.`;
                   </div>
                   {isExpanded && (
                     <div className="markdown-body mt-2 pt-2 border-t border-duo-gray/30">
-                      <Markdown rehypePlugins={[rehypeRaw]}>{cleanContent}</Markdown>
+                      <SafeMarkdown>{cleanContent}</SafeMarkdown>
                     </div>
                   )}
                 </div>
@@ -4538,7 +4561,7 @@ Be creative and concise.`;
                       <span className="text-[10px] font-bold text-duo-gray-dark block text-right">Queued Action</span>
                       <div className="chat-bubble-me w-full">
                         <div className="markdown-body text-sm">
-                          <Markdown rehypePlugins={[rehypeRaw]}>{content}</Markdown>
+                          <SafeMarkdown>{content}</SafeMarkdown>
                         </div>
                       </div>
                     </div>
@@ -4567,7 +4590,7 @@ Be creative and concise.`;
                             {!isMyAction && <span className="text-[10px] font-bold text-duo-gray-dark">{pName}</span>}
                             <div className={isMyAction ? 'chat-bubble-me' : 'chat-bubble-them'}>
                               <div className="markdown-body text-sm">
-                                <Markdown rehypePlugins={[rehypeRaw]}>{pAction}</Markdown>
+                                <SafeMarkdown>{pAction}</SafeMarkdown>
                               </div>
                             </div>
                           </div>
@@ -4582,7 +4605,7 @@ Be creative and concise.`;
             return (
               <div key={i} className="duo-card p-3 text-sm">
                 <div className="markdown-body">
-                  <Markdown rehypePlugins={[rehypeRaw]}>{content}</Markdown>
+                  <SafeMarkdown>{content}</SafeMarkdown>
                   {isStreamingAnswer && <span className="inline-block w-2 h-4 ml-1 bg-duo-blue animate-pulse" />}
                 </div>
               </div>
@@ -5368,14 +5391,14 @@ Be creative and concise.`;
                   </div>
                   {expandedExplorationThoughts.has(thoughtId) && msg.text.trim() && (
                     <div className="markdown-body mt-2 pt-2 border-t border-duo-gray/30">
-                      <Markdown rehypePlugins={[rehypeRaw]}>{msg.text}</Markdown>
+                      <SafeMarkdown>{msg.text}</SafeMarkdown>
                     </div>
                   )}
                 </div>
               ) : msg.role === 'system' ? (
                 <div className="w-full">
                   <div className="text-center text-sm font-bold text-duo-blue bg-duo-blue/5 border border-duo-blue/10 rounded-lg py-2 px-4 my-1 markdown-body">
-                    <Markdown rehypePlugins={[rehypeRaw]}>{msg.text}</Markdown>
+                    <SafeMarkdown>{msg.text}</SafeMarkdown>
                   </div>
                   <InlineMessageMedia message={msg} alt="Inline scene" />
                 </div>
@@ -5388,7 +5411,7 @@ Be creative and concise.`;
                     <span className="text-[10px] font-bold text-duo-gray-dark">{msg.playerName}</span>
                     <div className="chat-bubble-them w-fit min-w-[12rem]">
                       <div className="markdown-body">
-                        <Markdown rehypePlugins={[rehypeRaw]}>{msg.text}</Markdown>
+                        <SafeMarkdown>{msg.text}</SafeMarkdown>
                       </div>
                     </div>
                   </div>
@@ -5400,14 +5423,14 @@ Be creative and concise.`;
                   </div>
                   <div className="chat-bubble-me w-fit min-w-[12rem]">
                     <div className="markdown-body">
-                      <Markdown rehypePlugins={[rehypeRaw]}>{msg.text}</Markdown>
+                      <SafeMarkdown>{msg.text}</SafeMarkdown>
                     </div>
                   </div>
                 </div>
               ) : (
                 <div className={msg.role === 'model' ? 'chat-bubble-them' : 'chat-bubble-me'}>
                   <div className="markdown-body">
-                    <Markdown rehypePlugins={[rehypeRaw]}>{msg.text}</Markdown>
+                    <SafeMarkdown>{msg.text}</SafeMarkdown>
                   </div>
                 </div>
               )}
@@ -5909,7 +5932,7 @@ Be creative and concise.`;
             </div>
             <div className="flex-1 overflow-y-auto p-6 prose prose-slate max-w-none">
               <div className="markdown-body">
-                <Markdown rehypePlugins={[rehypeRaw]}>{profileToView}</Markdown>
+                <SafeMarkdown>{profileToView}</SafeMarkdown>
               </div>
             </div>
             <div className="p-4 border-t-2 border-duo-gray bg-gray-50 flex justify-end">
