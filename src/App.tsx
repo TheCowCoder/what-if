@@ -98,6 +98,39 @@ const BATTLE_STREAM_ANSWER_PREFIX = 'STREAMING_ANSWER_';
 const BATTLE_PLAYER_ACTIONS_PREFIX = 'PLAYER_ACTIONS_';
 const BATTLE_PENDING_ACTION_PREFIX = 'PENDING_PLAYER_ACTION_';
 
+const logBattleDebug = (event: string, details: Record<string, unknown> = {}) => {
+  const payload = {
+    event,
+    timestamp: new Date().toISOString(),
+    ...details,
+  };
+
+  try {
+    console.log('[BattleDebug]', JSON.stringify(payload, null, 2));
+  } catch {
+    console.log('[BattleDebug]', payload);
+  }
+};
+
+const isCoarsePointerDevice = () => (
+  typeof window !== 'undefined'
+  && typeof window.matchMedia === 'function'
+  && window.matchMedia('(pointer: coarse)').matches
+);
+
+const summarizeBattleLogEntry = (entry: string) => {
+  if (entry.startsWith('STATUS_IMAGE_URL::')) {
+    return `STATUS_IMAGE_URL(len=${entry.length - 'STATUS_IMAGE_URL::'.length})`;
+  }
+  if (entry.startsWith('STATUS_IMAGE::')) {
+    return entry;
+  }
+  if (entry.startsWith('STATUS_')) {
+    return entry;
+  }
+  return entry.replace(/\s+/g, ' ').slice(0, 140);
+};
+
 const normalizeCharacter = (value: any): Character => ({
   ...value,
   name: value?.name || 'Unknown',
@@ -163,11 +196,42 @@ const optimizeCharacterAvatar = async (imageUrl: string) => {
   });
 };
 
+const fetchImageAssetAsDataUrl = async (assetPath: string): Promise<string | null> => {
+  try {
+    const response = await fetch(assetPath);
+    if (!response.ok) return null;
+
+    const blob = await response.blob();
+    return await new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onloadend = () => resolve(typeof reader.result === 'string' ? reader.result : null);
+      reader.onerror = () => resolve(null);
+      reader.readAsDataURL(blob);
+    });
+  } catch {
+    return null;
+  }
+};
+
 const extractInlineImageFrames = (parts: any[]): string[] => parts.flatMap(part => {
   if (!(part as any).inlineData) return [];
   const imageData = (part as any).inlineData;
   return [`data:${imageData.mimeType};base64,${imageData.data}`];
 });
+
+const buildInlineImagePartFromDataUrl = (imageUrl?: string | null) => {
+  if (!imageUrl || !imageUrl.startsWith('data:image/')) return null;
+
+  const match = imageUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+  if (!match) return null;
+
+  return {
+    inlineData: {
+      mimeType: match[1],
+      data: match[2],
+    },
+  };
+};
 
 const buildBattleActionsLog = (roomPlayers: Record<string, any>): string => (
   BATTLE_PLAYER_ACTIONS_PREFIX + Object.keys(roomPlayers)
@@ -179,9 +243,33 @@ const appendBattleLogIfMissing = (logs: string[], entry: string): string[] => (
   logs.includes(entry) ? logs : [...logs, entry]
 );
 
+const appendBattleImageResultLogs = (logs: string[], actorName: string, imageUrl: string, completionText: string): string[] => {
+  const withoutImageStatuses = logs.filter(log => (
+    !log.startsWith('STATUS_battle-image-pending::')
+    && !log.startsWith('STATUS_battle-image-complete::')
+  ));
+  const withStatus = appendBattleLogIfMissing(withoutImageStatuses, `STATUS_IMAGE::🎨 **${actorName}** visualized the scene`);
+  const withImage = appendBattleLogIfMissing(withStatus, `STATUS_IMAGE_URL::${imageUrl}`);
+  return appendBattleLogIfMissing(withImage, `STATUS_battle-image-complete::${completionText}`);
+};
+
 const buildPendingBattleActionLog = (playerId: string, action: string): string => (
   `${BATTLE_PENDING_ACTION_PREFIX}${playerId}::${action}`
 );
+
+const sanitizeBattleHistoryForJudge = (logs: string[]): string[] => logs.filter(log => (
+  !log.startsWith('> **Judge\'s Thoughts:**')
+  && !log.startsWith(BATTLE_STREAM_THOUGHTS_PREFIX)
+  && !log.startsWith(BATTLE_STREAM_ANSWER_PREFIX)
+  && !log.startsWith(BATTLE_PENDING_ACTION_PREFIX)
+  && !log.startsWith('STATUS_')
+));
+
+const extractRecentBattleNarrative = (logs: string[]): string[] => logs.filter(log => (
+  !log.startsWith(BATTLE_PLAYER_ACTIONS_PREFIX)
+  && !log.startsWith('NPC_ALLY_ACTION_')
+  && log !== '**Match Found!** The battle begins.'
+)).slice(-2);
 
 const removePendingBattleActionLogs = (logs: string[], playerId?: string): string[] => {
   const prefix = playerId ? `${BATTLE_PENDING_ACTION_PREFIX}${playerId}::` : BATTLE_PENDING_ACTION_PREFIX;
@@ -222,14 +310,6 @@ const buildCompactCharacterStatSheet = (character: Character | null) => {
 const isScrollViewportNearBottom = (element: HTMLElement, threshold = 56) => {
   const remaining = element.scrollHeight - element.scrollTop - element.clientHeight;
   return remaining <= threshold;
-};
-
-const extractBattleTurnSummary = (log: string): string | null => {
-  const summaryMatch = log.match(/(?:^|\n)---\s*\n([\s\S]+)$/);
-  if (!summaryMatch) return null;
-
-  const summary = summaryMatch[1]?.trim();
-  return summary || null;
 };
 
 const ImageSequencePreview = ({ frames, fps = 60, alt }: { frames: string[]; fps?: number; alt: string }) => {
@@ -725,6 +805,56 @@ export default function App() {
     const prefix = `STATUS_${statusId}::`;
     setBattleLogs(prev => prev.filter(log => !log.startsWith(prefix)));
   }, []);
+
+  const clearBattleImageTimers = useCallback(() => {
+    if (battleImageReadyTimeoutRef.current) {
+      window.clearTimeout(battleImageReadyTimeoutRef.current);
+      battleImageReadyTimeoutRef.current = null;
+    }
+    if (battleImageFallbackTimeoutRef.current) {
+      window.clearTimeout(battleImageFallbackTimeoutRef.current);
+      battleImageFallbackTimeoutRef.current = null;
+    }
+  }, []);
+
+  const showBattleImagePendingStatus = useCallback(() => {
+    setBattleImageSkipHintVisible(false);
+    clearBattleStatusLog('battle-image-complete');
+    upsertBattleStatusLog('battle-image-pending', 'Generating image...');
+  }, [clearBattleStatusLog, upsertBattleStatusLog]);
+
+  const showBattleImageCompleteStatus = useCallback((text: string) => {
+    setBattleImageSkipHintVisible(false);
+    clearBattleStatusLog('battle-image-pending');
+    upsertBattleStatusLog('battle-image-complete', text);
+  }, [clearBattleStatusLog, upsertBattleStatusLog]);
+
+  const scheduleReadyForNextTurn = useCallback((reason: string, delayMs = 900) => {
+    if (battleImageReadyTimeoutRef.current) {
+      window.clearTimeout(battleImageReadyTimeoutRef.current);
+    }
+
+    battleImageReadyTimeoutRef.current = window.setTimeout(() => {
+      logBattleDebug('ready_for_next_turn_emit', {
+        roomId: roomIdRef.current,
+        reason,
+        delayMs,
+      });
+      socket.emit('readyForNextTurn');
+      battleImageReadyTimeoutRef.current = null;
+    }, delayMs);
+  }, []);
+
+  const handleSkipBattleImageWait = useCallback(() => {
+    battleImageSkipRef.current = true;
+    setBattleImageSkipHintVisible(false);
+    clearBattleImageTimers();
+    logBattleDebug('image_generation_manually_skipped', {
+      roomId: roomIdRef.current,
+    });
+    showBattleImageCompleteStatus('Continuing without image');
+    scheduleReadyForNextTurn('manual_skip_image', 300);
+  }, [clearBattleImageTimers, scheduleReadyForNextTurn, showBattleImageCompleteStatus]);
   
   // Chat state
   const [messages, setMessages] = useState<Message[]>([]);
@@ -835,6 +965,7 @@ export default function App() {
   const [arenaPreparation, setArenaPreparation] = useState<ArenaPreparationState | null>(null);
   const [battleLogs, setBattleLogs] = useState<string[]>([]);
   const battleLogsRef = useRef<string[]>([]);
+  const battleLogSnapshotRef = useRef<string>('');
   const [battleInput, setBattleInput] = useState('');
   const [battleError, setBattleError] = useState<string | null>(null);
   const [retryAttempt, setRetryAttempt] = useState(0);
@@ -850,9 +981,11 @@ export default function App() {
   const charInputRef = useRef<HTMLTextAreaElement>(null);
   const battleInputRef = useRef<HTMLTextAreaElement>(null);
   const handleGenerateBattleImageRef = useRef<(() => void) | null>(null);
+  const battleImageReadyTimeoutRef = useRef<number | null>(null);
+  const battleImageFallbackTimeoutRef = useRef<number | null>(null);
+  const battleImageSkipRef = useRef(false);
   const [battleAutoScroll, setBattleAutoScroll] = useState(true);
   const [allyActedIds, setAllyActedIds] = useState<string[]>([]);
-  const [lastBattleTurnSummary, setLastBattleTurnSummary] = useState<string | null>(null);
 
   const [showBotModal, setShowBotModal] = useState(false);
   const [botDifficulty, setBotDifficulty] = useState<number>(1);
@@ -865,6 +998,7 @@ export default function App() {
   const [isBotMatch, setIsBotMatch] = useState(false);
   const [isGeneratingBattleImage, setIsGeneratingBattleImage] = useState(false);
   const [hasVisualizedThisTurn, setHasVisualizedThisTurn] = useState(false);
+  const [battleImageSkipHintVisible, setBattleImageSkipHintVisible] = useState(false);
   const [turnTimerRemaining, setTurnTimerRemaining] = useState<number | null>(null);
   const [isVisualizingScene, setIsVisualizingScene] = useState(false);
   const isBotMatchRef = useRef(false);
@@ -952,6 +1086,12 @@ export default function App() {
       }
     };
   }, [clearConnectionPhaseTimeout]);
+
+  useEffect(() => {
+    return () => {
+      clearBattleImageTimers();
+    };
+  }, [clearBattleImageTimers]);
 
   const resumeChatAutoScroll = useCallback(() => {
     setCharAutoScroll(true);
@@ -1183,6 +1323,21 @@ export default function App() {
 
   useEffect(() => {
     battleLogsRef.current = battleLogs;
+  }, [battleLogs]);
+
+  useEffect(() => {
+    const snapshot = {
+      count: battleLogs.length,
+      imageStatusCount: battleLogs.filter(log => log.startsWith('STATUS_IMAGE::')).length,
+      imageUrlCount: battleLogs.filter(log => log.startsWith('STATUS_IMAGE_URL::')).length,
+      pendingImageCount: battleLogs.filter(log => log.startsWith('STATUS_battle-image-pending::')).length,
+      completeImageCount: battleLogs.filter(log => log.startsWith('STATUS_battle-image-complete::')).length,
+      tail: battleLogs.slice(-6).map(summarizeBattleLogEntry),
+    };
+    const serialized = JSON.stringify(snapshot);
+    if (serialized === battleLogSnapshotRef.current) return;
+    battleLogSnapshotRef.current = serialized;
+    logBattleDebug('battle_logs_state', snapshot);
   }, [battleLogs]);
 
   useEffect(() => {
@@ -1527,7 +1682,8 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
 
       if (roomSnapshot) {
         const restoredHistory = Array.isArray(roomSnapshot.history) ? roomSnapshot.history.filter(Boolean) : [];
-        const restoredLogs = removeBattleStreamPlaceholders(restoredHistory);
+        const restoredMediaLogs = Array.isArray(roomSnapshot.battleMediaLogs) ? roomSnapshot.battleMediaLogs.filter(Boolean) : [];
+        const restoredLogs = removeBattleStreamPlaceholders([...restoredHistory, ...restoredMediaLogs]);
         const activeStream = roomSnapshot.activeBattleStream;
 
         if (activeStream?.thoughts) {
@@ -1559,9 +1715,29 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         setRoomTypingIds([]);
         setLocalRoomTypingIds([]);
         setAllyActedIds([]);
-        setLastBattleTurnSummary(extractBattleTurnSummary(lastNarrativeLog || ''));
         setHasVisualizedThisTurn(false);
         setGameState(roomSnapshot.phase === 'arena_prep' ? 'arena_prep' : 'battle');
+
+        logBattleDebug('session_resumed', {
+          roomId: roomSnapshot.roomId,
+          phase: roomSnapshot.phase,
+          awaitingNextTurnReady: !!roomSnapshot.awaitingNextTurnReady,
+          needsTurnResolution: !!roomSnapshot.needsTurnResolution,
+          turnTimerRemaining: roomSnapshot.turnTimerRemaining ?? null,
+          historyCount: restoredLogs.length,
+          mediaLogCount: restoredMediaLogs.length,
+          hasActiveStream: !!(activeStream?.thoughts || activeStream?.answer),
+        });
+
+        if (roomSnapshot.awaitingNextTurnReady) {
+          battleImageSkipRef.current = false;
+          showBattleImagePendingStatus();
+        } else {
+          battleImageSkipRef.current = false;
+          clearBattleImageTimers();
+          clearBattleStatusLog('battle-image-pending');
+          clearBattleStatusLog('battle-image-complete');
+        }
 
         if (roomSnapshot.needsTurnResolution) {
           clearConnectionPhaseTimeout();
@@ -1670,10 +1846,20 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       const baseLogs = appendBattleLogIfMissing(battleLogsRef.current, actionsLog);
       setBattleLogs(prev => appendBattleLogIfMissing(prev, actionsLog));
 
-      const cleanLogs = baseLogs.filter(log => !log.startsWith("> **Judge's Thoughts:**"));
-      const fullLogText = cleanLogs.join('\n\n');
+      const judgeHistoryLogs = sanitizeBattleHistoryForJudge(baseLogs);
+      const recentNarrativeLogs = extractRecentBattleNarrative(judgeHistoryLogs);
+      const fullLogText = judgeHistoryLogs.join('\n\n');
       const logLines = fullLogText.split('\n');
       const totalLines = logLines.length;
+
+      logBattleDebug('judge_history_prepared', {
+        roomId: room.id,
+        baseLogCount: baseLogs.length,
+        judgeHistoryCount: judgeHistoryLogs.length,
+        recentNarrativeCount: recentNarrativeLogs.length,
+        totalLines,
+        recentNarrativeTail: recentNarrativeLogs.map(summarizeBattleLogEntry),
+      });
 
       let profiles = "";
       for (const pid of playerIds) {
@@ -1691,7 +1877,11 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         prompt += `Player (${pData.character.name}):\nHP: ${pData.character.hp}, Mana: ${pData.character.mana}\nAction: ${pData.action}\n\n`;
       }
       prompt += buildBattleMapContext(worldDataRef.current, room.mapState, room.players);
-      prompt += `The battle log currently has ${totalLines} lines. You can use the read_battle_history tool to read it if you need context from previous turns. Otherwise, resolve the turn simultaneously.`;
+      if (recentNarrativeLogs.length > 0) {
+        prompt += `LATEST RESOLVED BATTLE NARRATIVE:\n${recentNarrativeLogs.join('\n\n')}\n\n`;
+      }
+      prompt += 'The BATTLE MAP STATE above is authoritative. Do not invent new zones, do not remap the battlefield, and do not call any zone-setup tool. Treat the provided named locations and connections as the active combat zones.\n';
+      prompt += `The battle log currently has ${totalLines} lines. You can use the read_battle_history tool to read it if you need context from previous turns. Otherwise, resolve the turn simultaneously. When you call submit_battle_result, include the full markdown turn narration in battleLog. If an action is vague, resolve it as the simplest plausible action for the current distance instead of over-interpreting it.`;
 
       const readBattleHistory = {
         name: "read_battle_history",
@@ -1708,10 +1898,14 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
 
       const submitBattleResult = {
         name: "submit_battle_result",
-        description: "Submit the updated character states after resolving the turn. Call this AFTER writing the battle log narrative. Include battlePositions whenever movement, pursuit, swimming, sailing, or fleeing changes exact map coordinates.",
+        description: "Submit the updated character states and final markdown battle log after resolving the turn. Always include the full turn narration in battleLog. Include battlePositions whenever movement, pursuit, swimming, sailing, or fleeing changes exact map coordinates.",
         parameters: {
           type: "OBJECT",
           properties: {
+            battleLog: {
+              type: "STRING",
+              description: "The complete markdown narration for this turn. Include the full battle log text that should be shown to players.",
+            },
             characterStates: {
               type: "STRING",
               description: "JSON string of character states. Format: {\"CharName1\": {\"hp\": number, \"mana\": number, \"profileMarkdown\": \"optional updated markdown\"}, \"CharName2\": {\"hp\": number, \"mana\": number}}"
@@ -1721,7 +1915,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
               description: "Optional JSON string of per-character map positions. Format: {\"CharName1\": {\"x\": number, \"y\": number, \"locationId\": \"nearest_or_tactical_location_id\"}, \"CharName2\": {\"x\": number, \"y\": number, \"locationId\": \"...\"}}. Update this every turn when movement changes positions, including water travel between islands."
             }
           },
-          required: ["characterStates"]
+          required: ["battleLog", "characterStates"]
         }
       };
 
@@ -1762,7 +1956,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
                 temperature: 1.5,
                 thinkingConfig: {
                   includeThoughts: true,
-                  thinkingBudget: 8192
+                  thinkingBudget: 4096
                 },
                 tools: [{ functionDeclarations: [readBattleHistory as any, submitBattleResult as any] }]
               },
@@ -1870,12 +2064,9 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
                   room.players,
                 );
                 
+                const toolBattleLog = typeof args.battleLog === 'string' ? args.battleLog.trim() : '';
                 let thoughts = finalThoughts.trim();
-                let markdownLog = finalAnswer.trim() || buildFallbackBattleNarrative();
-                socket.emit('streamTurnResolutionChunk', {
-                  type: 'tool',
-                  text: '⚙️ Judge called submit_battle_result',
-                });
+                let markdownLog = toolBattleLog || finalAnswer.trim() || buildFallbackBattleNarrative();
                 
                 socket.emit('submitTurnResolution', {
                   log: markdownLog,
@@ -1969,7 +2160,6 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       if (connectionPhaseRef.current === 'resyncing') {
         flashConnectionPhase('reconnected');
       }
-      setLastBattleTurnSummary(extractBattleTurnSummary(data.log || ''));
       setBattleLogs(prev => {
         const filtered = removePendingBattleActionLogs(removeBattleStreamPlaceholders(prev));
         const thoughts = data.thoughts || "";
@@ -1987,8 +2177,15 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         if (alivePlayers.length <= 1) {
           const winner = alivePlayers[0] as any;
           const winnerName = winner ? winner.character.name : "No one";
+          battleImageSkipRef.current = false;
+          clearBattleImageTimers();
+          clearBattleStatusLog('battle-image-pending');
+          clearBattleStatusLog('battle-image-complete');
           setBattleLogs(prev => [...prev, `**GAME OVER!** ${winnerName} is victorious!`]);
         } else {
+          battleImageSkipRef.current = false;
+          clearBattleImageTimers();
+          showBattleImagePendingStatus();
           // If it's a bot match, trigger next bot action
           const room = {
             id: roomIdRef.current,
@@ -2005,8 +2202,24 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       // Auto-generate battle scene image after turn resolution (only resolver generates)
       const playerIds = Object.keys(data.players);
       const isFirstPlayer = playerIds[0] === socket.id;
+      logBattleDebug('turn_resolved_post_processing', {
+        roomId: roomIdRef.current,
+        playerIds,
+        alivePlayerNames: alivePlayers.map((player: any) => player.character.name),
+        isFirstPlayer,
+        isBotMatch: isBotMatchRef.current,
+      });
       if (isFirstPlayer) {
+        logBattleDebug('image_generation_scheduled', {
+          roomId: roomIdRef.current,
+          delayMs: 500,
+        });
         setTimeout(() => handleGenerateBattleImageRef.current?.(), 500);
+      } else {
+        logBattleDebug('image_generation_waiting_for_remote', {
+          roomId: roomIdRef.current,
+          awaitingSharedImage: true,
+        });
       }
     });
 
@@ -2025,7 +2238,10 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       syncBattleMapState(null);
       setArenaPreparation(null);
       setAllyActedIds([]);
-      setLastBattleTurnSummary(null);
+      battleImageSkipRef.current = false;
+      clearBattleImageTimers();
+      clearBattleStatusLog('battle-image-pending');
+      clearBattleStatusLog('battle-image-complete');
       setRoomTypingIds([]);
       setLocalRoomTypingIds([]);
       setBattleInput('');
@@ -2039,6 +2255,9 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     socket.on('streamTurnResolutionChunk', (data: { type: 'thought' | 'answer' | 'tool', text: string }) => {
       setBattleLogs(prev => {
         if (data.type === 'tool') {
+          if (data.text.includes('submit_battle_result')) {
+            return prev;
+          }
           return appendBattleLogIfMissing(prev, `STATUS_TOOL::${data.text}`);
         }
 
@@ -2071,11 +2290,35 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       });
     });
 
-    socket.on('battleImageShared', (data: { imageUrl: string }) => {
-      setBattleLogs(prev => [...prev, `![Battle Scene](${data.imageUrl})`]);
+    socket.on('battleImageShared', (data: { imageUrl: string; fromName?: string }) => {
+      logBattleDebug('battle_image_shared_received', {
+        roomId: roomIdRef.current,
+        fromName: data.fromName || 'Opponent',
+        imageUrlLength: data.imageUrl.length,
+        skipped: battleImageSkipRef.current,
+      });
+      if (battleImageFallbackTimeoutRef.current) {
+        window.clearTimeout(battleImageFallbackTimeoutRef.current);
+        battleImageFallbackTimeoutRef.current = null;
+      }
+
+      if (battleImageSkipRef.current) {
+        return;
+      }
+
+      setBattleLogs(prev => {
+        return appendBattleImageResultLogs(prev, data.fromName || 'Opponent', data.imageUrl, 'Image ready');
+      });
+      scheduleReadyForNextTurn('battle_image_shared_received');
     });
 
     socket.on('turnTimerTick', (data: { remaining: number | null }) => {
+      if (data.remaining != null) {
+        battleImageSkipRef.current = false;
+        clearBattleImageTimers();
+        clearBattleStatusLog('battle-image-pending');
+        clearBattleStatusLog('battle-image-complete');
+      }
       setTurnTimerRemaining(data.remaining);
     });
 
@@ -3009,45 +3252,151 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
   // ============ END EXPLORATION HANDLERS ============
 
   const handleGenerateBattleImage = async () => {
-    if (isGeneratingBattleImage || hasVisualizedThisTurn) return;
+    if (isGeneratingBattleImage || hasVisualizedThisTurn) {
+      logBattleDebug('image_generation_skipped', {
+        roomId,
+        isGeneratingBattleImage,
+        hasVisualizedThisTurn,
+      });
+      return;
+    }
+
+    showBattleImagePendingStatus();
     setIsGeneratingBattleImage(true);
+    let generatedImage = false;
+    let generatedImageUrlLength = 0;
+    let readyReason: string | null = null;
+    let completionLabel = 'Continuing without image';
     try {
       const aiClient = getAIClient();
-      // Get the last few battle log entries for scene context
-      const recentLogs = battleLogs
-        .filter(l => !l.startsWith('STREAMING_') && !l.startsWith('>') && !l.startsWith('PLAYER_ACTIONS_') && !l.startsWith(BATTLE_PENDING_ACTION_PREFIX))
-        .slice(-3)
-        .join('\n')
-        .substring(0, 500);
+      const imageNarrativeLogs = extractRecentBattleNarrative(sanitizeBattleHistoryForJudge(battleLogs));
+      const recentLogs = imageNarrativeLogs.join('\n\n').substring(0, 900);
       const playerNames = Object.values(players).map((p: any) => p.character.name).join(' vs ');
-      const prompt = `Generate a dynamic battle scene illustration: ${playerNames}. Recent events: ${recentLogs}. Style: fantasy RPG battle art, dramatic action poses, magical effects, vibrant colors.`;
+      const battleMapImageContext = buildBattleMapContext(worldDataRef.current, battleMapState, players)
+        .replace('BATTLE MAP STATE:\n', '')
+        .substring(0, 1200);
+      const battleLocationSummary = battleMapState.players.map((player) => {
+        const location = getWorldLocationById(worldDataRef.current, player.locationId);
+        const playerName = players[player.id]?.character?.name || player.name;
+        return `${playerName} is near ${location?.name || player.locationId} at (${player.x.toFixed(1)}, ${player.y.toFixed(1)})`;
+      }).join('; ');
+      const layoutReferenceDataUrl = await fetchImageAssetAsDataUrl('/image.png');
+      const layoutReferencePart = buildInlineImagePartFromDataUrl(layoutReferenceDataUrl);
+      const avatarReferenceParts = Object.values(players)
+        .filter((participant: any) => !participant.character?.isNpcAlly)
+        .slice(0, 2)
+        .flatMap((participant: any) => {
+          const avatarPart = buildInlineImagePartFromDataUrl(participant.character?.imageUrl);
+          if (!avatarPart) return [];
+          return [
+            { text: `Reference avatar for ${participant.character?.name || 'Combatant'}.` },
+            avatarPart,
+          ];
+        });
+      const prompt = `Generate a dynamic battle scene illustration for ${playerNames}. This must be a NEW poster image for the CURRENT turn, not an edit of any previous turn image. Latest resolved battle narrative: ${recentLogs || 'The battle has just begun.'}. Current positions: ${battleLocationSummary || 'Use the active battlefield state.'}. Authoritative battlefield state: ${battleMapImageContext || 'Use the active battlefield state.'}. Style: fantasy RPG battle poster art, dramatic action poses, magical effects, vibrant colors.
+
+This battle image must ALWAYS include cinematic UI text overlays integrated into the art:
+- A bold top headline announcing the battle beat.
+- Small location label text for at least one relevant battlefield location.
+- A bottom split result panel for both combatants with a cool icon, the move name, and a short outcome description.
+
+    Match the included reference image's poster language: strong comic-style title at the top, small floating location text, and bottom action-result banners with readable typography. Use the reference for layout and typography treatment only. Update all scene content, labels, move names, and locations to reflect THIS turn's narrative and current battlefield positions.
+
+    Do not invent terrain interactions that are not supported by the latest narrative or authoritative battlefield state. Do not place a combatant in water, waist-deep surf, or shoreline action unless the narrative or current map state explicitly puts them there. If one fighter is farther from the water or behind cover, keep that staging accurate instead of moving them for composition.`;
+
+      logBattleDebug('image_generation_start', {
+        roomId,
+        playerNames,
+        playerIds: Object.keys(players),
+        battleLogCount: battleLogs.length,
+        recentLogsPreview: recentLogs,
+        battleLocationSummary,
+        battleMapImageContext,
+        hasLayoutReference: !!layoutReferencePart,
+        avatarReferenceCount: avatarReferenceParts.length / 2,
+      });
+
+      const requestParts: any[] = [{ text: prompt }];
+      if (layoutReferencePart) {
+        requestParts.push({ text: 'Layout and typography reference image. Copy its top title, location callout, and bottom result-panel treatment.' });
+        requestParts.push(layoutReferencePart);
+      }
+      requestParts.push(...avatarReferenceParts);
       
       const response = await aiClient.models.generateContent({
-        model: 'gemini-3.1-pro-image-preview',
-        contents: prompt,
+        model: 'gemini-2.5-flash-image',
+        contents: [{ role: 'user', parts: requestParts }],
         config: {
           responseModalities: ['IMAGE', 'TEXT'],
         },
       });
 
       const parts = response.candidates?.[0]?.content?.parts || [];
-      for (const part of parts) {
-        if ((part as any).inlineData) {
-          const imageData = (part as any).inlineData;
-          const imageUrl = `data:${imageData.mimeType};base64,${imageData.data}`;
-          setBattleLogs(prev => [...prev, `STATUS_IMAGE::🎨 **${character?.name || 'You'}** visualized the scene`, `STATUS_IMAGE_URL::${imageUrl}`]);
-          setHasVisualizedThisTurn(true);
-          // Share with opponent
-          if (roomId) {
-            socket.emit('shareBattleImage', { roomId, imageUrl });
-          }
+      const imageFrames = extractInlineImageFrames(parts);
+      logBattleDebug('image_generation_response', {
+        roomId,
+        partCount: parts.length,
+        imageFrameCount: imageFrames.length,
+        parts: parts.map((part: any) => ({
+          hasInlineData: !!part?.inlineData,
+          mimeType: part?.inlineData?.mimeType || null,
+          textPreview: typeof part?.text === 'string' ? part.text.slice(0, 120) : null,
+        })),
+      });
+
+      if (imageFrames.length > 0) {
+        const rawImageUrl = imageFrames[imageFrames.length - 1];
+        const imageUrl = await optimizeCharacterAvatar(rawImageUrl);
+        generatedImage = true;
+        generatedImageUrlLength = imageUrl.length;
+        logBattleDebug('image_generation_success', {
+          roomId,
+          rawImageUrlLength: rawImageUrl.length,
+          imageUrlLength: imageUrl.length,
+          imageFrameCount: imageFrames.length,
+          skipped: battleImageSkipRef.current,
+        });
+
+        if (battleImageSkipRef.current) {
           return;
         }
+
+        completionLabel = 'Image ready';
+        readyReason = 'image_generation_success';
+        setBattleLogs(prev => {
+          return appendBattleImageResultLogs(prev, character?.name || 'You', imageUrl, completionLabel);
+        });
+        setHasVisualizedThisTurn(true);
+        if (roomId) {
+          socket.emit('shareBattleImage', { roomId, imageUrl });
+        }
+        return;
       }
+
+      logBattleDebug('image_generation_no_inline_data', {
+        roomId,
+        partCount: parts.length,
+        imageFrameCount: imageFrames.length,
+      });
     } catch (error: any) {
       console.error("Battle image error:", error);
+      logBattleDebug('image_generation_error', {
+        roomId,
+        name: error?.name || null,
+        message: error?.message || String(error),
+      });
     } finally {
       setIsGeneratingBattleImage(false);
+      if (readyReason) {
+        logBattleDebug('ready_for_next_turn_scheduled', {
+          roomId,
+          reason: readyReason,
+          generatedImage,
+          imageUrlLength: generatedImageUrlLength,
+          completionLabel,
+        });
+        scheduleReadyForNextTurn(readyReason);
+      }
     }
   };
   handleGenerateBattleImageRef.current = handleGenerateBattleImage;
@@ -3917,7 +4266,7 @@ Be creative and concise.`;
           )}
         </div>
 
-        {(followerPlayers.length > 0 || lastBattleTurnSummary) && (
+        {followerPlayers.length > 0 && (
           <div className="px-2 py-2 bg-white border-b border-duo-gray space-y-2">
             {followerPlayers.length > 0 && (
               <div className="flex flex-wrap items-center gap-1.5">
@@ -3938,14 +4287,6 @@ Be creative and concise.`;
                     </span>
                   );
                 })}
-              </div>
-            )}
-            {lastBattleTurnSummary && (
-              <div className="rounded-2xl border border-duo-gray bg-gray-50 px-3 py-2">
-                <div className="text-[10px] font-black uppercase text-duo-gray-dark mb-1">Turn Summary</div>
-                <div className="markdown-body text-sm">
-                  <Markdown rehypePlugins={[rehypeRaw]}>{lastBattleTurnSummary}</Markdown>
-                </div>
               </div>
             )}
           </div>
@@ -4001,6 +4342,9 @@ Be creative and concise.`;
             const isStreamingAnswer = log.startsWith(BATTLE_STREAM_ANSWER_PREFIX);
             const isThoughts = log.startsWith("> **Judge's Thoughts:**") || isStreamingThoughts;
             const isStatusLog = log.startsWith('STATUS_');
+            const isToolStatus = log.startsWith('STATUS_TOOL::');
+            const isImagePendingStatus = log.startsWith('STATUS_battle-image-pending::');
+            const isImageCompleteStatus = log.startsWith('STATUS_battle-image-complete::');
             const isImageUrl = log.startsWith('STATUS_IMAGE_URL::');
             
             // Check if it's a Player Actions bubble
@@ -4019,8 +4363,60 @@ Be creative and concise.`;
 
             if (isImageUrl) {
               return (
-                <div key={i} className="rounded-lg overflow-hidden border-2 border-duo-gray shadow-md my-2">
+                <div key={log} className="rounded-lg overflow-hidden border-2 border-duo-gray shadow-md my-2">
                   <img src={content} alt="Battle Scene" className="w-full" />
+                </div>
+              );
+            }
+
+            if (isToolStatus) {
+              return (
+                <div key={i} className="rounded-xl border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-700 shadow-sm">
+                  <div className="flex items-start gap-2">
+                    <Info className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                    <div className="font-semibold leading-relaxed">{content}</div>
+                  </div>
+                </div>
+              );
+            }
+
+            if (isImagePendingStatus) {
+              return (
+                <div
+                  key={i}
+                  className="group w-full rounded-xl border border-yellow-300 bg-yellow-50 px-3 py-2 text-xs text-yellow-800 shadow-sm"
+                  onClick={() => {
+                    if (isCoarsePointerDevice() && !battleImageSkipHintVisible) {
+                      setBattleImageSkipHintVisible(true);
+                    }
+                  }}
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="flex items-center gap-2 font-semibold min-w-0">
+                      <Loader2 className="w-4 h-4 animate-spin flex-shrink-0" />
+                      <span className="truncate">{content}</span>
+                    </div>
+                    <button
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        handleSkipBattleImageWait();
+                      }}
+                      className={`${battleImageSkipHintVisible ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'} transition-opacity rounded-full border border-yellow-400 bg-white/80 px-2 py-1 text-[10px] font-black uppercase tracking-wide text-yellow-800`}
+                    >
+                      Don't use image
+                    </button>
+                  </div>
+                </div>
+              );
+            }
+
+            if (isImageCompleteStatus) {
+              return (
+                <div key={i} className="w-full rounded-xl border border-green-300 bg-green-50 px-3 py-2 text-xs text-green-800 shadow-sm">
+                  <div className="flex items-center gap-2 font-semibold">
+                    <Check className="w-4 h-4 flex-shrink-0" />
+                    <span>{content}</span>
+                  </div>
                 </div>
               );
             }

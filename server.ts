@@ -19,6 +19,20 @@ function getPrompt(filename: string) {
   return fs.readFileSync(path.join(process.cwd(), "prompts", filename), "utf8");
 }
 
+function logBattleServerDebug(event: string, details: Record<string, unknown> = {}) {
+  const payload = {
+    event,
+    timestamp: new Date().toISOString(),
+    ...details,
+  };
+
+  try {
+    console.log('[BattleServerDebug]', JSON.stringify(payload, null, 2));
+  } catch {
+    console.log('[BattleServerDebug]', payload);
+  }
+}
+
 async function startServer() {
   const app = express();
   const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -27,6 +41,7 @@ async function startServer() {
     cors: {
       origin: "*",
     },
+    maxHttpBufferSize: 8 * 1024 * 1024,
     pingTimeout: 120_000,   // 2 min — prevents disconnect when phone goes to background
     pingInterval: 30_000,
   });
@@ -365,6 +380,14 @@ async function startServer() {
     delete room.pausedTurnRemaining;
     roomTimers[roomId] = { interval: null as any, remaining: turnDuration };
 
+    logBattleServerDebug('turn_timer_started', {
+      roomId,
+      turnDuration,
+      startingRemaining: startingRemaining ?? null,
+      playerIds: Object.keys(room.players || {}),
+      pendingReadyPlayers: Array.from(room.pendingReadyPlayers || []),
+    });
+
     io.to(roomId).emit("turnTimerTick", { remaining: turnDuration });
 
     roomTimers[roomId].interval = setInterval(() => {
@@ -408,6 +431,36 @@ async function startServer() {
     if (room.history.length > 200) {
       room.history = room.history.slice(-200);
     }
+  }
+
+  function appendBattleMediaLogs(roomId: string, actorName: string, imageUrl: string) {
+    const room = rooms[roomId];
+    if (!room || typeof imageUrl !== 'string' || !imageUrl.trim()) return;
+
+    if (!Array.isArray(room.battleMediaLogs)) {
+      room.battleMediaLogs = [];
+    }
+
+    const entries = [
+      `STATUS_IMAGE::🎨 **${actorName || 'Someone'}** visualized the scene`,
+      `STATUS_IMAGE_URL::${imageUrl}`,
+    ];
+
+    for (const entry of entries) {
+      if (room.battleMediaLogs[room.battleMediaLogs.length - 1] === entry) continue;
+      room.battleMediaLogs.push(entry);
+    }
+
+    if (room.battleMediaLogs.length > 8) {
+      room.battleMediaLogs = room.battleMediaLogs.slice(-8);
+    }
+
+    logBattleServerDebug('battle_media_logs_updated', {
+      roomId,
+      actorName,
+      mediaLogCount: room.battleMediaLogs.length,
+      imageUrlLength: imageUrl.length,
+    });
   }
 
   function emitBattleActionsSubmitted(roomId: string, room: { players: Record<string, any> }) {
@@ -1019,6 +1072,7 @@ async function startServer() {
     io.to(roomId).emit("playerLockedIn", playerId);
 
     if (options?.emitNpcAction) {
+      appendRoomHistory(roomId, `NPC_ALLY_ACTION_**${room.players[playerId].character?.name || 'NPC Ally'}:** ${actionText}`);
       io.to(roomId).emit("npcAllyAction", {
         npcId: playerId,
         npcName: room.players[playerId].character?.name || 'NPC Ally',
@@ -1030,6 +1084,21 @@ async function startServer() {
     const allLockedIn = playerIds.every((id) => room.players[id].lockedIn);
     if (allLockedIn) {
       requestTurnResolutionIfReady(roomId);
+    }
+  };
+
+  const autoLockPendingNpcAllies = (roomId: string, room: any, npcActions?: Record<string, string>) => {
+    if (!room?.isBotMatch) return;
+
+    const npcAllyIds = Array.isArray(room.npcAllyIds) ? room.npcAllyIds : [];
+    for (const npcId of npcAllyIds) {
+      if (!room.players?.[npcId] || room.players[npcId].lockedIn) continue;
+
+      const npcName = room.players[npcId].character?.name || 'NPC Ally';
+      const requestedAction = typeof npcActions?.[npcId] === 'string' ? npcActions[npcId].trim() : '';
+      const npcAction = requestedAction || `${npcName} attacks the enemy with their signature ability.`;
+
+      applyPlayerLockedAction(roomId, npcId, npcAction, { emitNpcAction: true });
     }
   };
 
@@ -1210,6 +1279,7 @@ async function startServer() {
     room.awaitingTurnResolution = false;
     delete room.activeBattleStream;
     room.history = ['**Match Found!** The battle begins.'];
+    room.battleMediaLogs = [];
     for (const playerId of Object.keys(room.players)) {
       room.players[playerId].lockedIn = false;
       room.players[playerId].action = "";
@@ -1292,6 +1362,7 @@ async function startServer() {
         [targetId]: { lockedIn: false, action: "", character: targetCharacter },
       },
       history: ['**Match Found!** The battle begins.'],
+      battleMediaLogs: [],
     };
 
     const matchData = {
@@ -2061,6 +2132,7 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
         isBotMatch: !!room.isBotMatch,
         isPvpExploration: !!room.isPvpExploration,
         history: Array.isArray(room.history) ? room.history : [],
+        battleMediaLogs: Array.isArray(room.battleMediaLogs) ? room.battleMediaLogs : [],
         activeBattleStream: room.activeBattleStream && (room.activeBattleStream.thoughts || room.activeBattleStream.answer)
           ? room.activeBattleStream
           : null,
@@ -2277,7 +2349,15 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
     console.log("User connected:", socket.id, { sessionId: requestedSessionId });
 
     socket.on("resumeSession", () => {
-      socket.emit("sessionResumed", buildSessionResumePayload(socket.id, reconnectContext.explorationInterrupted));
+      const payload = buildSessionResumePayload(socket.id, reconnectContext.explorationInterrupted);
+      logBattleServerDebug('session_resumed_emit', {
+        socketId: socket.id,
+        roomId: payload?.room?.roomId || null,
+        historyCount: payload?.room?.history?.length || 0,
+        mediaLogCount: payload?.room?.battleMediaLogs?.length || 0,
+        turnTimerRemaining: payload?.room?.turnTimerRemaining ?? null,
+      });
+      socket.emit("sessionResumed", payload);
       reconnectContext = { explorationInterrupted: false };
     });
 
@@ -2662,8 +2742,17 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
     socket.on("shareBattleImage", (data: { roomId: string; imageUrl: string }) => {
       const p = players[socket.id];
       if (!p) return;
+      const room = rooms[data.roomId];
+      const actorName = room?.players?.[socket.id]?.character?.name || p.character?.name || 'Someone';
+      appendBattleMediaLogs(data.roomId, actorName, data.imageUrl);
+      logBattleServerDebug('battle_image_shared', {
+        roomId: data.roomId,
+        socketId: socket.id,
+        fromName: actorName,
+        imageUrlLength: data.imageUrl?.length || 0,
+      });
       socket.to(data.roomId).emit("battleImageShared", {
-        fromName: p.character?.name || "Someone",
+        fromName: actorName,
         imageUrl: data.imageUrl,
       });
     });
@@ -2712,6 +2801,7 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
           [socket.id]: { lockedIn: false, action: "", character: accepter.character },
         },
         history: ['**Match Found!** The battle begins.'],
+        battleMediaLogs: [],
       };
 
       const challengerSocket = io.sockets.sockets.get(data.challengerId);
@@ -2824,6 +2914,7 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
         mapState: buildArenaBattleMapState(roomPlayers),
         phase: 'preview',
         history: [],
+        battleMediaLogs: [],
       };
 
       socket.join(roomId);
@@ -2935,7 +3026,8 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
             isBotMatch: false,
             mapState: buildArenaBattleMapState(roomPlayers),
             phase: 'preview',
-            history: []
+            history: [],
+            battleMediaLogs: []
           };
 
           startArenaPreparation(roomId);
@@ -3051,6 +3143,7 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
       const botId = Object.keys(room.players).find(playerId => playerId.startsWith('bot_'));
       if (!botId) return;
       applyPlayerLockedAction(roomId, botId, data.action);
+      autoLockPendingNpcAllies(roomId, room, data?.npcActions);
     });
 
     socket.on("playerAction", (payload) => {
@@ -3081,6 +3174,10 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
       applyPlayerLockedAction(roomId, targetPlayerId, actionText.trim(), {
         emitNpcAction: targetPlayerId.startsWith('npc_ally_'),
       });
+
+      if (room.isBotMatch && targetPlayerId.startsWith('bot_')) {
+        autoLockPendingNpcAllies(roomId, room, payload?.npcActions);
+      }
     });
 
     socket.on("playerUnlock", () => {
@@ -3100,14 +3197,26 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
       if (!roomId) return;
       const room = rooms[roomId];
       if (!room?.pendingReadyPlayers) return;
+      const pendingBefore = Array.from(room.pendingReadyPlayers);
       room.pendingReadyPlayers.delete(socket.id);
       // For bot matches, also mark autonomous combatants as ready
       for (const pid of Object.keys(room.players)) {
         if (pid.startsWith('bot_') || pid.startsWith('npc_ally_')) room.pendingReadyPlayers.delete(pid);
       }
+      const pendingAfter = Array.from(room.pendingReadyPlayers);
+      logBattleServerDebug('ready_for_next_turn_received', {
+        roomId,
+        socketId: socket.id,
+        pendingBefore,
+        pendingAfter,
+      });
       if (room.pendingReadyPlayers.size === 0) {
         if (room.readyTimeout) { clearTimeout(room.readyTimeout); delete room.readyTimeout; }
         delete room.pendingReadyPlayers;
+        logBattleServerDebug('ready_for_next_turn_all_ready', {
+          roomId,
+          socketId: socket.id,
+        });
         startRoomTimer(roomId);
       }
     });
@@ -3200,8 +3309,17 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
 
       if (alivePlayers.length > 1) {
         room.pendingReadyPlayers = new Set(Object.keys(room.players).filter(pid => alivePlayers.some((a: any) => a === room.players[pid])));
+        logBattleServerDebug('waiting_for_next_turn_ready', {
+          roomId,
+          alivePlayerNames: alivePlayers.map((player: any) => player.character?.name || 'Unknown'),
+          pendingReadyPlayers: Array.from(room.pendingReadyPlayers),
+        });
         // Safety timeout: start timer after 30s even if no readyForNextTurn received
         room.readyTimeout = setTimeout(() => {
+          logBattleServerDebug('ready_for_next_turn_timeout', {
+            roomId,
+            pendingReadyPlayers: Array.from(room.pendingReadyPlayers || []),
+          });
           delete room.pendingReadyPlayers;
           delete room.readyTimeout;
           if (rooms[roomId]) startRoomTimer(roomId);
@@ -3239,13 +3357,6 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
           }
         }
         io.to(roomId).emit("streamTurnResolutionChunk", data);
-      }
-    });
-
-    socket.on("shareBattleImage", (data: { imageUrl: string }) => {
-      const roomId = players[socket.id]?.room;
-      if (roomId) {
-        socket.to(roomId).emit("battleImageShared", { imageUrl: data.imageUrl });
       }
     });
 

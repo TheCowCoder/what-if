@@ -1,0 +1,341 @@
+[BattleDebug] {
+  "event": "battle_logs_state",
+  "timestamp": "2026-04-12T02:03:52.782Z",
+  "count": 0,
+  "imageStatusCount": 0,
+  "imageUrlCount": 0,
+  "pendingImageCount": 0,
+  "completeImageCount": 0,
+  "tail": []
+}
+inject.js:77 WARNING:Found both blacklist and siteRules — using siteRules
+App.tsx:710 Using platform-provided API key
+2App.tsx:2743 [Sync] Characters synced to cloud successfully
+App.tsx:710 Using platform-provided API key
+App.tsx:109 [BattleDebug] {
+  "event": "battle_logs_state",
+  "timestamp": "2026-04-12T02:04:07.695Z",
+  "count": 1,
+  "imageStatusCount": 0,
+  "imageUrlCount": 0,
+  "pendingImageCount": 0,
+  "completeImageCount": 0,
+  "tail": [
+    "**Match Found!** The battle begins."
+  ]
+}
+App.tsx:109 [BattleDebug] {
+  "event": "battle_logs_state",
+  "timestamp": "2026-04-12T02:04:11.223Z",
+  "count": 2,
+  "imageStatusCount": 0,
+  "imageUrlCount": 0,
+  "pendingImageCount": 0,
+  "completeImageCount": 0,
+  "tail": [
+    "**Match Found!** The battle begins.",
+    "PENDING_PLAYER_ACTION_S5yJXnVoyPLJZsxOAAAD::i fabricate a mansion"
+  ]
+}
+App.tsx:109 [BattleDebug] {
+  "event": "battle_logs_state",
+  "timestamp": "2026-04-12T02:04:13.972Z",
+  "count": 2,
+  "imageStatusCount": 0,
+  "imageUrlCount": 0,
+  "pendingImageCount": 0,
+  "completeImageCount": 0,
+  "tail": [
+    "**Match Found!** The battle begins.",
+    "PLAYER_ACTIONS_**Kael-Orion:** i fabricate a mansion **Bot the Murderer:** Rush towards Kael-Orion, daggers ready for termination."
+  ]
+}
+App.tsx:710 Using platform-provided API key
+App.tsx:109 [BattleDebug] {
+  "event": "battle_logs_state",
+  "timestamp": "2026-04-12T02:04:27.260Z",
+  "count": 4,
+  "imageStatusCount": 0,
+  "imageUrlCount": 0,
+  "pendingImageCount": 0,
+  "completeImageCount": 0,
+  "tail": [
+    "**Match Found!** The battle begins.",
+    "PLAYER_ACTIONS_**Kael-Orion:** i fabricate a mansion **Bot the Murderer:** Rush towards Kael-Orion, daggers ready for termination.",
+    "STREAMING_THOUGHTS_",
+    "STREAMING_ANSWER_"
+  ]
+}
+App.tsx:109 [BattleDebug] {
+  "event": "battle_logs_state",
+  "timestamp": "2026-04-12T02:04:27.295Z",
+  "count": 4,
+  "imageStatusCount": 0,
+  "imageUrlCount": 0,
+  "pendingImageCount": 0,
+  "completeImageCount": 0,
+  "tail": [
+    "**Match Found!** The battle begins.",
+    "PLAYER_ACTIONS_**Kael-Orion:** i fabricate a mansion **Bot the Murderer:** Rush towards Kael-Orion, daggers ready for termination.",
+    "STREAMING_THOUGHTS_**Analyzing Fabrication Limitations** I've been analyzing the feasibility of Kael-Orion fabricating a mansion. My current",
+    "STREAMING_ANSWER_"
+  ]
+}
+App.tsx:710 Using platform-provided API key
+App.tsx:109 [BattleDebug] {
+  "event": "turn_resolved_post_processing",
+  "timestamp": "2026-04-12T02:04:32.330Z",
+  "roomId": "bot_room_S5yJXnVoyPLJZsxOAAAD",
+  "playerIds": [
+    "S5yJXnVoyPLJZsxOAAAD",
+    "bot_S5yJXnVoyPLJZsxOAAAD"
+  ],
+  "alivePlayerNames": [
+    "Kael-Orion",
+    "Bot the Murderer"
+  ],
+  "isFirstPlayer": true,
+  "isBotMatch": true
+}
+App.tsx:109 [BattleDebug] {
+  "event": "image_generation_scheduled",
+  "timestamp": "2026-04-12T02:04:32.330Z",
+  "roomId": "bot_room_S5yJXnVoyPLJZsxOAAAD",
+  "delayMs": 500
+}
+App.tsx:109 [BattleDebug] {
+  "event": "battle_logs_state",
+  "timestamp": "2026-04-12T02:04:32.380Z",
+  "count": 5,
+  "imageStatusCount": 0,
+  "imageUrlCount": 0,
+  "pendingImageCount": 1,
+  "completeImageCount": 0,
+  "tail": [
+    "**Match Found!** The battle begins.",
+    "PLAYER_ACTIONS_**Kael-Orion:** i fabricate a mansion **Bot the Murderer:** Rush towards Kael-Orion, daggers ready for termination.",
+    "> **Judge's Thoughts:** > **Analyzing Fabrication Limitations** > > I've been analyzing the feasibility of Kael-Orion fabricating a mansion.",
+    "### Kael-Orion — *Omni-Fabrication* [SUCCESS - 40 MANA] **Kael-Orion** vents a massive cloud of nanites into the sands of Driftwood Beach. W",
+    "STATUS_battle-image-pending::Generating image..."
+  ]
+}
+App.tsx:710 Using platform-provided API key
+App.tsx:109 [BattleDebug] {
+  "event": "image_generation_start",
+  "timestamp": "2026-04-12T02:04:32.832Z",
+  "roomId": "bot_room_S5yJXnVoyPLJZsxOAAAD",
+  "playerNames": "Kael-Orion vs Bot the Murderer",
+  "playerIds": [
+    "S5yJXnVoyPLJZsxOAAAD",
+    "bot_S5yJXnVoyPLJZsxOAAAD"
+  ],
+  "battleLogCount": 5,
+  "recentLogsPreview": "**Match Found!** The battle begins.\n### Kael-Orion — *Omni-Fabrication*\n\n[SUCCESS - 40 MANA] **Kael-Orion** vents a massive cloud of nanites into the sands of Driftwood Beach. While a full \"mansion\" exceeds the server's immediate power, the nanites crystallize into a two-story, *Reinforced Bastion* of cold, interlocking alloys. \n\n`Kael-Orion is now behind Total Cover`\n\n---\n\n### Bot the Murderer — *Sprint*\n\n[MOVE] **Bot** ignores the shifting geometry on the horizon, its hydraulics hissing as it ",
+  "avatarReferenceCount": 0
+}
+App.tsx:109 [BattleDebug] {
+  "event": "image_generation_response",
+  "timestamp": "2026-04-12T02:04:41.569Z",
+  "roomId": "bot_room_S5yJXnVoyPLJZsxOAAAD",
+  "partCount": 3,
+  "imageFrameCount": 1,
+  "parts": [
+    {
+      "hasInlineData": false,
+      "mimeType": null,
+      "textPreview": "Here's an illustration of the intense battle unfolding between Kael-Orion and Bot the Murderer!\n\n"
+    },
+    {
+      "hasInlineData": true,
+      "mimeType": "image/png",
+      "textPreview": null
+    },
+    {
+      "hasInlineData": false,
+      "mimeType": null,
+      "textPreview": "."
+    }
+  ]
+}
+App.tsx:109 [BattleDebug] {
+  "event": "image_generation_success",
+  "timestamp": "2026-04-12T02:04:41.569Z",
+  "roomId": "bot_room_S5yJXnVoyPLJZsxOAAAD",
+  "imageUrlLength": 2234518,
+  "imageFrameCount": 1,
+  "skipped": false
+}
+App.tsx:109 [BattleDebug] {
+  "event": "ready_for_next_turn_scheduled",
+  "timestamp": "2026-04-12T02:04:41.583Z",
+  "roomId": "bot_room_S5yJXnVoyPLJZsxOAAAD",
+  "reason": "image_generation_success",
+  "generatedImage": true,
+  "imageUrlLength": 2234518,
+  "completionLabel": "Image ready"
+}
+App.tsx:109 [BattleDebug] {
+  "event": "battle_logs_state",
+  "timestamp": "2026-04-12T02:04:41.660Z",
+  "count": 7,
+  "imageStatusCount": 1,
+  "imageUrlCount": 1,
+  "pendingImageCount": 0,
+  "completeImageCount": 1,
+  "tail": [
+    "PLAYER_ACTIONS_**Kael-Orion:** i fabricate a mansion **Bot the Murderer:** Rush towards Kael-Orion, daggers ready for termination.",
+    "> **Judge's Thoughts:** > **Analyzing Fabrication Limitations** > > I've been analyzing the feasibility of Kael-Orion fabricating a mansion.",
+    "### Kael-Orion — *Omni-Fabrication* [SUCCESS - 40 MANA] **Kael-Orion** vents a massive cloud of nanites into the sands of Driftwood Beach. W",
+    "STATUS_IMAGE::🎨 **Kael-Orion** visualized the scene",
+    "STATUS_IMAGE_URL(len=2234518)",
+    "STATUS_battle-image-complete::Image ready"
+  ]
+}
+App.tsx:109 [BattleDebug] {
+  "event": "session_resumed",
+  "timestamp": "2026-04-12T02:04:42.472Z",
+  "roomId": "bot_room_S5yJXnVoyPLJZsxOAAAD",
+  "phase": "battle",
+  "awaitingNextTurnReady": true,
+  "needsTurnResolution": false,
+  "turnTimerRemaining": null,
+  "historyCount": 4,
+  "mediaLogCount": 0,
+  "hasActiveStream": false
+}
+App.tsx:109 [BattleDebug] {
+  "event": "battle_logs_state",
+  "timestamp": "2026-04-12T02:04:42.530Z",
+  "count": 5,
+  "imageStatusCount": 0,
+  "imageUrlCount": 0,
+  "pendingImageCount": 1,
+  "completeImageCount": 0,
+  "tail": [
+    "**Match Found!** The battle begins.",
+    "PLAYER_ACTIONS_**Kael-Orion:** i fabricate a mansion **Bot the Murderer:** Rush towards Kael-Orion, daggers ready for termination.",
+    "> **Judge's Thoughts:** > **Analyzing Fabrication Limitations** > > I've been analyzing the feasibility of Kael-Orion fabricating a mansion.",
+    "### Kael-Orion — *Omni-Fabrication* [SUCCESS - 40 MANA] **Kael-Orion** vents a massive cloud of nanites into the sands of Driftwood Beach. W",
+    "STATUS_battle-image-pending::Generating image..."
+  ]
+}
+App.tsx:109 [BattleDebug] {
+  "event": "ready_for_next_turn_emit",
+  "timestamp": "2026-04-12T02:04:42.531Z",
+  "roomId": "bot_room_S5yJXnVoyPLJZsxOAAAD",
+  "reason": "image_generation_success",
+  "delayMs": 900
+}
+App.tsx:109 [BattleDebug] {
+  "event": "battle_logs_state",
+  "timestamp": "2026-04-12T02:04:42.626Z",
+  "count": 4,
+  "imageStatusCount": 0,
+  "imageUrlCount": 0,
+  "pendingImageCount": 0,
+  "completeImageCount": 0,
+  "tail": [
+    "**Match Found!** The battle begins.",
+    "PLAYER_ACTIONS_**Kael-Orion:** i fabricate a mansion **Bot the Murderer:** Rush towards Kael-Orion, daggers ready for termination.",
+    "> **Judge's Thoughts:** > **Analyzing Fabrication Limitations** > > I've been analyzing the feasibility of Kael-Orion fabricating a mansion.",
+    "### Kael-Orion — *Omni-Fabrication* [SUCCESS - 40 MANA] **Kael-Orion** vents a massive cloud of nanites into the sands of Driftwood Beach. W"
+  ]
+}
+
+
+  "pendingReadyPlayers": []
+}
+User disconnected: tKmVFGqe8CzCFZ0XAAAF
+10:02:49 PM [vite] (client) hmr update /src/App.tsx, /src/index.css
+ianbhatt@Ians-MacBook-Air arena-clash % npm run dev
+
+> react-example@0.0.0 dev
+> tsx server.ts
+
+◇ injected env (3) from .env // tip: ⌘ multiple files { path: ['.env.local', '.env'] }
+Connected to MongoDB Atlas
+Default inspector port 9229 not available, using 9230 instead
+
+Server running on http://localhost:3000
+User connected: Wtngzag5Irq8lUn5AAAB { sessionId: '4db6d61c-b732-48bd-9e88-0db39d94fba8' }
+[BattleServerDebug] {
+  "event": "session_resumed_emit",
+  "timestamp": "2026-04-12T02:03:52.349Z",
+  "socketId": "Wtngzag5Irq8lUn5AAAB",
+  "roomId": null,
+  "historyCount": 0,
+  "mediaLogCount": 0,
+  "turnTimerRemaining": null
+}
+User connected: S5yJXnVoyPLJZsxOAAAD { sessionId: '4db6d61c-b732-48bd-9e88-0db39d94fba8' }
+[FollowerBattle][server] startBotMatch ally merge {
+  socketId: 'S5yJXnVoyPLJZsxOAAAD',
+  explicitNpcAllies: [],
+  followingNpcAllies: [],
+  mergedNpcAllies: []
+}
+[BattleServerDebug] {
+  "event": "turn_timer_started",
+  "timestamp": "2026-04-12T02:04:07.613Z",
+  "roomId": "bot_room_S5yJXnVoyPLJZsxOAAAD",
+  "turnDuration": 90,
+  "startingRemaining": null,
+  "playerIds": [
+    "S5yJXnVoyPLJZsxOAAAD",
+    "bot_S5yJXnVoyPLJZsxOAAAD"
+  ],
+  "pendingReadyPlayers": []
+}
+[BattleServerDebug] {
+  "event": "waiting_for_next_turn_ready",
+  "timestamp": "2026-04-12T02:04:32.276Z",
+  "roomId": "bot_room_S5yJXnVoyPLJZsxOAAAD",
+  "alivePlayerNames": [
+    "Kael-Orion",
+    "Bot the Murderer"
+  ],
+  "pendingReadyPlayers": [
+    "S5yJXnVoyPLJZsxOAAAD",
+    "bot_S5yJXnVoyPLJZsxOAAAD"
+  ]
+}
+User disconnected: S5yJXnVoyPLJZsxOAAAD
+User connected: nHYvPWx0I_WQsuyIAAAF { sessionId: '4db6d61c-b732-48bd-9e88-0db39d94fba8' }
+[BattleServerDebug] {
+  "event": "session_resumed_emit",
+  "timestamp": "2026-04-12T02:04:42.430Z",
+  "socketId": "nHYvPWx0I_WQsuyIAAAF",
+  "roomId": "bot_room_S5yJXnVoyPLJZsxOAAAD",
+  "historyCount": 4,
+  "mediaLogCount": 0,
+  "turnTimerRemaining": null
+}
+[BattleServerDebug] {
+  "event": "ready_for_next_turn_received",
+  "timestamp": "2026-04-12T02:04:42.531Z",
+  "roomId": "bot_room_S5yJXnVoyPLJZsxOAAAD",
+  "socketId": "nHYvPWx0I_WQsuyIAAAF",
+  "pendingBefore": [
+    "bot_S5yJXnVoyPLJZsxOAAAD",
+    "nHYvPWx0I_WQsuyIAAAF"
+  ],
+  "pendingAfter": []
+}
+[BattleServerDebug] {
+  "event": "ready_for_next_turn_all_ready",
+  "timestamp": "2026-04-12T02:04:42.532Z",
+  "roomId": "bot_room_S5yJXnVoyPLJZsxOAAAD",
+  "socketId": "nHYvPWx0I_WQsuyIAAAF"
+}
+[BattleServerDebug] {
+  "event": "turn_timer_started",
+  "timestamp": "2026-04-12T02:04:42.532Z",
+  "roomId": "bot_room_S5yJXnVoyPLJZsxOAAAD",
+  "turnDuration": 90,
+  "startingRemaining": null,
+  "playerIds": [
+    "bot_S5yJXnVoyPLJZsxOAAAD",
+    "nHYvPWx0I_WQsuyIAAAF"
+  ],
+  "pendingReadyPlayers": []
+}
