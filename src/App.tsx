@@ -1957,6 +1957,16 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         try {
           while (true) {
             if (signal.aborted) break;
+            const BATTLE_STREAM_STALL_MS = 60_000;
+            let battleStreamStallTimer: ReturnType<typeof setTimeout> | null = null;
+            const clearBattleStallTimer = () => { if (battleStreamStallTimer) { clearTimeout(battleStreamStallTimer); battleStreamStallTimer = null; } };
+            const resetBattleStallTimer = () => {
+              clearBattleStallTimer();
+              battleStreamStallTimer = setTimeout(() => {
+                console.warn('[BattleStream] No chunk received in 60s — aborting stalled stream');
+                abortControllerRef.current?.abort();
+              }, BATTLE_STREAM_STALL_MS);
+            };
             const responseStream = await aiClient.models.generateContentStream({
               model: settingsRef.current.battleModel,
               contents: contents,
@@ -1977,7 +1987,9 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
             let streamedThoughts = "";
             let streamedAnswer = "";
 
+            resetBattleStallTimer();
             for await (const chunk of responseStream) {
+              resetBattleStallTimer();
               if (signal.aborted) break;
               const parts = chunk.candidates?.[0]?.content?.parts || [];
               for (const part of parts) {
@@ -2012,6 +2024,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
                 }
               }
             }
+            clearBattleStallTimer();
             if (signal.aborted) break;
 
             finalThoughts += streamedThoughts;
@@ -2895,13 +2908,20 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     };
 
     let attempts = 0;
+    const charAbort = new AbortController();
+    const CHAR_STREAM_TIMEOUT_MS = 90_000;
 
     while (true) {
+      if (charAbort.signal.aborted) break;
       setCharCreatorError(null);
       setCharCreatorRetryAttempt(attempts);
 
       try {
-        const responseStream = await aiClient.models.generateContentStream(charApiConfig);
+        const streamTimeoutId = window.setTimeout(() => charAbort.abort(), CHAR_STREAM_TIMEOUT_MS);
+        const responseStream = await aiClient.models.generateContentStream({
+          ...charApiConfig,
+          config: { ...charApiConfig.config, abortSignal: charAbort.signal },
+        });
         
         let fullText = "";
         let currentModelMessage = "";
@@ -2911,6 +2931,8 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         setMessages(prev => [...prev, { role: 'model', text: "" }]);
         
         for await (const chunk of responseStream) {
+          if (charAbort.signal.aborted) break;
+          window.clearTimeout(streamTimeoutId);
           const parts = chunk.candidates?.[0]?.content?.parts || [];
           for (const part of parts) {
             if (part.functionCall) {
@@ -2959,12 +2981,24 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         }
 
         // Success
+        window.clearTimeout(streamTimeoutId);
         clearChatStatusMessage('char-creator-retry');
         setCharCreatorRetryAttempt(0);
         setCharCreatorError(null);
         break;
 
       } catch (error: any) {
+        if (error.name === 'AbortError' || charAbort.signal.aborted) {
+          console.warn('Character creator stream aborted (timeout or cleanup)');
+          setMessages(prev => {
+            const newMsgs = [...prev];
+            if (newMsgs.length > 0 && newMsgs[newMsgs.length - 1].role === 'model' && !newMsgs[newMsgs.length - 1].text) {
+              newMsgs.pop();
+            }
+            return [...newMsgs, { role: 'system', text: '⚠️ Character creator timed out. Try sending your message again.' }];
+          });
+          break;
+        }
         console.error("Error creating character:", error);
 
         const errorInfo = classifyAIError(error);
@@ -4851,6 +4885,7 @@ Be creative and concise.`;
           <div className="fixed inset-0 z-50 bg-black/60" onClick={() => setShowFullMap(false)}>
             <div 
               className="absolute inset-4 bg-blue-900/95 rounded-3xl border-2 border-duo-gray overflow-hidden"
+              style={{ touchAction: 'none' }}
               onClick={(e) => e.stopPropagation()}
               onWheel={(e) => {
                 e.stopPropagation();
@@ -4867,10 +4902,42 @@ Be creative and concise.`;
                 }));
               }}
               onPointerDown={(e) => {
+                // Track active pointers for pinch-zoom
+                const el = e.currentTarget as HTMLElement;
+                if (!el.dataset.pointers) el.dataset.pointers = '{}';
+                const pointers: Record<string, {x: number; y: number}> = JSON.parse(el.dataset.pointers);
+                pointers[e.pointerId] = { x: e.clientX, y: e.clientY };
+                el.dataset.pointers = JSON.stringify(pointers);
+                el.dataset.lastPinchDist = '';
                 mapDragRef.current = { dragging: true, lastX: e.clientX, lastY: e.clientY };
-                (e.target as HTMLElement).setPointerCapture(e.pointerId);
+                el.setPointerCapture(e.pointerId);
               }}
               onPointerMove={(e) => {
+                const el = e.currentTarget as HTMLElement;
+                const pointers: Record<string, {x: number; y: number}> = JSON.parse(el.dataset.pointers || '{}');
+                pointers[e.pointerId] = { x: e.clientX, y: e.clientY };
+                el.dataset.pointers = JSON.stringify(pointers);
+                const pts = Object.values(pointers);
+                if (pts.length >= 2) {
+                  // Pinch zoom
+                  const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+                  const lastDist = parseFloat(el.dataset.lastPinchDist || '');
+                  if (lastDist && lastDist > 0) {
+                    const scale = dist / lastDist;
+                    const midX = (pts[0].x + pts[1].x) / 2;
+                    const midY = (pts[0].y + pts[1].y) / 2;
+                    const rect = el.getBoundingClientRect();
+                    const cx = midX - rect.left;
+                    const cy = midY - rect.top;
+                    const oldZoom = mapZoom;
+                    const newZoom = Math.min(5, Math.max(0.5, oldZoom * scale));
+                    const s = newZoom / oldZoom;
+                    setMapZoom(newZoom);
+                    setMapPan(p => ({ x: cx - s * (cx - p.x), y: cy - s * (cy - p.y) }));
+                  }
+                  el.dataset.lastPinchDist = String(dist);
+                  return;
+                }
                 if (!mapDragRef.current.dragging) return;
                 const dx = e.clientX - mapDragRef.current.lastX;
                 const dy = e.clientY - mapDragRef.current.lastY;
@@ -4878,7 +4945,26 @@ Be creative and concise.`;
                 mapDragRef.current.lastY = e.clientY;
                 setMapPan(p => ({ x: p.x + dx, y: p.y + dy }));
               }}
-              onPointerUp={() => { mapDragRef.current.dragging = false; }}
+              onPointerUp={(e) => {
+                const el = e.currentTarget as HTMLElement;
+                const pointers: Record<string, {x: number; y: number}> = JSON.parse(el.dataset.pointers || '{}');
+                delete pointers[e.pointerId];
+                el.dataset.pointers = JSON.stringify(pointers);
+                el.dataset.lastPinchDist = '';
+                if (Object.keys(pointers).length === 0) {
+                  mapDragRef.current.dragging = false;
+                }
+              }}
+              onPointerCancel={(e) => {
+                const el = e.currentTarget as HTMLElement;
+                const pointers: Record<string, {x: number; y: number}> = JSON.parse(el.dataset.pointers || '{}');
+                delete pointers[e.pointerId];
+                el.dataset.pointers = JSON.stringify(pointers);
+                el.dataset.lastPinchDist = '';
+                if (Object.keys(pointers).length === 0) {
+                  mapDragRef.current.dragging = false;
+                }
+              }}
             >
               <div className="absolute top-2 left-2 z-10 flex gap-1">
                 <button onClick={() => setMapZoom(z => Math.min(5, z + 0.3))} className="bg-white/90 rounded-full w-7 h-7 text-sm font-black text-blue-900 shadow">+</button>
