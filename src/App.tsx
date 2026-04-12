@@ -1472,15 +1472,32 @@ export default function App() {
           .filter(([id]) => id !== botId)
           .map(([, player]) => `Opponent: ${player.character.name}\n${player.character.profileMarkdown}`)
           .join('\n\n');
-        const response = await aiClient.models.generateContent({
-          model: settingsRef.current.botModel,
-          contents: `You are revising your dueling profile before the arena begins. Keep the same name and return markdown only.\n\nCurrent profile:\n${botPlayer.character.profileMarkdown}\n\nOpponents:\n${opponents}\n\nRefine the profile to better prepare for this duel while preserving identity and formatting.`,
-          config: {
-            temperature: 0.8,
-          },
-        });
 
-        const rewrittenProfile = response.text?.trim();
+        let response: any = null;
+        for (let attempt = 0; attempt < 4; attempt++) {
+          if (cancelled) break;
+          try {
+            const botAbort = new AbortController();
+            const timeout = setTimeout(() => botAbort.abort(), 90_000);
+            response = await aiClient.models.generateContent({
+              model: settingsRef.current.botModel,
+              contents: `You are revising your dueling profile before the arena begins. Keep the same name and return markdown only.\n\nCurrent profile:\n${botPlayer.character.profileMarkdown}\n\nOpponents:\n${opponents}\n\nRefine the profile to better prepare for this duel while preserving identity and formatting.`,
+              config: {
+                temperature: 0.8,
+                abortSignal: botAbort.signal,
+              },
+            });
+            clearTimeout(timeout);
+            break;
+          } catch (err: any) {
+            const errorInfo = classifyAIError(err);
+            if (!errorInfo.retryable || attempt >= 3) throw err;
+            console.warn(`[BotRewrite] Attempt ${attempt + 1} failed: ${errorInfo.label}, retrying...`);
+            await new Promise(r => setTimeout(r, getAIRetryDelaySeconds(attempt + 1) * 1000));
+          }
+        }
+
+        const rewrittenProfile = response?.text?.trim();
         if (!cancelled && rewrittenProfile) {
           rewriteSubmitted = true;
           window.clearTimeout(previewFallbackTimeout);
@@ -1551,16 +1568,31 @@ ${totalLines > 0 ? logLines.slice(Math.max(0, totalLines - 15)).join('\n') : "Th
 
 What is your action? Keep it short and tactical. Remember, you are ${p2Data.character.name}.
 `;
-      const botRes = await aiClient.models.generateContent({
-        model: settingsRef.current.botModel,
-        contents: botPrompt,
-        config: {
-          systemInstruction: botSysPrompt,
-          temperature: 0.8,
-        },
-      });
+      let botRes: any = null;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        try {
+          const botAbort = new AbortController();
+          const timeout = setTimeout(() => botAbort.abort(), 90_000);
+          botRes = await aiClient.models.generateContent({
+            model: settingsRef.current.botModel,
+            contents: botPrompt,
+            config: {
+              systemInstruction: botSysPrompt,
+              temperature: 0.8,
+              abortSignal: botAbort.signal,
+            },
+          });
+          clearTimeout(timeout);
+          break;
+        } catch (err: any) {
+          const errorInfo = classifyAIError(err);
+          if (!errorInfo.retryable || attempt >= 3) throw err;
+          console.warn(`[BotAction] Attempt ${attempt + 1} failed: ${errorInfo.label}, retrying...`);
+          await new Promise(r => setTimeout(r, getAIRetryDelaySeconds(attempt + 1) * 1000));
+        }
+      }
       
-      const action = botRes.text || "I do nothing.";
+      const action = botRes?.text || "I do nothing.";
       socket.emit('playerAction', { playerId: botId, action });
     } catch (error) {
       console.error("Error generating bot action:", error);
