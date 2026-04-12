@@ -95,7 +95,7 @@ input[type="number"] {
 }
 
 .markdown-body {
-  @apply text-sm leading-relaxed;
+  @apply text-base leading-relaxed;
 }
 .markdown-body h1 { @apply text-2xl font-black mb-4 text-duo-text border-b-2 border-duo-gray pb-2; }
 .markdown-body h2 { @apply text-xl font-black mb-3 text-duo-text mt-4; }
