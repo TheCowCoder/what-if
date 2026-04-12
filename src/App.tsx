@@ -2909,15 +2909,25 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
 
     let attempts = 0;
     const charAbort = new AbortController();
-    const CHAR_STREAM_TIMEOUT_MS = 90_000;
+    const CHAR_STREAM_STALL_MS = 30_000;
 
     while (true) {
       if (charAbort.signal.aborted) break;
       setCharCreatorError(null);
       setCharCreatorRetryAttempt(attempts);
 
+      let charStallTimer: ReturnType<typeof setTimeout> | null = null;
+      const clearCharStallTimer = () => { if (charStallTimer) { clearTimeout(charStallTimer); charStallTimer = null; } };
+      const resetCharStallTimer = () => {
+        clearCharStallTimer();
+        charStallTimer = setTimeout(() => {
+          console.warn('[CharStream] No chunk received in 30s — aborting stalled stream');
+          charAbort.abort();
+        }, CHAR_STREAM_STALL_MS);
+      };
+
       try {
-        const streamTimeoutId = window.setTimeout(() => charAbort.abort(), CHAR_STREAM_TIMEOUT_MS);
+        resetCharStallTimer();
         const responseStream = await aiClient.models.generateContentStream({
           ...charApiConfig,
           config: { ...charApiConfig.config, abortSignal: charAbort.signal },
@@ -2931,8 +2941,8 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         setMessages(prev => [...prev, { role: 'model', text: "" }]);
         
         for await (const chunk of responseStream) {
+          resetCharStallTimer();
           if (charAbort.signal.aborted) break;
-          window.clearTimeout(streamTimeoutId);
           const parts = chunk.candidates?.[0]?.content?.parts || [];
           for (const part of parts) {
             if (part.functionCall) {
@@ -2981,13 +2991,14 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         }
 
         // Success
-        window.clearTimeout(streamTimeoutId);
+        clearCharStallTimer();
         clearChatStatusMessage('char-creator-retry');
         setCharCreatorRetryAttempt(0);
         setCharCreatorError(null);
         break;
 
       } catch (error: any) {
+        clearCharStallTimer();
         if (error.name === 'AbortError' || charAbort.signal.aborted) {
           console.warn('Character creator stream aborted (timeout or cleanup)');
           setMessages(prev => {
