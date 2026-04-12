@@ -1912,7 +1912,8 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         abortControllerRef.current.abort();
       }
       abortControllerRef.current = new AbortController();
-      const signal = abortControllerRef.current.signal;
+      let signal = abortControllerRef.current.signal;
+      let battleStallAborted = false;
 
       const playerIds = Object.keys(room.players);
       const actionsLog = buildBattleActionsLog(room.players);
@@ -2018,19 +2019,21 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         setBattleError(null);
         setRetryAttempt(attempts);
 
+        const BATTLE_STREAM_STALL_MS = 120_000;
+        let battleStreamStallTimer: ReturnType<typeof setTimeout> | null = null;
+        const clearBattleStallTimer = () => { if (battleStreamStallTimer) { clearTimeout(battleStreamStallTimer); battleStreamStallTimer = null; } };
+        const resetBattleStallTimer = () => {
+          clearBattleStallTimer();
+          battleStreamStallTimer = setTimeout(() => {
+            console.warn('[BattleStream] No chunk received in 120s — aborting stalled stream');
+            battleStallAborted = true;
+            abortControllerRef.current?.abort();
+          }, BATTLE_STREAM_STALL_MS);
+        };
+
         try {
           while (true) {
             if (signal.aborted) break;
-            const BATTLE_STREAM_STALL_MS = 120_000;
-            let battleStreamStallTimer: ReturnType<typeof setTimeout> | null = null;
-            const clearBattleStallTimer = () => { if (battleStreamStallTimer) { clearTimeout(battleStreamStallTimer); battleStreamStallTimer = null; } };
-            const resetBattleStallTimer = () => {
-              clearBattleStallTimer();
-              battleStreamStallTimer = setTimeout(() => {
-                console.warn('[BattleStream] No chunk received in 120s — aborting stalled stream');
-                abortControllerRef.current?.abort();
-              }, BATTLE_STREAM_STALL_MS);
-            };
             const responseStream = await aiClient.models.generateContentStream({
               model: settingsRef.current.battleModel,
               contents: contents,
@@ -2216,6 +2219,21 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
             }
           }
         } catch (error: any) {
+          clearBattleStallTimer();
+          // Stall timer abort: retry with a fresh AbortController
+          if (error.name === 'AbortError' && battleStallAborted) {
+            battleStallAborted = false;
+            attempts++;
+            console.warn(`[BattleStream] Stall timeout — retrying (attempt ${attempts})`);
+            abortControllerRef.current = new AbortController();
+            signal = abortControllerRef.current.signal;
+            const delay = getAIRetryDelaySeconds(attempts);
+            setRetryAttempt(attempts);
+            setBattleError(`Model stream stalled. Retrying in ${delay}s...`);
+            upsertBattleStatusLog('battle-retry', `⚠️ Model stream stalled. Retrying in **${delay}s**. Attempt **#${attempts}**...`);
+            await new Promise(resolve => setTimeout(resolve, delay * 1000));
+            continue;
+          }
           if (error.name === 'AbortError') return;
           console.error("Error resolving turn:", error);
 
