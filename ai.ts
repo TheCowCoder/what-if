@@ -18,6 +18,7 @@ export interface AIErrorInfo {
   detail: string;
   statusCode?: number;
   statusText?: string;
+  suggestedRetrySeconds?: number;
 }
 
 interface ErrorPayload {
@@ -67,8 +68,13 @@ const extractStatusText = (message: string): string | undefined => {
   return match?.[1]?.toUpperCase();
 };
 
-const extractMessage = (error: any, payload: ErrorPayload | null, fallback: string): string => {
-  return getString(error?.error?.message) || payload?.message || fallback;
+const extractRetryDelaySeconds = (message: string): number | undefined => {
+  // Look for "Please retry in 6.093s" or "retryDelay": "5s" patterns
+  const retryIn = message.match(/retry in\s+([\d.]+)s/i);
+  if (retryIn) return parseFloat(retryIn[1]);
+  const retryDelay = message.match(/"retryDelay"\s*:\s*"(\d+)s"/);
+  if (retryDelay) return parseInt(retryDelay[1], 10);
+  return undefined;
 };
 
 export const createAIClient = (apiKey?: string): GoogleGenAI => {
@@ -143,6 +149,7 @@ export const classifyAIError = (error: unknown): AIErrorInfo => {
     detail,
     statusCode,
     statusText,
+    suggestedRetrySeconds: retryable ? extractRetryDelaySeconds(rawMessage) : undefined,
   };
 };
 
@@ -153,7 +160,11 @@ export const formatAIError = (errorInfo: AIErrorInfo): string => {
   return `${errorInfo.label}: ${errorInfo.detail}`;
 };
 
-export const getAIRetryDelaySeconds = (attempt: number): number => {
+export const getAIRetryDelaySeconds = (attempt: number, suggestedSeconds?: number): number => {
+  if (suggestedSeconds && suggestedSeconds > 0) {
+    // Use Gemini's suggested delay with ±15% jitter
+    return suggestedSeconds * (0.85 + Math.random() * 0.3);
+  }
   const base = Math.pow(2, Math.min(Math.max(attempt, 1), 6));
   // Add ±25% jitter to stagger concurrent requests (e.g. PvP)
   const jitter = base * (0.75 + Math.random() * 0.5);

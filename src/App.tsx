@@ -1493,7 +1493,7 @@ export default function App() {
             const errorInfo = classifyAIError(err);
             if (!errorInfo.retryable || attempt >= 3) throw err;
             console.warn(`[BotRewrite] Attempt ${attempt + 1} failed: ${errorInfo.label}, retrying...`);
-            await new Promise(r => setTimeout(r, getAIRetryDelaySeconds(attempt + 1) * 1000));
+            await new Promise(r => setTimeout(r, getAIRetryDelaySeconds(attempt + 1, errorInfo.suggestedRetrySeconds) * 1000));
           }
         }
 
@@ -1588,7 +1588,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
           const errorInfo = classifyAIError(err);
           if (!errorInfo.retryable || attempt >= 3) throw err;
           console.warn(`[BotAction] Attempt ${attempt + 1} failed: ${errorInfo.label}, retrying...`);
-          await new Promise(r => setTimeout(r, getAIRetryDelaySeconds(attempt + 1) * 1000));
+          await new Promise(r => setTimeout(r, getAIRetryDelaySeconds(attempt + 1, errorInfo.suggestedRetrySeconds) * 1000));
         }
       }
       
@@ -2248,10 +2248,19 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
 
           if (errorInfo.retryable) {
             attempts++;
-            const delay = getAIRetryDelaySeconds(attempts);
+            if (attempts > 8) {
+              const formattedError = formatAIError(errorInfo);
+              socket.emit('error', `Turn resolution failed after ${attempts} attempts (Model: ${settingsRef.current.battleModel}). ${formattedError}`);
+              setBattleError(formattedError);
+              upsertBattleStatusLog('battle-retry', `⚠️ Gave up after ${attempts} attempts: ${formattedError}`);
+              setRetryAttempt(0);
+              break;
+            }
+            const delay = getAIRetryDelaySeconds(attempts, errorInfo.suggestedRetrySeconds);
+            const delaySec = Math.round(delay);
             setRetryAttempt(attempts);
-            setBattleError(`${errorInfo.label}. Retrying in ${delay}s...`);
-            upsertBattleStatusLog('battle-retry', `⚠️ ${errorInfo.label}. Retrying in **${delay}s**. Attempt **#${attempts}**...`);
+            setBattleError(`${errorInfo.label}. Retrying in ${delaySec}s...`);
+            upsertBattleStatusLog('battle-retry', `⚠️ ${errorInfo.label}. Retrying in **${delaySec}s**. Attempt **#${attempts}**...`);
             await new Promise(resolve => setTimeout(resolve, delay * 1000));
             continue;
           }
@@ -3116,10 +3125,11 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
             return newMsgs;
           });
           attempts++;
-          const delay = getAIRetryDelaySeconds(attempts);
+          const delay = getAIRetryDelaySeconds(attempts, errorInfo.suggestedRetrySeconds);
+          const delaySec = Math.round(delay);
           setCharCreatorRetryAttempt(attempts);
-          setCharCreatorError(`${errorInfo.label}. Retrying in ${delay}s...`);
-          upsertChatStatusMessage('char-creator-retry', `⚠️ ${errorInfo.label}. Retrying in **${delay}s**. Attempt **#${attempts}**...`);
+          setCharCreatorError(`${errorInfo.label}. Retrying in ${delaySec}s...`);
+          upsertChatStatusMessage('char-creator-retry', `⚠️ ${errorInfo.label}. Retrying in **${delaySec}s**. Attempt **#${attempts}**...`);
           await new Promise(resolve => setTimeout(resolve, delay * 1000));
           continue;
         }
