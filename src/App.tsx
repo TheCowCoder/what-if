@@ -367,6 +367,17 @@ const buildPendingBattleActionLog = (playerId: string, action: string): string =
   `${BATTLE_PENDING_ACTION_PREFIX}${playerId}::${action}`
 );
 
+const buildTurnResolutionRequestKey = (room: any): string => {
+  if (typeof room?.resolutionRequestNonce === 'number') {
+    return `${room?.id || 'room'}::nonce:${room.resolutionRequestNonce}`;
+  }
+
+  const actions = Object.entries(room?.players || {})
+    .map(([id, player]: [string, any]) => `${id}:${player?.action || ''}:${player?.lockedIn ? '1' : '0'}`)
+    .join('|');
+  return `${room?.id || 'room'}::${actions}`;
+};
+
 const sanitizeBattleHistoryForJudge = (logs: string[]): string[] => logs.filter(log => (
   !log.startsWith('> **Judge\'s Thoughts:**')
   && !log.startsWith(BATTLE_STREAM_THOUGHTS_PREFIX)
@@ -1191,6 +1202,7 @@ export default function App() {
   const [expandedThoughts, setExpandedThoughts] = useState<Set<number>>(new Set());
   const [expandedExplorationThoughts, setExpandedExplorationThoughts] = useState<Set<string>>(new Set());
   const abortControllerRef = useRef<AbortController | null>(null);
+  const activeTurnResolutionRequestKeyRef = useRef<string | null>(null);
   const [isLockedIn, setIsLockedIn] = useState(false);
   const [roomTypingIds, setRoomTypingIds] = useState<string[]>([]);
   const [localRoomTypingIds, setLocalRoomTypingIds] = useState<string[]>([]);
@@ -1623,6 +1635,11 @@ export default function App() {
     const handleCharacterSynced = () => setIsSynced(true);
     const handleDisconnect = (reason: string) => {
       appendBattleTraceEvent('socket_disconnect', { reason, roomId: roomIdRef.current, gameState: gameStateRef.current });
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+        abortControllerRef.current = null;
+      }
+      activeTurnResolutionRequestKeyRef.current = null;
       closeFullMap();
       setIsSynced(false);
       if (reason === 'io server disconnect') {
@@ -2358,63 +2375,78 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     socket.on('requestTurnResolution', async (room) => {
       if (socket.id !== room.host) return;
 
+      const resolutionRequestKey = buildTurnResolutionRequestKey(room);
+      if (activeTurnResolutionRequestKeyRef.current) {
+        appendBattleTraceEvent('request_turn_resolution_ignored_inflight', {
+          roomId: room.id,
+          activeRequestKey: activeTurnResolutionRequestKeyRef.current,
+          incomingRequestKey: resolutionRequestKey,
+          reissue: !!room.resolutionRequestReissue,
+        });
+        return;
+      }
+      activeTurnResolutionRequestKeyRef.current = resolutionRequestKey;
+
       appendBattleTraceEvent('request_turn_resolution', {
         roomId: room.id,
         playerCount: Object.keys(room.players || {}).length,
         hostId: room.host,
         battleLogCount: battleLogsRef.current.length,
+        requestKey: resolutionRequestKey,
+        reissue: !!room.resolutionRequestReissue,
       });
       
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-      }
-      abortControllerRef.current = new AbortController();
-      let signal = abortControllerRef.current.signal;
-      let battleStallAborted = false;
+      try {
+        if (abortControllerRef.current) {
+          abortControllerRef.current.abort();
+        }
+        abortControllerRef.current = new AbortController();
+        let signal = abortControllerRef.current.signal;
+        let battleStallAborted = false;
 
-      const playerIds = Object.keys(room.players);
-      const actionsLog = buildBattleActionsLog(room.players);
-      const baseLogs = appendBattleLogIfMissing(battleLogsRef.current, actionsLog);
-      setBattleLogs(prev => appendBattleLogIfMissing(prev, actionsLog));
+        const playerIds = Object.keys(room.players);
+        const actionsLog = buildBattleActionsLog(room.players);
+        const baseLogs = appendBattleLogIfMissing(battleLogsRef.current, actionsLog);
+        setBattleLogs(prev => appendBattleLogIfMissing(prev, actionsLog));
 
-      const judgeHistoryLogs = sanitizeBattleHistoryForJudge(baseLogs);
-      const recentNarrativeLogs = extractRecentBattleNarrative(judgeHistoryLogs);
-      const fullLogText = judgeHistoryLogs.join('\n\n');
-      const logLines = fullLogText.split('\n');
-      const totalLines = logLines.length;
+        const judgeHistoryLogs = sanitizeBattleHistoryForJudge(baseLogs);
+        const recentNarrativeLogs = extractRecentBattleNarrative(judgeHistoryLogs);
+        const fullLogText = judgeHistoryLogs.join('\n\n');
+        const logLines = fullLogText.split('\n');
+        const totalLines = logLines.length;
 
-      logBattleDebug('judge_history_prepared', {
-        roomId: room.id,
-        baseLogCount: baseLogs.length,
-        judgeHistoryCount: judgeHistoryLogs.length,
-        recentNarrativeCount: recentNarrativeLogs.length,
-        totalLines,
-        recentNarrativeTail: recentNarrativeLogs.map(summarizeBattleLogEntry),
-      });
+        logBattleDebug('judge_history_prepared', {
+          roomId: room.id,
+          baseLogCount: baseLogs.length,
+          judgeHistoryCount: judgeHistoryLogs.length,
+          recentNarrativeCount: recentNarrativeLogs.length,
+          totalLines,
+          recentNarrativeTail: recentNarrativeLogs.map(summarizeBattleLogEntry),
+        });
 
-      let profiles = "";
-      for (const pid of playerIds) {
-        const pData = room.players[pid];
-        profiles += `Profile for ${pData.character.name}:\n${pData.character.profileMarkdown}\n\n`;
-      }
+        let profiles = "";
+        for (const pid of playerIds) {
+          const pData = room.players[pid];
+          profiles += `Profile for ${pData.character.name}:\n${pData.character.profileMarkdown}\n\n`;
+        }
 
-      const sysPromptRes = await fetch('/api/prompts/battle_judge.txt');
-      const sysPrompt = await sysPromptRes.text();
-      const fullSysPrompt = sysPrompt + "\n\n" + profiles;
+        const sysPromptRes = await fetch('/api/prompts/battle_judge.txt');
+        const sysPrompt = await sysPromptRes.text();
+        const fullSysPrompt = sysPrompt + "\n\n" + profiles;
 
-      let prompt = `BATTLE STATE (TURN START):\n`;
-      for (const pid of playerIds) {
-        const pData = room.players[pid];
-        prompt += `Player (${pData.character.name}):\nHP: ${pData.character.hp}, Mana: ${pData.character.mana}\nAction: ${pData.action}\n\n`;
-      }
-      prompt += buildBattleMapContext(worldDataRef.current, room.mapState, room.players);
-      if (recentNarrativeLogs.length > 0) {
-        prompt += `LATEST RESOLVED BATTLE NARRATIVE:\n${recentNarrativeLogs.join('\n\n')}\n\n`;
-      }
-      prompt += 'The BATTLE MAP STATE above is authoritative. Do not invent new zones, do not remap the battlefield, and do not call any zone-setup tool. Treat the provided named locations and connections as the active combat zones.\n';
-      prompt += `The battle log currently has ${totalLines} lines. You can use the read_battle_history tool to read it if you need context from previous turns. Otherwise, resolve the turn simultaneously. When you call submit_battle_result, include the full markdown turn narration in battleLog. If an action is vague, resolve it as the simplest plausible action for the current distance instead of over-interpreting it.`;
+        let prompt = `BATTLE STATE (TURN START):\n`;
+        for (const pid of playerIds) {
+          const pData = room.players[pid];
+          prompt += `Player (${pData.character.name}):\nHP: ${pData.character.hp}, Mana: ${pData.character.mana}\nAction: ${pData.action}\n\n`;
+        }
+        prompt += buildBattleMapContext(worldDataRef.current, room.mapState, room.players);
+        if (recentNarrativeLogs.length > 0) {
+          prompt += `LATEST RESOLVED BATTLE NARRATIVE:\n${recentNarrativeLogs.join('\n\n')}\n\n`;
+        }
+        prompt += 'The BATTLE MAP STATE above is authoritative. Do not invent new zones, do not remap the battlefield, and do not call any zone-setup tool. Treat the provided named locations and connections as the active combat zones.\n';
+        prompt += `The battle log currently has ${totalLines} lines. You can use the read_battle_history tool to read it if you need context from previous turns. Otherwise, resolve the turn simultaneously. When you call submit_battle_result, include the full markdown turn narration in battleLog. If an action is vague, resolve it as the simplest plausible action for the current distance instead of over-interpreting it.`;
 
-      const readBattleHistory = {
+        const readBattleHistory = {
         name: "read_battle_history",
         description: "Read the battle history markdown log. Provide start and end lines to read a specific section. The log contains all previous turns.",
         parameters: {
@@ -2427,7 +2459,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         }
       };
 
-      const submitBattleResult = {
+        const submitBattleResult = {
         name: "submit_battle_result",
         description: "Submit the updated character states and final markdown battle log after resolving the turn. Always include the full turn narration in battleLog. Include battlePositions whenever movement, pursuit, swimming, sailing, or fleeing changes exact map coordinates.",
         parameters: {
@@ -2450,17 +2482,17 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         }
       };
 
-      const aiClient = getAIClient();
-      let contents: any[] = [{ role: 'user', parts: [{ text: prompt }] }];
-      let hasEmittedStart = false;
-      let finalThoughts = "";
-      let finalAnswer = "";
+        const aiClient = getAIClient();
+        let contents: any[] = [{ role: 'user', parts: [{ text: prompt }] }];
+        let hasEmittedStart = false;
+        let finalThoughts = "";
+        let finalAnswer = "";
 
-      let attempts = 0;
-      clearBattleStatusLog('battle-retry');
-      setBattle503RetryAttempt(0);
+        let attempts = 0;
+        clearBattleStatusLog('battle-retry');
+        setBattle503RetryAttempt(0);
 
-      const buildFallbackBattleNarrative = () => {
+        const buildFallbackBattleNarrative = () => {
         const submittedActions = Object.values(room.players)
           .map((player: any) => `- **${player.character.name}:** ${player.action || 'No action submitted.'}`)
           .join('\n');
@@ -2472,7 +2504,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         ].join('\n');
       };
 
-      while (true) {
+        while (true) {
         if (signal.aborted) break;
         setBattleError(null);
         setRetryAttempt(attempts);
@@ -2833,10 +2865,16 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
           socket.emit('battleRetryStatus', { attempt: 0 });
           break;
         }
+        }
+      } finally {
+        if (activeTurnResolutionRequestKeyRef.current === resolutionRequestKey) {
+          activeTurnResolutionRequestKeyRef.current = null;
+        }
       }
     });
 
     socket.on('turnResolved', (data) => {
+      activeTurnResolutionRequestKeyRef.current = null;
       appendBattleTraceEvent('turn_resolved', {
         roomId: roomIdRef.current,
         playerCount: Object.keys(data.players || {}).length,
@@ -2914,6 +2952,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     });
 
     socket.on('battleEndedByInactivity', (data: { log: string }) => {
+      activeTurnResolutionRequestKeyRef.current = null;
       appendBattleTraceEvent('battle_ended_by_inactivity', {
         roomId: roomIdRef.current,
         logPreview: summarizeBattleLogEntry(data.log),

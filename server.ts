@@ -493,7 +493,7 @@ async function startServer() {
     io.to(roomId).emit("battleActionsSubmitted", { log: payload });
   }
 
-  function requestTurnResolutionIfReady(roomId: string) {
+  function requestTurnResolutionIfReady(roomId: string, options?: { reissue?: boolean }) {
     const room = rooms[roomId];
     if (!room) return;
 
@@ -503,6 +503,11 @@ async function startServer() {
     const allLockedIn = playerIds.every((id) => room.players[id].lockedIn);
     if (!allLockedIn) return;
 
+    const isReissue = !!options?.reissue && !!room.awaitingTurnResolution;
+    if (room.awaitingTurnResolution && !isReissue) {
+      return;
+    }
+
     const now = Date.now();
     if (typeof room.lastResolutionRequestAt === 'number' && now - room.lastResolutionRequestAt < 3_000) {
       return;
@@ -511,8 +516,16 @@ async function startServer() {
     room.lastResolutionRequestAt = now;
     room.awaitingTurnResolution = true;
     clearRoomTimer(roomId);
-    emitBattleActionsSubmitted(roomId, room);
-    io.to(room.host).emit("requestTurnResolution", room);
+    if (!isReissue) {
+      emitBattleActionsSubmitted(roomId, room);
+    }
+
+    room.resolutionRequestNonce = (room.resolutionRequestNonce || 0) + 1;
+    io.to(room.host).emit("requestTurnResolution", {
+      ...room,
+      resolutionRequestNonce: room.resolutionRequestNonce,
+      resolutionRequestReissue: isReissue,
+    });
   }
 
   function endBattleDueToInactivity(roomId: string, room: { players: Record<string, any> }) {
@@ -2357,7 +2370,7 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
           && !room.pendingReadyPlayers;
         if (shouldReissueTurnResolution) {
           delete room.lastResolutionRequestAt;
-          setTimeout(() => requestTurnResolutionIfReady(roomId), 250);
+          setTimeout(() => requestTurnResolutionIfReady(roomId, { reissue: true }), 250);
         }
       }
 
@@ -3292,6 +3305,7 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
       delete room.lastResolutionRequestAt;
       room.awaitingTurnResolution = false;
       delete room.activeBattleStream;
+      delete room.resolutionRequestNonce;
 
       const newState = data.state;
 
