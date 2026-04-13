@@ -115,11 +115,15 @@ type AppSettings = {
   unlimitedTurnTime: boolean;
 };
 
+type ModelSettingsPayload = Pick<AppSettings, 'charModel' | 'explorationModel' | 'battleModel' | 'botModel'>;
+
 const DEFAULT_STARTING_GOLD = 25;
 const BATTLE_STREAM_THOUGHTS_PREFIX = 'STREAMING_THOUGHTS_';
 const BATTLE_STREAM_ANSWER_PREFIX = 'STREAMING_ANSWER_';
 const BATTLE_PLAYER_ACTIONS_PREFIX = 'PLAYER_ACTIONS_';
 const BATTLE_PENDING_ACTION_PREFIX = 'PENDING_PLAYER_ACTION_';
+const BATTLE_TRACE_SAMPLE_INTERVAL_MS = 200;
+const BATTLE_TRACE_MAX_ENTRIES = 2400;
 const VALID_MODEL_OPTIONS = ['gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-2.5-pro', 'gemini-2.5-flash'] as const;
 const DEFAULT_MODEL_SETTINGS = {
   charModel: 'gemini-2.5-flash',
@@ -142,6 +146,14 @@ const sanitizeModelSettings = (value?: Partial<typeof DEFAULT_MODEL_SETTINGS> | 
     ? value.botModel
     : DEFAULT_MODEL_SETTINGS.botModel,
 });
+
+const buildModelSettingsPayload = (value?: Partial<ModelSettingsPayload> | AppSettings | null): ModelSettingsPayload => (
+  sanitizeModelSettings(value)
+);
+
+const getModelSettingsSignature = (value?: Partial<ModelSettingsPayload> | AppSettings | null) => (
+  JSON.stringify(buildModelSettingsPayload(value))
+);
 
 const isServiceUnavailableRetry = (errorInfo?: { statusCode?: number; statusText?: string } | null) => (
   errorInfo?.statusCode === 503 || errorInfo?.statusText === 'UNAVAILABLE'
@@ -291,6 +303,29 @@ const buildInlineImagePartFromDataUrl = (imageUrl?: string | null) => {
   };
 };
 
+const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const extractTransformationCueForCombatant = (narrative: string, combatantName: string): string | null => {
+  const trimmedNarrative = narrative.trim();
+  const trimmedName = combatantName.trim();
+  if (!trimmedNarrative || !trimmedName) return null;
+
+  const escapedName = escapeRegExp(trimmedName);
+  const patterns = [
+    new RegExp(`${escapedName}[^.!?\n]{0,160}\\b(?:turns?|turned|becomes?|became|transforms?|transformed|morphs?|morphed|shapeshifts?|shapeshifted|mutates?|mutated|changes?|changed|polymorphs?|polymorphed)\\b[^.!?\n]{0,180}`, 'i'),
+    new RegExp(`${escapedName}[^.!?\n]{0,160}\\b(?:into|as)\\b[^.!?\n]{0,180}\\b(?:fish|goldfish|frog|toad|wolf|dragon|serpent|bird|eagle|beast|monster|blob|slime|ooze|creature|form)\\b[^.!?\n]{0,120}`, 'i'),
+  ];
+
+  for (const pattern of patterns) {
+    const match = trimmedNarrative.match(pattern);
+    if (match?.[0]) {
+      return match[0].replace(/\s+/g, ' ').trim();
+    }
+  }
+
+  return null;
+};
+
 const buildBattleActionsLog = (roomPlayers: Record<string, any>): string => (
   BATTLE_PLAYER_ACTIONS_PREFIX + Object.keys(roomPlayers)
     .map(pid => `**${roomPlayers[pid].character.name}:** ${roomPlayers[pid].action}`)
@@ -302,13 +337,30 @@ const appendBattleLogIfMissing = (logs: string[], entry: string): string[] => (
 );
 
 const appendBattleImageResultLogs = (logs: string[], actorName: string, imageUrl: string, completionText: string): string[] => {
+  const transientPrefixes = [
+    BATTLE_PENDING_ACTION_PREFIX,
+    BATTLE_PLAYER_ACTIONS_PREFIX,
+    BATTLE_STREAM_THOUGHTS_PREFIX,
+    BATTLE_STREAM_ANSWER_PREFIX,
+    'STATUS_TOOL::',
+  ];
   const withoutImageStatuses = logs.filter(log => (
     !log.startsWith('STATUS_battle-image-pending::')
     && !log.startsWith('STATUS_battle-image-complete::')
   ));
-  const withStatus = appendBattleLogIfMissing(withoutImageStatuses, `STATUS_IMAGE::🎨 **${actorName}** visualized the scene`);
+  let transientStartIndex = withoutImageStatuses.length;
+  while (
+    transientStartIndex > 0
+    && transientPrefixes.some(prefix => withoutImageStatuses[transientStartIndex - 1].startsWith(prefix))
+  ) {
+    transientStartIndex -= 1;
+  }
+  const stableLogs = withoutImageStatuses.slice(0, transientStartIndex);
+  const trailingLogs = withoutImageStatuses.slice(transientStartIndex);
+  const withStatus = appendBattleLogIfMissing(stableLogs, `STATUS_IMAGE::🎨 **${actorName}** visualized the scene`);
   const withImage = appendBattleLogIfMissing(withStatus, `STATUS_IMAGE_URL::${imageUrl}`);
-  return appendBattleLogIfMissing(withImage, `STATUS_battle-image-complete::${completionText}`);
+  const withCompleteStatus = appendBattleLogIfMissing(withImage, `STATUS_battle-image-complete::${completionText}`);
+  return [...withCompleteStatus, ...trailingLogs];
 };
 
 const buildPendingBattleActionLog = (playerId: string, action: string): string => (
@@ -761,6 +813,35 @@ export default function App() {
   const [settingsPage, setSettingsPage] = useState<'general' | 'debug'>('general');
   const settingsRef = useRef(settings);
   const [settingsHydrated, setSettingsHydrated] = useState(false);
+  const initialModelSettingsSignatureRef = useRef(getModelSettingsSignature(settings));
+  const lastSharedModelSettingsSignatureRef = useRef(getModelSettingsSignature(settings));
+
+  const applyRemoteModelSettings = useCallback((incoming: any, options?: { preserveLocalIfChangedFromInitial?: boolean }) => {
+    if (!incoming) return;
+
+    const sanitized = buildModelSettingsPayload(incoming);
+    const incomingSignature = getModelSettingsSignature(sanitized);
+
+    setSettings(prev => {
+      const prevSignature = getModelSettingsSignature(prev);
+      if (prevSignature === incomingSignature) {
+        lastSharedModelSettingsSignatureRef.current = incomingSignature;
+        return prev;
+      }
+
+      if (options?.preserveLocalIfChangedFromInitial && prevSignature !== initialModelSettingsSignatureRef.current) {
+        return prev;
+      }
+
+      lastSharedModelSettingsSignatureRef.current = incomingSignature;
+      return {
+        ...prev,
+        ...sanitized,
+        unlimitedTurnTime: true,
+        apiKey: prev.apiKey,
+      };
+    });
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -773,12 +854,7 @@ export default function App() {
         const remoteSettings = await response.json();
         if (cancelled || !remoteSettings) return;
 
-        setSettings(prev => ({
-          ...prev,
-          ...sanitizeModelSettings(remoteSettings),
-          unlimitedTurnTime: true,
-          apiKey: prev.apiKey,
-        }));
+        applyRemoteModelSettings(remoteSettings, { preserveLocalIfChangedFromInitial: true });
       } catch (error) {
         console.warn('Failed to load shared settings', error);
       } finally {
@@ -793,7 +869,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [applyRemoteModelSettings]);
 
   useEffect(() => {
     if (character) {
@@ -946,6 +1022,7 @@ export default function App() {
 
   const handleSkipBattleImageWait = useCallback(() => {
     battleImageSkipRef.current = true;
+    setBattleImageRetryAttempt(0);
     setBattleImageSkipHintVisible(false);
     clearBattleImageTimers();
     logBattleDebug('image_generation_manually_skipped', {
@@ -1069,19 +1146,24 @@ export default function App() {
   useEffect(() => {
     settingsRef.current = settings;
     localStorage.setItem('duo_settings', JSON.stringify(settings));
-    const modelSettingsPayload = {
-      charModel: settings.charModel,
-      explorationModel: settings.explorationModel,
-      battleModel: settings.battleModel,
-      botModel: settings.botModel,
-    };
+  }, [settings]);
+
+  useEffect(() => {
+    if (!settingsHydrated) {
+      return;
+    }
+
+    const modelSettingsPayload = buildModelSettingsPayload(settings);
+    const modelSettingsSignature = getModelSettingsSignature(modelSettingsPayload);
+
+    if (lastSharedModelSettingsSignatureRef.current === modelSettingsSignature) {
+      return;
+    }
+
+    lastSharedModelSettingsSignatureRef.current = modelSettingsSignature;
 
     if (roomId) {
       socket.emit('updateRoomSettings', modelSettingsPayload);
-    }
-
-    if (!settingsHydrated) {
-      return;
     }
 
     void fetch('/api/settings', {
@@ -1091,7 +1173,7 @@ export default function App() {
     }).catch((error) => {
       console.warn('Failed to persist shared settings', error);
     });
-  }, [roomId, settings, settingsHydrated]);
+  }, [roomId, settings.battleModel, settings.botModel, settings.charModel, settings.explorationModel, settingsHydrated]);
 
   const [players, setPlayers] = useState<Record<string, any>>({});
   const playersRef = useRef<Record<string, any>>({});
@@ -1104,6 +1186,7 @@ export default function App() {
   const [battleError, setBattleError] = useState<string | null>(null);
   const [retryAttempt, setRetryAttempt] = useState(0);
   const [battle503RetryAttempt, setBattle503RetryAttempt] = useState(0);
+  const [battleImageRetryAttempt, setBattleImageRetryAttempt] = useState(0);
   const [bot503RetryAttempt, setBot503RetryAttempt] = useState(0);
   const [expandedThoughts, setExpandedThoughts] = useState<Set<number>>(new Set());
   const [expandedExplorationThoughts, setExpandedExplorationThoughts] = useState<Set<string>>(new Set());
@@ -1122,6 +1205,16 @@ export default function App() {
   const battleImageSkipRef = useRef(false);
   const [battleAutoScroll, setBattleAutoScroll] = useState(true);
   const [allyActedIds, setAllyActedIds] = useState<string[]>([]);
+  const [isBattleTraceRecording, setIsBattleTraceRecording] = useState(false);
+  const [battleTraceEntryCount, setBattleTraceEntryCount] = useState(0);
+  const [battleTraceCopyStatus, setBattleTraceCopyStatus] = useState<{ text: string; tone: 'green' | 'red' } | null>(null);
+  const battleTraceEntriesRef = useRef<string[]>([]);
+  const battleTraceSnapshotRef = useRef<Record<string, unknown>>({});
+  const battleTraceStartMsRef = useRef<number | null>(null);
+  const battleTraceLastSampleMsRef = useRef(0);
+  const battleTraceLoopRef = useRef<number | null>(null);
+  const battleTraceRecordingRef = useRef(false);
+  const battleTraceChunkCountRef = useRef(0);
 
   const [showBotModal, setShowBotModal] = useState(false);
   const [botDifficulty, setBotDifficulty] = useState<number>(1);
@@ -1146,6 +1239,182 @@ export default function App() {
   useEffect(() => { isBotMatchRef.current = isBotMatch; }, [isBotMatch]);
   const difficultyLabels = ['Easy', 'Medium', 'Hard', 'Superintelligent'];
   const avatarSyncKeysRef = useRef<Record<string, string>>({});
+
+  const appendBattleTraceEvent = useCallback((event: string, details: Record<string, unknown> = {}) => {
+    if (!battleTraceRecordingRef.current) return;
+
+    const now = Date.now();
+    const startedAt = battleTraceStartMsRef.current ?? now;
+    if (!battleTraceStartMsRef.current) {
+      battleTraceStartMsRef.current = startedAt;
+    }
+
+    let line: string;
+    try {
+      line = JSON.stringify({
+        t: new Date(now).toISOString(),
+        elapsedMs: now - startedAt,
+        event,
+        ...details,
+      });
+    } catch {
+      line = JSON.stringify({
+        t: new Date(now).toISOString(),
+        elapsedMs: now - startedAt,
+        event,
+        note: 'battle trace serialization failed',
+      });
+    }
+
+    const entries = battleTraceEntriesRef.current;
+    entries.push(line);
+    if (entries.length > BATTLE_TRACE_MAX_ENTRIES) {
+      entries.splice(0, entries.length - BATTLE_TRACE_MAX_ENTRIES);
+    }
+
+    setBattleTraceEntryCount(entries.length);
+  }, []);
+
+  const stopBattleTraceLoop = useCallback(() => {
+    if (battleTraceLoopRef.current !== null) {
+      window.cancelAnimationFrame(battleTraceLoopRef.current);
+      battleTraceLoopRef.current = null;
+    }
+  }, []);
+
+  const handleStartBattleTrace = useCallback(() => {
+    stopBattleTraceLoop();
+    battleTraceEntriesRef.current = [];
+    battleTraceStartMsRef.current = Date.now();
+    battleTraceLastSampleMsRef.current = 0;
+    battleTraceChunkCountRef.current = 0;
+    battleTraceRecordingRef.current = true;
+    setBattleTraceEntryCount(0);
+    setBattleTraceCopyStatus(null);
+    setIsBattleTraceRecording(true);
+    appendBattleTraceEvent('trace_started', {
+      sampleIntervalMs: BATTLE_TRACE_SAMPLE_INTERVAL_MS,
+      snapshot: battleTraceSnapshotRef.current,
+    });
+  }, [appendBattleTraceEvent, stopBattleTraceLoop]);
+
+  const handleStopBattleTrace = useCallback(() => {
+    if (!battleTraceRecordingRef.current) return;
+    appendBattleTraceEvent('trace_stopped', {
+      entryCount: battleTraceEntriesRef.current.length,
+      snapshot: battleTraceSnapshotRef.current,
+    });
+    battleTraceRecordingRef.current = false;
+    setIsBattleTraceRecording(false);
+    stopBattleTraceLoop();
+  }, [appendBattleTraceEvent, stopBattleTraceLoop]);
+
+  const handleCopyBattleTrace = useCallback(async () => {
+    const header = [
+      'BATTLE_TRACE_V1',
+      `capturedAt=${new Date().toISOString()}`,
+      `entryCount=${battleTraceEntriesRef.current.length}`,
+      `sampleIntervalMs=${BATTLE_TRACE_SAMPLE_INTERVAL_MS}`,
+      `recording=${battleTraceRecordingRef.current}`,
+      `socketId=${socket.id || 'none'}`,
+      `roomId=${roomIdRef.current || 'none'}`,
+      `battleModel=${settingsRef.current.battleModel}`,
+      '',
+    ];
+    const text = [...header, ...battleTraceEntriesRef.current].join('\n');
+
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.setAttribute('readonly', 'true');
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.focus();
+        textarea.select();
+        textarea.setSelectionRange(0, text.length);
+        const copied = document.execCommand('copy');
+        document.body.removeChild(textarea);
+        if (!copied) {
+          throw new Error('Clipboard copy failed');
+        }
+      }
+
+      setBattleTraceCopyStatus({ text: `Copied ${battleTraceEntriesRef.current.length} trace lines`, tone: 'green' });
+    } catch (error) {
+      console.error('[BattleTrace] Copy failed', error);
+      setBattleTraceCopyStatus({ text: 'Copy failed on this device/browser', tone: 'red' });
+    }
+  }, []);
+
+  const battleTraceMapPlayersById = new globalThis.Map(battleMapState.players.map(player => [player.id, player]));
+  const activeStreamThoughtLog = battleLogs.find(log => log.startsWith(BATTLE_STREAM_THOUGHTS_PREFIX));
+  const activeStreamAnswerLog = battleLogs.find(log => log.startsWith(BATTLE_STREAM_ANSWER_PREFIX));
+  battleTraceSnapshotRef.current = {
+    socketConnected: socket.connected,
+    socketId: socket.id || null,
+    connectionPhase,
+    gameState,
+    roomId,
+    arenaPreparationStage: arenaPreparation?.stage || null,
+    isLockedIn,
+    battleInputPreview: battleInput.slice(0, 160),
+    battleError,
+    retryAttempt,
+    battle503RetryAttempt,
+    battleImageRetryAttempt,
+    isGeneratingBattleImage,
+    hasVisualizedThisTurn,
+    turnTimerRemaining,
+    showFullMap,
+    roomTypingIds: [...roomTypingIds],
+    localRoomTypingIds: [...localRoomTypingIds],
+    allyActedIds: [...allyActedIds],
+    pendingBattleActionCount: battleLogs.filter(log => log.startsWith(BATTLE_PENDING_ACTION_PREFIX)).length,
+    battleLogCount: battleLogs.length,
+    battleLogTail: battleLogs.slice(-4).map(summarizeBattleLogEntry),
+    streamThoughtLength: activeStreamThoughtLog ? activeStreamThoughtLog.slice(BATTLE_STREAM_THOUGHTS_PREFIX.length).length : 0,
+    streamAnswerLength: activeStreamAnswerLog ? activeStreamAnswerLog.slice(BATTLE_STREAM_ANSWER_PREFIX.length).length : 0,
+    players: Object.values(players).map((player: any) => {
+      const mapPlayer = battleTraceMapPlayersById.get(player.id);
+      return {
+        id: player.id,
+        name: player.character?.name || 'Unknown',
+        hp: player.character?.hp ?? null,
+        mana: player.character?.mana ?? null,
+        lockedIn: !!player.lockedIn,
+        locationId: mapPlayer?.locationId || null,
+        x: typeof mapPlayer?.x === 'number' ? Number(mapPlayer.x.toFixed(1)) : null,
+        y: typeof mapPlayer?.y === 'number' ? Number(mapPlayer.y.toFixed(1)) : null,
+      };
+    }),
+  };
+
+  useEffect(() => {
+    if (!isBattleTraceRecording) return;
+
+    const sample = (now: number) => {
+      if (!battleTraceRecordingRef.current) {
+        battleTraceLoopRef.current = null;
+        return;
+      }
+
+      if (!battleTraceLastSampleMsRef.current || now - battleTraceLastSampleMsRef.current >= BATTLE_TRACE_SAMPLE_INTERVAL_MS) {
+        battleTraceLastSampleMsRef.current = now;
+        appendBattleTraceEvent('sample', battleTraceSnapshotRef.current);
+      }
+
+      battleTraceLoopRef.current = window.requestAnimationFrame(sample);
+    };
+
+    battleTraceLoopRef.current = window.requestAnimationFrame(sample);
+    return () => {
+      stopBattleTraceLoop();
+    };
+  }, [appendBattleTraceEvent, isBattleTraceRecording, stopBattleTraceLoop]);
 
   useEffect(() => {
     playersRef.current = players;
@@ -1353,6 +1622,7 @@ export default function App() {
 
     const handleCharacterSynced = () => setIsSynced(true);
     const handleDisconnect = (reason: string) => {
+      appendBattleTraceEvent('socket_disconnect', { reason, roomId: roomIdRef.current, gameState: gameStateRef.current });
       closeFullMap();
       setIsSynced(false);
       if (reason === 'io server disconnect') {
@@ -1367,24 +1637,32 @@ export default function App() {
     };
     
     const handleReconnectAttempt = () => {
+      appendBattleTraceEvent('socket_reconnect_attempt', { roomId: roomIdRef.current, gameState: gameStateRef.current });
       reconnectRecoveryRef.current = true;
       clearConnectionPhaseTimeout();
       setConnectionPhase('reconnecting');
     };
     
     const handleReconnectError = () => {
+      appendBattleTraceEvent('socket_reconnect_error', { roomId: roomIdRef.current, gameState: gameStateRef.current });
       reconnectRecoveryRef.current = true;
       clearConnectionPhaseTimeout();
       setConnectionPhase('reconnecting');
     };
     
     const handleReconnectFailed = () => {
+      appendBattleTraceEvent('socket_reconnect_failed', { roomId: roomIdRef.current, gameState: gameStateRef.current });
       reconnectRecoveryRef.current = false;
       clearConnectionPhaseTimeout();
       setConnectionPhase('online');
     };
     
     const handleConnect = () => {
+      appendBattleTraceEvent('socket_connect', {
+        recovered: socket.recovered,
+        roomId: roomIdRef.current,
+        reconnectRecovery: reconnectRecoveryRef.current,
+      });
       if (!initialConnectHandledRef.current) {
         initialConnectHandledRef.current = true;
         clearConnectionPhaseTimeout();
@@ -1395,6 +1673,11 @@ export default function App() {
       clearConnectionPhaseTimeout();
       if (reconnectRecoveryRef.current || !socket.recovered) {
         setConnectionPhase('resyncing');
+        appendBattleTraceEvent('resume_session_requested', {
+          recovered: socket.recovered,
+          roomId: roomIdRef.current,
+          gameState: gameStateRef.current,
+        });
         socket.emit('resumeSession');
         return;
       }
@@ -1413,6 +1696,7 @@ export default function App() {
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible' && !socket.connected) {
         console.log('[Visibility] Page visible, socket disconnected — forcing reconnect');
+        appendBattleTraceEvent('visibility_reconnect_forced', { roomId: roomIdRef.current, gameState: gameStateRef.current });
         socket.connect();
       }
     };
@@ -1590,9 +1874,9 @@ export default function App() {
         let response: any = null;
         for (let attempt = 0; attempt < 4; attempt++) {
           if (cancelled) break;
+          const botAbort = new AbortController();
+          const timeout = window.setTimeout(() => botAbort.abort(), 90_000);
           try {
-            const botAbort = new AbortController();
-            const timeout = setTimeout(() => botAbort.abort(), 90_000);
             response = await aiClient.models.generateContent({
               model: settingsRef.current.botModel,
               contents: `You are revising your dueling profile before the arena begins. Keep the same name and return markdown only.\n\nCurrent profile:\n${botPlayer.character.profileMarkdown}\n\nOpponents:\n${opponents}\n\nRefine the profile to better prepare for this duel while preserving identity and formatting.`,
@@ -1601,7 +1885,6 @@ export default function App() {
                 abortSignal: botAbort.signal,
               },
             });
-            clearTimeout(timeout);
             break;
           } catch (err: any) {
             const errorInfo = classifyAIError(err);
@@ -1609,6 +1892,8 @@ export default function App() {
             setBot503RetryAttempt(isServiceUnavailableRetry(errorInfo) ? attempt + 1 : 0);
             console.warn(`[BotRewrite] Attempt ${attempt + 1} failed: ${errorInfo.label}, retrying...`);
             await new Promise(r => setTimeout(r, getAIRetryDelaySeconds(attempt + 1, errorInfo.suggestedRetrySeconds) * 1000));
+          } finally {
+            window.clearTimeout(timeout);
           }
         }
 
@@ -1825,13 +2110,13 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         setArenaPreparation(prev => prev ? { ...prev, stage: data.phase as ArenaPreparationState['stage'] } : prev);
       }
       if (data.modelSettings) {
-        setSettings(prev => ({ ...prev, ...sanitizeModelSettings(data.modelSettings), apiKey: prev.apiKey }));
+        applyRemoteModelSettings(data.modelSettings);
       }
     });
 
     socket.on('roomSettingsUpdated', (modelSettings: any) => {
       if (modelSettings) {
-        setSettings(prev => ({ ...prev, ...sanitizeModelSettings(modelSettings), apiKey: prev.apiKey }));
+        applyRemoteModelSettings(modelSettings);
       }
     });
 
@@ -1884,6 +2169,14 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       const roomSnapshot = payload?.room;
       const explorationSnapshot = payload?.exploration;
       const queueSnapshot = payload?.queue;
+
+      appendBattleTraceEvent('session_resumed', {
+        hasRoom: !!roomSnapshot,
+        hasExploration: !!explorationSnapshot,
+        hasQueue: !!queueSnapshot,
+        roomPhase: roomSnapshot?.phase || null,
+        needsTurnResolution: !!roomSnapshot?.needsTurnResolution,
+      });
 
       if (roomSnapshot) {
         const restoredHistory = Array.isArray(roomSnapshot.history) ? roomSnapshot.history.filter(Boolean) : [];
@@ -2026,11 +2319,21 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     });
 
     socket.on('battleActionsSubmitted', (data: { log: string }) => {
+      appendBattleTraceEvent('battle_actions_submitted', {
+        logPreview: summarizeBattleLogEntry(data.log),
+      });
       setAllyActedIds([]);
-      setBattleLogs(prev => appendBattleLogIfMissing(removePendingBattleActionLogs(prev), data.log));
+      setBattleLogs(prev => {
+        const nextLogs = removePendingBattleActionLogs(prev);
+        return nextLogs[nextLogs.length - 1] === data.log ? nextLogs : [...nextLogs, data.log];
+      });
     });
 
     socket.on('playerLockedIn', (id) => {
+      appendBattleTraceEvent('player_locked_in', {
+        id,
+        name: playersRef.current[id]?.character?.name || null,
+      });
       setPlayers(prev => ({
         ...prev,
         [id]: { ...prev[id], lockedIn: true }
@@ -2038,6 +2341,10 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     });
 
     socket.on('playerUnlocked', (id) => {
+      appendBattleTraceEvent('player_unlocked', {
+        id,
+        name: playersRef.current[id]?.character?.name || null,
+      });
       setPlayers(prev => ({
         ...prev,
         [id]: { ...prev[id], lockedIn: false }
@@ -2050,6 +2357,13 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
 
     socket.on('requestTurnResolution', async (room) => {
       if (socket.id !== room.host) return;
+
+      appendBattleTraceEvent('request_turn_resolution', {
+        roomId: room.id,
+        playerCount: Object.keys(room.players || {}).length,
+        hostId: room.host,
+        battleLogCount: battleLogsRef.current.length,
+      });
       
       if (abortControllerRef.current) {
         abortControllerRef.current.abort();
@@ -2162,6 +2476,11 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         if (signal.aborted) break;
         setBattleError(null);
         setRetryAttempt(attempts);
+        appendBattleTraceEvent('resolver_attempt_started', {
+          roomId: room.id,
+          attempt: attempts,
+          model: settingsRef.current.battleModel,
+        });
 
         const BATTLE_STREAM_STALL_MS = 120_000;
         let battleStreamStallTimer: ReturnType<typeof setTimeout> | null = null;
@@ -2179,6 +2498,12 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
           while (true) {
             if (signal.aborted) break;
             resetBattleStallTimer();
+            appendBattleTraceEvent('resolver_stream_requested', {
+              roomId: room.id,
+              attempt: attempts,
+              contentsCount: contents.length,
+              model: settingsRef.current.battleModel,
+            });
             const responseStream = await aiClient.models.generateContentStream({
               model: settingsRef.current.battleModel,
               contents: contents,
@@ -2199,14 +2524,28 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
             let modelParts = [];
             let streamedThoughts = "";
             let streamedAnswer = "";
+            let emittedFirstChunk = false;
 
             resetBattleStallTimer();
+            appendBattleTraceEvent('resolver_stream_connected', {
+              roomId: room.id,
+              attempt: attempts,
+              model: settingsRef.current.battleModel,
+            });
             let chunkCount = 0;
             for await (const chunk of responseStream) {
               chunkCount++;
               resetBattleStallTimer();
               if (signal.aborted) break;
               const parts = chunk.candidates?.[0]?.content?.parts || [];
+              if (!emittedFirstChunk) {
+                appendBattleTraceEvent('resolver_first_chunk', {
+                  roomId: room.id,
+                  attempt: attempts,
+                  partTypes: parts.map((part: any) => part.functionCall ? 'functionCall' : part.thought ? 'thought' : part.text ? 'text' : 'unknown'),
+                });
+                emittedFirstChunk = true;
+              }
               console.log(`[BattleStream] chunk #${chunkCount}, parts: ${parts.length}, types: [${parts.map((p: any) => p.functionCall ? 'functionCall' : p.thought ? 'thought' : p.text ? 'text' : 'unknown').join(', ')}]`);
               for (const part of parts) {
                 modelParts.push(part);
@@ -2221,6 +2560,10 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
                   if (text) {
                     if (!hasEmittedStart) {
                       socket.emit('streamTurnResolutionStart');
+                      appendBattleTraceEvent('stream_start_emitted', {
+                        roomId: room.id,
+                        attempt: attempts,
+                      });
                       hasEmittedStart = true;
                     }
                     
@@ -2260,6 +2603,12 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
               if (funcName === 'read_battle_history') {
                 const start = Math.max(1, args.startLine || 1);
                 const end = Math.min(totalLines, args.endLine || totalLines);
+                appendBattleTraceEvent('battle_history_tool_called', {
+                  roomId: room.id,
+                  attempt: attempts,
+                  startLine: start,
+                  endLine: end,
+                });
                 const resultText = logLines.slice(start - 1, end).join('\n');
                 socket.emit('streamTurnResolutionChunk', {
                   type: 'tool',
@@ -2307,6 +2656,15 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
                 const toolBattleLog = typeof args.battleLog === 'string' ? args.battleLog.trim() : '';
                 let thoughts = finalThoughts.trim();
                 let markdownLog = toolBattleLog || finalAnswer.trim() || buildFallbackBattleNarrative();
+                appendBattleTraceEvent('submit_turn_resolution_emitted', {
+                  roomId: room.id,
+                  attempt: attempts,
+                  viaTool: true,
+                  hasState: !!newState,
+                  hasMapState: !!resolvedMapState,
+                  battleLogLength: markdownLog.length,
+                  thoughtsLength: thoughts.length,
+                });
                 
                 socket.emit('submitTurnResolution', {
                   log: markdownLog,
@@ -2358,6 +2716,15 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
                 .replace(/<BATTLE_STATE>[\s\S]*?(?:<\/BATTLE_STATE>|$)/, "")
                 .replace(/<BATTLE_POSITIONS>[\s\S]*?(?:<\/BATTLE_POSITIONS>|$)/, "")
                 .trim() || buildFallbackBattleNarrative();
+              appendBattleTraceEvent('submit_turn_resolution_emitted', {
+                roomId: room.id,
+                attempt: attempts,
+                viaTool: false,
+                hasState: !!newState,
+                hasMapState: !!resolvedMapState,
+                battleLogLength: markdownLog.length,
+                thoughtsLength: thoughts.length,
+              });
               
               socket.emit('submitTurnResolution', {
                 log: markdownLog,
@@ -2381,6 +2748,11 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
             battleStallAborted = false;
             attempts++;
             console.warn(`[BattleStream] Stall timeout — retrying (attempt ${attempts})`);
+            appendBattleTraceEvent('resolver_stream_stalled', {
+              roomId: room.id,
+              attempt: attempts,
+              retryDelaySeconds: getAIRetryDelaySeconds(attempts),
+            });
             abortControllerRef.current = new AbortController();
             signal = abortControllerRef.current.signal;
             const delay = getAIRetryDelaySeconds(attempts);
@@ -2393,6 +2765,10 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
             continue;
           }
           if (error.name === 'AbortError') {
+            appendBattleTraceEvent('resolver_aborted', {
+              roomId: room.id,
+              attempt: attempts,
+            });
             setBattle503RetryAttempt(0);
             socket.emit('battleRetryStatus', { attempt: 0 });
             return;
@@ -2405,6 +2781,13 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
             attempts++;
             if (attempts > 8) {
               const formattedError = formatAIError(errorInfo);
+              appendBattleTraceEvent('resolver_retry_gave_up', {
+                roomId: room.id,
+                attempt: attempts,
+                label: errorInfo.label,
+                statusCode: errorInfo.statusCode ?? null,
+                statusText: errorInfo.statusText ?? null,
+              });
               socket.emit('error', `Turn resolution failed after ${attempts} attempts (Model: ${settingsRef.current.battleModel}). ${formattedError}`);
               setBattleError(formattedError);
               upsertBattleStatusLog('battle-retry', `⚠️ Gave up after ${attempts} attempts: ${formattedError}`);
@@ -2415,6 +2798,14 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
             }
             const delay = getAIRetryDelaySeconds(attempts, errorInfo.suggestedRetrySeconds);
             const delaySec = Math.round(delay);
+            appendBattleTraceEvent('resolver_retry_scheduled', {
+              roomId: room.id,
+              attempt: attempts,
+              label: errorInfo.label,
+              delaySeconds: delaySec,
+              statusCode: errorInfo.statusCode ?? null,
+              statusText: errorInfo.statusText ?? null,
+            });
             setRetryAttempt(attempts);
             setBattle503RetryAttempt(isServiceUnavailableRetry(errorInfo) ? attempts : 0);
             socket.emit('battleRetryStatus', isServiceUnavailableRetry(errorInfo)
@@ -2427,6 +2818,13 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
           }
 
           const formattedError = formatAIError(errorInfo);
+          appendBattleTraceEvent('resolver_failed', {
+            roomId: room.id,
+            attempt: attempts,
+            label: errorInfo.label,
+            statusCode: errorInfo.statusCode ?? null,
+            statusText: errorInfo.statusText ?? null,
+          });
           socket.emit('error', `Turn resolution failed (Model: ${settingsRef.current.battleModel}). ${formattedError}`);
           setBattleError(formattedError);
           upsertBattleStatusLog('battle-retry', `⚠️ Battle resolution error: ${formattedError}`);
@@ -2439,6 +2837,13 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     });
 
     socket.on('turnResolved', (data) => {
+      appendBattleTraceEvent('turn_resolved', {
+        roomId: roomIdRef.current,
+        playerCount: Object.keys(data.players || {}).length,
+        hasMapState: !!data.mapState,
+        logLength: typeof data.log === 'string' ? data.log.length : 0,
+        thoughtsLength: typeof data.thoughts === 'string' ? data.thoughts.length : 0,
+      });
       setHasVisualizedThisTurn(false);
       clearBattleStatusLog('battle-resync');
       setBattle503RetryAttempt(0);
@@ -2509,6 +2914,10 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     });
 
     socket.on('battleEndedByInactivity', (data: { log: string }) => {
+      appendBattleTraceEvent('battle_ended_by_inactivity', {
+        roomId: roomIdRef.current,
+        logPreview: summarizeBattleLogEntry(data.log),
+      });
       if (abortControllerRef.current) {
         abortControllerRef.current.abort();
         abortControllerRef.current = null;
@@ -2535,14 +2944,34 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     });
 
     socket.on('streamTurnResolutionStart', () => {
+      battleTraceChunkCountRef.current = 0;
+      appendBattleTraceEvent('stream_start_received', {
+        roomId: roomIdRef.current,
+      });
       setBattleLogs(prev => ensureBattleStreamPlaceholders(prev));
     });
 
     socket.on('battleRetryStatus', (data: { attempt: number; statusCode?: number; statusText?: string }) => {
+      appendBattleTraceEvent('battle_retry_status', {
+        roomId: roomIdRef.current,
+        attempt: data.attempt,
+        statusCode: data.statusCode ?? null,
+        statusText: data.statusText ?? null,
+      });
       setBattle503RetryAttempt(isServiceUnavailableRetry(data) ? data.attempt : 0);
     });
 
     socket.on('streamTurnResolutionChunk', (data: { type: 'thought' | 'answer' | 'tool', text: string }) => {
+      battleTraceChunkCountRef.current += 1;
+      if (battleTraceChunkCountRef.current <= 5 || battleTraceChunkCountRef.current % 20 === 0 || data.type === 'tool') {
+        appendBattleTraceEvent('stream_chunk_received', {
+          roomId: roomIdRef.current,
+          chunkIndex: battleTraceChunkCountRef.current,
+          type: data.type,
+          isRefresh: data.text.startsWith('REFRESH:'),
+          textLength: data.text.length,
+        });
+      }
       setBattleLogs(prev => {
         if (data.type === 'tool') {
           if (data.text.includes('submit_battle_result')) {
@@ -2581,6 +3010,12 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     });
 
     socket.on('battleImageShared', (data: { imageUrl: string; fromName?: string }) => {
+      appendBattleTraceEvent('battle_image_shared_received', {
+        roomId: roomIdRef.current,
+        fromName: data.fromName || null,
+        imageUrlLength: data.imageUrl.length,
+      });
+      setBattleImageRetryAttempt(0);
       logBattleDebug('battle_image_shared_received', {
         roomId: roomIdRef.current,
         fromName: data.fromName || 'Opponent',
@@ -3594,6 +4029,11 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
 
   const handleGenerateBattleImage = async () => {
     if (isGeneratingBattleImage || hasVisualizedThisTurn) {
+      appendBattleTraceEvent('battle_image_generation_skipped', {
+        roomId,
+        isGeneratingBattleImage,
+        hasVisualizedThisTurn,
+      });
       logBattleDebug('image_generation_skipped', {
         roomId,
         isGeneratingBattleImage,
@@ -3603,11 +4043,32 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     }
 
     showBattleImagePendingStatus();
+    setBattleImageRetryAttempt(0);
     setIsGeneratingBattleImage(true);
+    appendBattleTraceEvent('battle_image_generation_started', {
+      roomId: roomIdRef.current || roomId,
+      playerCount: Object.keys(players).length,
+      battleLogCount: battleLogs.length,
+    });
     let generatedImage = false;
     let generatedImageUrlLength = 0;
     let readyReason: string | null = null;
     let completionLabel = 'Continuing without image';
+    let readyScheduled = false;
+    const activeImageRoomId = roomIdRef.current || roomId;
+    const continueWithoutBlocking = (reason: string, label = 'Continuing while image retries') => {
+      if (readyScheduled || battleImageSkipRef.current) return;
+      readyScheduled = true;
+      readyReason = reason;
+      completionLabel = label;
+      appendBattleTraceEvent('battle_image_generation_backgrounded', {
+        roomId: activeImageRoomId,
+        reason,
+        label,
+      });
+      showBattleImageCompleteStatus(label);
+      scheduleReadyForNextTurn(reason, 300);
+    };
     try {
       const aiClient = getAIClient();
       const imageNarrativeLogs = extractRecentBattleNarrative(sanitizeBattleHistoryForJudge(battleLogs));
@@ -3653,26 +4114,55 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       const combatantAnchorSummary = combatantAnchors
         .map((anchor) => `- ${anchor.side}: ${anchor.name} is on ${anchor.islandName} near ${anchor.locationName}.`)
         .join('\n');
+      const transformationCuesByName = new globalThis.Map(orderedCombatants.map((participant: any) => {
+        const participantName = participant.character?.name || 'Combatant';
+        return [participantName, extractTransformationCueForCombatant(recentLogs, participantName)];
+      }));
+      const transformationSummary = orderedCombatants
+        .map((participant: any) => {
+          const participantName = participant.character?.name || 'Combatant';
+          const cue = transformationCuesByName.get(participantName);
+          return cue ? `- ${participantName}: ${cue}` : null;
+        })
+        .filter(Boolean)
+        .join('\n');
       const layoutReferenceDataUrl = await fetchImageAssetAsDataUrl('/image.png');
       const layoutReferencePart = buildInlineImagePartFromDataUrl(layoutReferenceDataUrl);
       const avatarReferenceParts = orderedCombatants
         .flatMap((participant: any, idx: number) => {
+          const participantName = participant.character?.name || 'Combatant';
+          const transformationCue = transformationCuesByName.get(participantName);
+          if (transformationCue) {
+            return [{ text: `${participantName} transformed this turn: ${transformationCue}. The transformed form overrides the portrait anatomy and silhouette. Keep identity and side placement, but render the new form literally.` }];
+          }
           const avatarPart = buildInlineImagePartFromDataUrl(participant.character?.imageUrl);
           if (!avatarPart) return [];
           const side = idx === 0 ? 'LEFT side' : 'RIGHT side';
           return [
-            { text: `Reference avatar for ${participant.character?.name || 'Combatant'} — draw this character on the ${side} of the image and bottom panel.` },
+            { text: `Reference avatar for ${participantName} — use for identity, colors, and face continuity on the ${side} of the image and bottom panel. If the narrative says this character transformed, the transformed form overrides this portrait's anatomy.` },
             avatarPart,
           ];
         });
+      const avatarReferenceImageCount = avatarReferenceParts.filter((part: any) => !!part?.inlineData).length;
       const leftName = (orderedCombatants[0] as any)?.character?.name || 'Combatant 1';
       const rightName = (orderedCombatants[1] as any)?.character?.name || 'Combatant 2';
-      const prompt = `Generate a dynamic battle scene illustration for ${playerNames}. This must be a NEW poster image for the CURRENT turn, not an edit of any previous turn image. Latest resolved battle narrative: ${recentLogs || 'The battle has just begun.'}. Current positions: ${battleLocationSummary || 'Use the active battlefield state.'}. Authoritative battlefield state: ${battleMapImageContext || 'Use the active battlefield state.'}. Style: fantasy RPG battle poster art, dramatic action poses, magical effects, vibrant colors.
+      const prompt = `Generate a dynamic battle scene illustration for ${playerNames}. This must be a NEW poster image for the CURRENT turn, not an edit, continuation, repaint, variation, or touch-up of any previous turn image. Create the scene from scratch for this turn only. Latest resolved battle narrative: ${recentLogs || 'The battle has just begun.'}. Current positions: ${battleLocationSummary || 'Use the active battlefield state.'}. Authoritative battlefield state: ${battleMapImageContext || 'Use the active battlefield state.'}. Style: fantasy RPG battle poster art, dramatic action poses, magical effects, vibrant colors.
 
 This battle image must ALWAYS include cinematic UI text overlays integrated into the art:
 - A bold top headline announcing the battle beat.
 - Small location label text for at least one relevant battlefield location.
 - A bottom split result panel: ${leftName} on the LEFT, ${rightName} on the RIGHT. Each side shows the character's name, a cool icon, the move name, and a short outcome. Match each character to their reference avatar — do NOT swap them.
+
+    Fresh-scene rules:
+    - Render a fresh composition from scratch every turn.
+    - Do NOT reuse the previous turn's camera angle, crop, pose, lighting, background, horizon line, or character staging unless the latest narrative independently requires a similar view.
+    - Do NOT behave like an image editor making small edits to an earlier frame.
+    - The provided poster reference is only a graphic-design template for title/location/result-panel treatment. It is NOT scene content to continue or repaint.
+
+    Transformation rules:
+    - If the latest narrative says a fighter transformed, polymorphed, mutated, or became a creature/object, render the transformed form literally.
+    - In those cases, the portrait reference only preserves identity cues such as side placement, palette, or facial motifs. It must NOT force the old humanoid anatomy, armor silhouette, or body plan.
+    ${transformationSummary || '- No explicit transformation override detected in the latest narrative.'}
 
 Spatial composition requirements:
 ${compositionDirective}
@@ -3692,82 +4182,165 @@ ${combatantAnchorSummary || '- Use the authoritative battlefield state to anchor
         battleMapImageContext,
         compositionDirective,
         combatantAnchors,
+        transformationSummary,
         hasLayoutReference: !!layoutReferencePart,
-        avatarReferenceCount: avatarReferenceParts.length / 2,
+        avatarReferenceCount: avatarReferenceImageCount,
       });
 
       const requestParts: any[] = [{ text: prompt }];
       if (layoutReferencePart) {
-        requestParts.push({ text: 'Layout and typography reference image. Copy its top title, location callout, and bottom result-panel treatment.' });
+        requestParts.push({ text: 'Graphic-design reference only. Copy its title, location-callout, and bottom result-panel treatment. Do not copy its scene, framing, background, or poses.' });
         requestParts.push(layoutReferencePart);
       }
       requestParts.push(...avatarReferenceParts);
-      
-      const response = await aiClient.models.generateContent({
-        model: 'gemini-2.5-flash-image',
-        contents: [{ role: 'user', parts: requestParts }],
-        config: {
-          responseModalities: ['IMAGE', 'TEXT'],
-        },
-      });
+      let attempt = 0;
+      while (!battleImageSkipRef.current && (!activeImageRoomId || roomIdRef.current === activeImageRoomId)) {
+        const battleImageAbort = new AbortController();
+        const battleImageTimeout = window.setTimeout(() => {
+          battleImageAbort.abort();
+        }, 75_000);
 
-      const parts = response.candidates?.[0]?.content?.parts || [];
-      const imageFrames = extractInlineImageFrames(parts);
-      logBattleDebug('image_generation_response', {
-        roomId,
-        partCount: parts.length,
-        imageFrameCount: imageFrames.length,
-        parts: parts.map((part: any) => ({
-          hasInlineData: !!part?.inlineData,
-          mimeType: part?.inlineData?.mimeType || null,
-          textPreview: typeof part?.text === 'string' ? part.text.slice(0, 120) : null,
-        })),
-      });
+        try {
+          const response = await aiClient.models.generateContent({
+            model: 'gemini-2.5-flash-image',
+            contents: [{ role: 'user', parts: requestParts }],
+            config: {
+              responseModalities: ['IMAGE', 'TEXT'],
+              abortSignal: battleImageAbort.signal,
+            },
+          });
 
-      if (imageFrames.length > 0) {
-        const rawImageUrl = imageFrames[imageFrames.length - 1];
-        const imageUrl = await optimizeCharacterAvatar(rawImageUrl);
-        generatedImage = true;
-        generatedImageUrlLength = imageUrl.length;
-        logBattleDebug('image_generation_success', {
-          roomId,
-          rawImageUrlLength: rawImageUrl.length,
-          imageUrlLength: imageUrl.length,
-          imageFrameCount: imageFrames.length,
-          skipped: battleImageSkipRef.current,
-        });
+          const parts = response.candidates?.[0]?.content?.parts || [];
+          const imageFrames = extractInlineImageFrames(parts);
+          logBattleDebug('image_generation_response', {
+            roomId,
+            attempt,
+            partCount: parts.length,
+            imageFrameCount: imageFrames.length,
+            parts: parts.map((part: any) => ({
+              hasInlineData: !!part?.inlineData,
+              mimeType: part?.inlineData?.mimeType || null,
+              textPreview: typeof part?.text === 'string' ? part.text.slice(0, 120) : null,
+            })),
+          });
 
-        if (battleImageSkipRef.current) {
-          return;
+          if (imageFrames.length > 0) {
+            const rawImageUrl = imageFrames[imageFrames.length - 1];
+            const imageUrl = await optimizeCharacterAvatar(rawImageUrl);
+            generatedImage = true;
+            generatedImageUrlLength = imageUrl.length;
+            setBattleImageRetryAttempt(0);
+            appendBattleTraceEvent('battle_image_generation_succeeded', {
+              roomId: activeImageRoomId,
+              attempt,
+              imageFrameCount: imageFrames.length,
+              imageUrlLength: imageUrl.length,
+            });
+            logBattleDebug('image_generation_success', {
+              roomId,
+              attempt,
+              rawImageUrlLength: rawImageUrl.length,
+              imageUrlLength: imageUrl.length,
+              imageFrameCount: imageFrames.length,
+              skipped: battleImageSkipRef.current,
+            });
+
+            if (battleImageSkipRef.current) {
+              return;
+            }
+
+            completionLabel = 'Image ready';
+            if (!readyScheduled) {
+              readyReason = 'image_generation_success';
+            }
+            setBattleLogs(prev => appendBattleImageResultLogs(prev, character?.name || 'You', imageUrl, completionLabel));
+            setHasVisualizedThisTurn(true);
+            if (roomIdRef.current) {
+              socket.emit('shareBattleImage', { roomId: roomIdRef.current, imageUrl });
+            }
+            return;
+          }
+
+          attempt += 1;
+          setBattleImageRetryAttempt(attempt);
+          continueWithoutBlocking('image_generation_background_retry');
+          const delay = getAIRetryDelaySeconds(attempt);
+          const delaySec = Math.round(delay);
+          appendBattleTraceEvent('battle_image_retry_scheduled', {
+            roomId: activeImageRoomId,
+            attempt,
+            delaySeconds: delaySec,
+            reason: 'no_inline_data',
+          });
+          logBattleDebug('image_generation_no_inline_data', {
+            roomId,
+            attempt,
+            partCount: parts.length,
+            imageFrameCount: imageFrames.length,
+            retryDelaySeconds: delaySec,
+          });
+          await new Promise(resolve => window.setTimeout(resolve, delay * 1000));
+          continue;
+        } catch (error: any) {
+          const errorInfo = classifyAIError(error);
+          attempt += 1;
+          setBattleImageRetryAttempt(attempt);
+          continueWithoutBlocking('image_generation_background_retry');
+          const delay = getAIRetryDelaySeconds(attempt, errorInfo.suggestedRetrySeconds);
+          const delaySec = Math.round(delay);
+          console.error("Battle image error:", error);
+          appendBattleTraceEvent('battle_image_retry_scheduled', {
+            roomId: activeImageRoomId,
+            attempt,
+            delaySeconds: delaySec,
+            reason: errorInfo.label,
+            statusCode: errorInfo.statusCode ?? null,
+            statusText: errorInfo.statusText ?? null,
+          });
+          logBattleDebug('image_generation_error', {
+            roomId,
+            attempt,
+            name: error?.name || null,
+            message: error?.message || String(error),
+            retryDelaySeconds: delaySec,
+            statusCode: errorInfo.statusCode,
+            statusText: errorInfo.statusText,
+          });
+          await new Promise(resolve => window.setTimeout(resolve, delay * 1000));
+          continue;
+        } finally {
+          window.clearTimeout(battleImageTimeout);
         }
-
-        completionLabel = 'Image ready';
-        readyReason = 'image_generation_success';
-        setBattleLogs(prev => {
-          return appendBattleImageResultLogs(prev, character?.name || 'You', imageUrl, completionLabel);
-        });
-        setHasVisualizedThisTurn(true);
-        if (roomId) {
-          socket.emit('shareBattleImage', { roomId, imageUrl });
-        }
-        return;
       }
 
-      logBattleDebug('image_generation_no_inline_data', {
-        roomId,
-        partCount: parts.length,
-        imageFrameCount: imageFrames.length,
-      });
+      if (!generatedImage && !readyScheduled && !battleImageSkipRef.current) {
+        readyReason = 'image_generation_fallback';
+      }
     } catch (error: any) {
       console.error("Battle image error:", error);
+      appendBattleTraceEvent('battle_image_generation_failed', {
+        roomId: activeImageRoomId,
+        message: error?.message || String(error),
+      });
       logBattleDebug('image_generation_error', {
         roomId,
         name: error?.name || null,
         message: error?.message || String(error),
       });
+      readyReason = 'image_generation_fallback';
     } finally {
       setIsGeneratingBattleImage(false);
-      if (readyReason) {
+      if (!generatedImage && readyReason && !battleImageSkipRef.current && !readyScheduled) {
+        setBattleImageRetryAttempt(0);
+        showBattleImageCompleteStatus(completionLabel);
+      }
+      if (readyReason && !readyScheduled) {
+        appendBattleTraceEvent('battle_image_ready_for_next_turn_scheduled', {
+          roomId: activeImageRoomId,
+          reason: readyReason,
+          generatedImage,
+          completionLabel,
+        });
         logBattleDebug('ready_for_next_turn_scheduled', {
           roomId,
           reason: readyReason,
@@ -3782,6 +4355,10 @@ ${combatantAnchorSummary || '- Use the authoritative battlefield state to anchor
   handleGenerateBattleImageRef.current = handleGenerateBattleImage;
 
   const handleBattleUnlock = () => {
+    appendBattleTraceEvent('player_action_unlock_requested', {
+      roomId: roomIdRef.current,
+      playerId: socket.id || null,
+    });
     clearTypingPresence('battle');
     socket.emit('playerUnlock');
     setIsLockedIn(false);
@@ -3821,6 +4398,12 @@ ${combatantAnchorSummary || '- Use the authoritative battlefield state to anchor
   const handleSendBattleAction = () => {
     const action = battleInput.trim();
     if (!action || isLockedIn) return;
+    appendBattleTraceEvent('player_action_submitted', {
+      roomId: roomIdRef.current,
+      playerId: socket.id || null,
+      actionLength: action.length,
+      actionPreview: action.slice(0, 160),
+    });
     clearTypingPresence('battle');
 
     const socketId = socket.id;
@@ -3913,7 +4496,10 @@ ${combatantAnchorSummary || '- Use the authoritative battlefield state to anchor
                 <Heart className="w-6 h-6 fill-current" />
                 <span>{hp}</span>
               </div>
-              <button onClick={() => setShowSettings(true)} className="text-duo-gray-dark hover:text-duo-blue transition-colors ml-2">
+              <button onClick={() => {
+                setSettingsPage('general');
+                setShowSettings(true);
+              }} className="text-duo-gray-dark hover:text-duo-blue transition-colors ml-2">
                 <Settings className="w-6 h-6" />
               </button>
             </div>
@@ -3984,6 +4570,7 @@ ${combatantAnchorSummary || '- Use the authoritative battlefield state to anchor
 
   const render503RetryPills = () => {
     const pills = [
+      battleImageRetryAttempt > 0 ? { key: 'battle-image', label: 'Image', attempt: battleImageRetryAttempt } : null,
       charCreator503RetryAttempt > 0 ? { key: 'char-creator', label: '503 Character', attempt: charCreator503RetryAttempt } : null,
       exploration503RetryAttempt > 0 ? { key: 'exploration', label: '503 Explore', attempt: exploration503RetryAttempt } : null,
       battle503RetryAttempt > 0 ? { key: 'battle', label: '503 Battle', attempt: battle503RetryAttempt } : null,
@@ -4647,6 +5234,16 @@ Be creative and concise.`;
             <h1 className="font-black text-sm text-duo-text truncate">{battleTitle}</h1>
           </div>
           <div className="flex items-center gap-2">
+            <button
+              onClick={() => {
+                setSettingsPage('debug');
+                setShowSettings(true);
+              }}
+              className="rounded-full bg-duo-gray/70 p-1.5 text-duo-gray-dark hover:text-duo-text"
+              aria-label="Open battle debug settings"
+            >
+              <Settings className="w-4 h-4" />
+            </button>
             <button
               onClick={() => setShowBattleMeta(prev => !prev)}
               className="rounded-full bg-duo-gray/70 p-1.5 text-duo-gray-dark hover:text-duo-text"
@@ -5340,6 +5937,9 @@ Be creative and concise.`;
         {/* Full-screen map overlay */}
         {showFullMap && (
           <div className="fixed inset-0 z-50 bg-black/60" onClick={closeFullMap}>
+            <button onClick={closeFullMap} className="absolute top-4 right-4 z-[60] bg-white rounded-full p-2 shadow-xl border border-duo-gray">
+              <X className="w-5 h-5" />
+            </button>
             <div 
               className="absolute inset-4 bg-blue-900/95 rounded-3xl border-2 border-duo-gray overflow-hidden"
               style={{ touchAction: 'none' }}
@@ -5457,9 +6057,6 @@ Be creative and concise.`;
                   <Target className="w-3 h-3" /> Center
                 </button>
               </div>
-              <button onClick={closeFullMap} className="absolute top-2 right-2 z-10 bg-white rounded-full p-1.5 shadow">
-                <X className="w-4 h-4" />
-              </button>
               {/* Pannable/zoomable content */}
               <div style={{ transform: `translate(${mapPan.x}px, ${mapPan.y}px) scale(${mapZoom})`, transformOrigin: '0 0', position: 'absolute', inset: 0 }}>
                 {/* Islands */}
@@ -6302,6 +6899,53 @@ Be creative and concise.`;
                     <div className="mt-3 text-[11px] font-bold text-duo-gray-dark">
                       Current state: All arena phase timers are disabled for new rooms.
                     </div>
+                  </div>
+                  <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4">
+                    <div className="flex items-start justify-between gap-4">
+                      <div>
+                        <h4 className="text-sm font-black text-duo-text">Battle Trace Recorder</h4>
+                        <p className="text-xs text-duo-gray-dark mt-1">
+                          Samples battle state every {BATTLE_TRACE_SAMPLE_INTERVAL_MS}ms and tags socket, retry, stream, and image events.
+                        </p>
+                      </div>
+                      <span className={`inline-flex items-center rounded-full px-3 py-1 text-[10px] font-black uppercase ${isBattleTraceRecording ? 'bg-amber-400 text-white' : 'bg-white text-duo-gray-dark border border-amber-200'}`}>
+                        {isBattleTraceRecording ? 'Recording' : 'Idle'}
+                      </span>
+                    </div>
+                    <div className="mt-3 text-[11px] font-bold text-duo-gray-dark space-y-1">
+                      <div>Trace lines: {battleTraceEntryCount}</div>
+                      <div>Use this for the exact "both players submitted, then silence" repro.</div>
+                    </div>
+                    <div className="mt-4 grid grid-cols-3 gap-2">
+                      <button
+                        onClick={handleStartBattleTrace}
+                        className="rounded-xl bg-duo-blue px-3 py-2 text-xs font-black text-white transition-colors hover:bg-duo-blue-light"
+                      >
+                        Start Trace
+                      </button>
+                      <button
+                        onClick={handleStopBattleTrace}
+                        className="rounded-xl bg-duo-gray-dark px-3 py-2 text-xs font-black text-white transition-colors hover:bg-black/80"
+                      >
+                        Stop Trace
+                      </button>
+                      <button
+                        onClick={() => { void handleCopyBattleTrace(); }}
+                        className="rounded-xl bg-amber-400 px-3 py-2 text-xs font-black text-white transition-colors hover:bg-amber-500"
+                      >
+                        Copy Trace
+                      </button>
+                    </div>
+                    {battleTraceCopyStatus && (
+                      <div className={`mt-3 text-[11px] font-bold ${battleTraceCopyStatus.tone === 'green' ? 'text-duo-green-dark' : 'text-red-500'}`}>
+                        {battleTraceCopyStatus.text}
+                      </div>
+                    )}
+                    {battleTraceEntryCount > 0 && (
+                      <pre className="mt-3 max-h-32 overflow-auto rounded-xl bg-black px-3 py-2 text-[10px] font-bold text-amber-100 whitespace-pre-wrap">
+                        {battleTraceEntriesRef.current.slice(-2).join('\n')}
+                      </pre>
+                    )}
                   </div>
                 </div>
               )}

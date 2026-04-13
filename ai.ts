@@ -77,6 +77,21 @@ const extractRetryDelaySeconds = (message: string): number | undefined => {
   return undefined;
 };
 
+const extractMessage = (errorObj: any, payload: ErrorPayload | null, fallback: string): string => {
+  const candidates = [
+    payload?.message,
+    getString(errorObj?.error?.message),
+    getString(errorObj?.details),
+    getString(errorObj?.cause?.message),
+    getString(errorObj?.response?.data?.error?.message),
+    getString(errorObj?.response?.data?.message),
+    getString(errorObj?.response?.statusText),
+    fallback,
+  ];
+
+  return candidates.find((value): value is string => typeof value === 'string' && value.trim().length > 0) || 'Unknown AI error';
+};
+
 export const createAIClient = (apiKey?: string): GoogleGenAI => {
   return new GoogleGenAI({ apiKey, maxRetries: 0 } as GoogleGenAIInit);
 };
