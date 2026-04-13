@@ -1807,7 +1807,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         setLocalRoomTypingIds([]);
         setAllyActedIds([]);
         setHasVisualizedThisTurn(false);
-        setGameState(roomSnapshot.phase === 'arena_prep' ? 'arena_prep' : 'battle');
+        setGameState(roomSnapshot.phase === 'preview' || roomSnapshot.phase === 'tweak' ? 'arena_prep' : 'battle');
 
         logBattleDebug('session_resumed', {
           roomId: roomSnapshot.roomId,
@@ -3688,37 +3688,39 @@ This battle image must ALWAYS include cinematic UI text overlays integrated into
 
     return (
       <div className="sticky top-0 z-20 bg-white border-b-2 border-duo-gray shadow-sm">
-        <div className="px-4 py-3 flex items-center justify-between">
-          <div className="flex items-center gap-2 text-duo-gray-dark font-bold">
-            {(gameState === 'battle' || gameState === 'post_match') && (
-              <button onClick={() => {
-                setGameState('menu');
-                socket.emit('leaveQueue');
-              }} className="mr-1 hover:text-duo-blue transition-colors">
-                <ArrowLeft className="w-6 h-6" />
+        {gameState !== 'battle' && (
+          <div className="px-4 py-3 flex items-center justify-between">
+            <div className="flex items-center gap-2 text-duo-gray-dark font-bold">
+              {gameState === 'post_match' && (
+                <button onClick={() => {
+                  setGameState('menu');
+                  socket.emit('leaveQueue');
+                }} className="mr-1 hover:text-duo-blue transition-colors">
+                  <ArrowLeft className="w-6 h-6" />
+                </button>
+              )}
+              <Shield className="w-6 h-6" />
+              <span className="uppercase text-sm truncate max-w-[120px]">{charName}</span>
+            </div>
+            <div className="flex items-center gap-4 font-bold text-lg">
+              <div className="flex items-center gap-1 text-amber-500">
+                <Coins className="w-6 h-6" />
+                <span>{gold}</span>
+              </div>
+              <div className="flex items-center gap-1 text-fuchsia-600">
+                <Orbit className="w-6 h-6" />
+                <span>{mana}</span>
+              </div>
+              <div className="flex items-center gap-1 text-duo-red">
+                <Heart className="w-6 h-6 fill-current" />
+                <span>{hp}</span>
+              </div>
+              <button onClick={() => setShowSettings(true)} className="text-duo-gray-dark hover:text-duo-blue transition-colors ml-2">
+                <Settings className="w-6 h-6" />
               </button>
-            )}
-            <Shield className="w-6 h-6" />
-            <span className="uppercase text-sm truncate max-w-[120px]">{charName}</span>
+            </div>
           </div>
-          <div className="flex items-center gap-4 font-bold text-lg">
-            <div className="flex items-center gap-1 text-amber-500">
-              <Coins className="w-6 h-6" />
-              <span>{gold}</span>
-            </div>
-            <div className="flex items-center gap-1 text-fuchsia-600">
-              <Orbit className="w-6 h-6" />
-              <span>{mana}</span>
-            </div>
-            <div className="flex items-center gap-1 text-duo-red">
-              <Heart className="w-6 h-6 fill-current" />
-              <span>{hp}</span>
-            </div>
-            <button onClick={() => setShowSettings(true)} className="text-duo-gray-dark hover:text-duo-blue transition-colors ml-2">
-              <Settings className="w-6 h-6" />
-            </button>
-          </div>
-        </div>
+        )}
         {(selfConnectionNotice || participantConnectionNotice) && (
           <div className="px-2 py-1.5 border-t flex flex-wrap items-center justify-center gap-1.5 bg-gray-50/70">
             {selfConnectionNotice && (
@@ -3735,7 +3737,14 @@ This battle image must ALWAYS include cinematic UI text overlays integrated into
         )}
         {gameState === 'battle' && (
           <>
-            <div className="px-4 py-2 border-t border-duo-gray/30 flex flex-wrap gap-2">
+            <div className="px-4 py-2 border-t border-duo-gray/30 flex items-start gap-2">
+              <button onClick={() => {
+                setGameState('menu');
+                socket.emit('leaveQueue');
+              }} className="mt-0.5 text-duo-gray-dark hover:text-duo-blue transition-colors flex-shrink-0">
+                <ArrowLeft className="w-5 h-5" />
+              </button>
+              <div className="flex-1 flex flex-wrap gap-2">
               {Object.keys(players).map(id => {
                 const p = players[id];
                 const isMe = id === socket.id;
@@ -3765,6 +3774,7 @@ This battle image must ALWAYS include cinematic UI text overlays integrated into
                   </div>
                 );
               })}
+              </div>
             </div>
             <div className="px-2 py-1 flex flex-wrap justify-center gap-x-4 gap-y-1 border-t border-duo-gray/50 bg-gray-50/50">
             </div>

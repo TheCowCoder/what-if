@@ -3399,7 +3399,7 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
       const room = roomId ? rooms[roomId] : null;
       const queueState = !!matchmakingQueue[socket.id];
       const hasExplorationState = !!explorationPlayers[socket.id];
-      const hasResumableRoomState = !!room && room.phase === 'battle';
+      const hasResumableRoomState = !!room;
       let explorationInterrupted = false;
 
       if (activeExplorationRequests[socket.id]) {
