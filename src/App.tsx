@@ -1102,7 +1102,7 @@ export default function App() {
   const showBattleImagePendingStatus = useCallback(() => {
     setBattleImageSkipHintVisible(false);
     clearBattleStatusLog('battle-image-complete');
-    upsertBattleStatusLog('battle-image-pending', 'Generating image...');
+    upsertBattleStatusLog('battle-image-pending', 'Generating image... server retries automatically if Gemini is busy.');
   }, [clearBattleStatusLog, upsertBattleStatusLog]);
 
   const showBattleImageCompleteStatus = useCallback((text: string) => {
@@ -1982,31 +1982,15 @@ export default function App() {
           .map(([, player]) => `Opponent: ${player.character.name}\n${player.character.profileMarkdown}`)
           .join('\n\n');
 
-        let response: any = null;
-        for (let attempt = 0; attempt < 4; attempt++) {
-          if (cancelled) break;
-          const botAbort = new AbortController();
-          const timeout = window.setTimeout(() => botAbort.abort(), 90_000);
-          try {
-            response = await aiClient.models.generateContent({
-              model: settingsRef.current.botModel,
-              contents: `You are revising your dueling profile before the arena begins. Keep the same name and return markdown only.\n\nCurrent profile:\n${botPlayer.character.profileMarkdown}\n\nOpponents:\n${opponents}\n\nRefine the profile to better prepare for this duel while preserving identity and formatting.`,
-              config: {
-                temperature: 0.8,
-                abortSignal: botAbort.signal,
-              },
-            });
-            break;
-          } catch (err: any) {
-            const errorInfo = classifyAIError(err);
-            if (!errorInfo.retryable || attempt >= 3) throw err;
-            setBot503RetryAttempt(isServiceUnavailableRetry(errorInfo) ? attempt + 1 : 0);
-            console.warn(`[BotRewrite] Attempt ${attempt + 1} failed: ${errorInfo.label}, retrying...`);
-            await new Promise(r => setTimeout(r, getAIRetryDelaySeconds(attempt + 1, errorInfo.suggestedRetrySeconds) * 1000));
-          } finally {
-            window.clearTimeout(timeout);
-          }
-        }
+        if (cancelled) return;
+
+        const response = await aiClient.models.generateContent({
+          model: settingsRef.current.botModel,
+          contents: `You are revising your dueling profile before the arena begins. Keep the same name and return markdown only.\n\nCurrent profile:\n${botPlayer.character.profileMarkdown}\n\nOpponents:\n${opponents}\n\nRefine the profile to better prepare for this duel while preserving identity and formatting.`,
+          config: {
+            temperature: 0.8,
+          },
+        });
 
         const rewrittenProfile = response?.text?.trim();
         if (!cancelled && rewrittenProfile) {
@@ -2083,30 +2067,14 @@ ${totalLines > 0 ? logLines.slice(Math.max(0, totalLines - 15)).join('\n') : "Th
 
 What is your action? Keep it short and tactical. Remember, you are ${p2Data.character.name}.
 `;
-      let botRes: any = null;
-      for (let attempt = 0; attempt < 4; attempt++) {
-        try {
-          const botAbort = new AbortController();
-          const timeout = setTimeout(() => botAbort.abort(), 90_000);
-          botRes = await aiClient.models.generateContent({
-            model: settingsRef.current.botModel,
-            contents: botPrompt,
-            config: {
-              systemInstruction: botSysPrompt,
-              temperature: 0.8,
-              abortSignal: botAbort.signal,
-            },
-          });
-          clearTimeout(timeout);
-          break;
-        } catch (err: any) {
-          const errorInfo = classifyAIError(err);
-          if (!errorInfo.retryable || attempt >= 3) throw err;
-          setBot503RetryAttempt(isServiceUnavailableRetry(errorInfo) ? attempt + 1 : 0);
-          console.warn(`[BotAction] Attempt ${attempt + 1} failed: ${errorInfo.label}, retrying...`);
-          await new Promise(r => setTimeout(r, getAIRetryDelaySeconds(attempt + 1, errorInfo.suggestedRetrySeconds) * 1000));
-        }
-      }
+      const botRes = await aiClient.models.generateContent({
+        model: settingsRef.current.botModel,
+        contents: botPrompt,
+        config: {
+          systemInstruction: botSysPrompt,
+          temperature: 0.8,
+        },
+      });
       
       const action = botRes?.text || "I do nothing.";
       setBot503RetryAttempt(0);
@@ -3631,7 +3599,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     setIsGeneratingCharImage(true);
     console.log("[Portrait] Starting generation for:", character.name);
     const generationMessageId = `avatar-generation-${character.name}-${Date.now()}`;
-    setMessages(prev => [...prev, { role: 'system', text: '🎨 Generating portrait... this may take a moment.', streamId: generationMessageId }]);
+    setMessages(prev => [...prev, { role: 'system', text: '🎨 Generating portrait... server retries automatically if Gemini is busy.', streamId: generationMessageId }]);
     try {
       const aiClient = getAIClient();
       const prompt = `Generate a fantasy character portrait for: ${character.name}. ${character.profileMarkdown.substring(0, 500)}. Style: detailed digital art, fantasy RPG character portrait, vibrant colors.`;
@@ -3895,18 +3863,12 @@ ${combatantAnchorSummary || '- Use the authoritative battlefield state to anchor
       requestParts.push(...avatarReferenceParts);
       let attempt = 0;
       while (!battleImageSkipRef.current && (!activeImageRoomId || roomIdRef.current === activeImageRoomId)) {
-        const battleImageAbort = new AbortController();
-        const battleImageTimeout = window.setTimeout(() => {
-          battleImageAbort.abort();
-        }, 75_000);
-
         try {
           const response = await aiClient.models.generateContent({
             model: 'gemini-2.5-flash-image',
             contents: [{ role: 'user', parts: requestParts }],
             config: {
               responseModalities: ['IMAGE', 'TEXT'],
-              abortSignal: battleImageAbort.signal,
             },
           });
 
@@ -4011,8 +3973,6 @@ ${combatantAnchorSummary || '- Use the authoritative battlefield state to anchor
           });
           await new Promise(resolve => window.setTimeout(resolve, delay * 1000));
           continue;
-        } finally {
-          window.clearTimeout(battleImageTimeout);
         }
       }
 
