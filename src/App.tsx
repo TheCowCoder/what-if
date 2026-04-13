@@ -266,23 +266,6 @@ const optimizeCharacterAvatar = async (imageUrl: string) => {
   });
 };
 
-const fetchImageAssetAsDataUrl = async (assetPath: string): Promise<string | null> => {
-  try {
-    const response = await fetch(assetPath);
-    if (!response.ok) return null;
-
-    const blob = await response.blob();
-    return await new Promise((resolve) => {
-      const reader = new FileReader();
-      reader.onloadend = () => resolve(typeof reader.result === 'string' ? reader.result : null);
-      reader.onerror = () => resolve(null);
-      reader.readAsDataURL(blob);
-    });
-  } catch {
-    return null;
-  }
-};
-
 const extractInlineImageFrames = (parts: any[]): string[] => parts.flatMap(part => {
   if (!(part as any).inlineData) return [];
   const imageData = (part as any).inlineData;
@@ -3794,8 +3777,6 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         })
         .filter(Boolean)
         .join('\n');
-      const layoutReferenceDataUrl = await fetchImageAssetAsDataUrl('/image.png');
-      const layoutReferencePart = buildInlineImagePartFromDataUrl(layoutReferenceDataUrl);
       const avatarReferenceParts = orderedCombatants
         .flatMap((participant: any, idx: number) => {
           const participantName = participant.character?.name || 'Combatant';
@@ -3814,6 +3795,13 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       const avatarReferenceImageCount = avatarReferenceParts.filter((part: any) => !!part?.inlineData).length;
       const leftName = (orderedCombatants[0] as any)?.character?.name || 'Combatant 1';
       const rightName = (orderedCombatants[1] as any)?.character?.name || 'Combatant 2';
+      const posterLayoutDirective = [
+        '- Build the artwork as a fresh original battle poster for this turn only.',
+        '- Put a bold comic-style headline at the top, but choose a new framing and scene composition from the current narrative instead of imitating any stock layout.',
+        '- Add at least one small floating location callout tied to a real battlefield position from this turn.',
+        `- Add a bottom split result banner with ${leftName} locked on the LEFT and ${rightName} locked on the RIGHT. Each side must show the character name, a strong icon, the move name, and a short outcome.`,
+        '- Keep typography readable and energetic, but do not let the text treatment force repeated camera angles, repeated horizons, or repeated combatant poses.',
+      ].join('\n');
       const prompt = `Generate a dynamic battle scene illustration for ${playerNames}. This must be a NEW poster image for the CURRENT turn, not an edit, continuation, repaint, variation, or touch-up of any previous turn image. Create the scene from scratch for this turn only. Latest resolved battle narrative: ${recentLogs || 'The battle has just begun.'}. Current positions: ${battleLocationSummary || 'Use the active battlefield state.'}. Authoritative battlefield state: ${battleMapImageContext || 'Use the active battlefield state.'}. Style: fantasy RPG battle poster art, dramatic action poses, magical effects, vibrant colors.
 
 This battle image must ALWAYS include cinematic UI text overlays integrated into the art:
@@ -3825,7 +3813,7 @@ This battle image must ALWAYS include cinematic UI text overlays integrated into
     - Render a fresh composition from scratch every turn.
     - Do NOT reuse the previous turn's camera angle, crop, pose, lighting, background, horizon line, or character staging unless the latest narrative independently requires a similar view.
     - Do NOT behave like an image editor making small edits to an earlier frame.
-    - The provided poster reference is only a graphic-design template for title/location/result-panel treatment. It is NOT scene content to continue or repaint.
+    - Do NOT imitate or trace a stock poster sample, prior turn image, or any fixed scene template.
 
     Transformation rules:
     - If the latest narrative says a fighter transformed, polymorphed, mutated, or became a creature/object, render the transformed form literally.
@@ -3836,7 +3824,10 @@ Spatial composition requirements:
 ${compositionDirective}
 ${combatantAnchorSummary || '- Use the authoritative battlefield state to anchor each fighter.'}
 
-    Match the included reference image's poster language: strong comic-style title at the top, small floating location text, and bottom action-result banners with readable typography. Use the reference for layout and typography treatment only. Update all scene content, labels, move names, and locations to reflect THIS turn's narrative and current battlefield positions. Show each character's current equipment and weapons as described in the battle narrative — if a character just acquired a new weapon, they must be holding it.
+Poster layout requirements:
+${posterLayoutDirective}
+
+Update all scene content, labels, move names, and locations to reflect THIS turn's narrative and current battlefield positions. Show each character's current equipment and weapons as described in the battle narrative — if a character just acquired a new weapon, they must be holding it.
 
   Do not invent terrain interactions that are not supported by the latest narrative or authoritative battlefield state. Do not place a combatant in water, waist-deep surf, or shoreline action unless the narrative or current map state explicitly puts them there. If one fighter is farther from the water or behind cover, keep that staging accurate instead of moving them for composition. If the fighters are on different islands, the artwork must clearly show separate islands or a split view; never collapse them onto the same patch of land.`;
 
@@ -3851,15 +3842,11 @@ ${combatantAnchorSummary || '- Use the authoritative battlefield state to anchor
         compositionDirective,
         combatantAnchors,
         transformationSummary,
-        hasLayoutReference: !!layoutReferencePart,
+        posterLayoutMode: 'text-only',
         avatarReferenceCount: avatarReferenceImageCount,
       });
 
       const requestParts: any[] = [{ text: prompt }];
-      if (layoutReferencePart) {
-        requestParts.push({ text: 'Graphic-design reference only. Copy its title, location-callout, and bottom result-panel treatment. Do not copy its scene, framing, background, or poses.' });
-        requestParts.push(layoutReferencePart);
-      }
       requestParts.push(...avatarReferenceParts);
       let attempt = 0;
       while (!battleImageSkipRef.current && (!activeImageRoomId || roomIdRef.current === activeImageRoomId)) {
@@ -5385,6 +5372,11 @@ Be creative and concise.`;
       .filter(npc => discoveredLocationIds.includes(npc.locationId) || npc.followTargetId === socket.id);
     const visiblePlayers = (isBattleMap ? battleMapState.players : worldPlayers)
       .filter(player => player.id !== socket.id);
+    const localPlayerLabel = 'You';
+    const miniSelfAnchorX = currentMapX * miniScaleX;
+    const miniSelfAnchorY = currentMapY * miniScaleY;
+    const fullSelfAnchorX = currentMapX * fullScaleX;
+    const fullSelfAnchorY = currentMapY * fullScaleY;
 
     const miniMarkerLayouts = layoutRepelledMarkers([
       ...discoveredLocations.map((loc: WorldLocation) => ({
@@ -5408,6 +5400,13 @@ Be creative and concise.`;
         width: estimateMarkerLabelWidth(player.name, 20, 58, 3.8),
         height: 14,
       })),
+      {
+        id: 'mini-self',
+        anchorX: miniSelfAnchorX,
+        anchorY: miniSelfAnchorY,
+        width: estimateMarkerLabelWidth(localPlayerLabel, 24, 60, 4.1),
+        height: 16,
+      },
       ...discoveredLocations.map((loc: WorldLocation) => ({
         id: `mini-loc-obstacle-${loc.id}`,
         anchorX: loc.x * miniScaleX,
@@ -5432,6 +5431,14 @@ Be creative and concise.`;
         height: 8,
         fixed: true,
       })),
+      {
+        id: 'mini-self-obstacle',
+        anchorX: miniSelfAnchorX,
+        anchorY: miniSelfAnchorY,
+        width: 10,
+        height: 10,
+        fixed: true,
+      },
       ...(effectiveSpawnMarker ? [{
         id: 'mini-spawn-target-obstacle',
         anchorX: effectiveSpawnMarker.x * miniScaleX,
@@ -5464,6 +5471,13 @@ Be creative and concise.`;
         width: estimateMarkerLabelWidth(player.name, 36, 120, 6.1),
         height: 20,
       })),
+      {
+        id: 'full-self',
+        anchorX: fullSelfAnchorX,
+        anchorY: fullSelfAnchorY,
+        width: estimateMarkerLabelWidth(localPlayerLabel, 54, 126, 7.2),
+        height: 24,
+      },
       ...discoveredLocations.map((loc: WorldLocation) => ({
         id: `full-loc-obstacle-${loc.id}`,
         anchorX: loc.x * fullScaleX,
@@ -5488,6 +5502,14 @@ Be creative and concise.`;
         height: 12,
         fixed: true,
       })),
+      {
+        id: 'full-self-obstacle',
+        anchorX: fullSelfAnchorX,
+        anchorY: fullSelfAnchorY,
+        width: 16,
+        height: 16,
+        fixed: true,
+      },
       ...(effectiveSpawnMarker ? [{
         id: 'full-spawn-target-obstacle',
         anchorX: effectiveSpawnMarker.x * fullScaleX,
@@ -5497,6 +5519,8 @@ Be creative and concise.`;
         fixed: true,
       }] : []),
     ], { width: fullMapW, height: fullMapH });
+    const miniSelfLayout = miniMarkerLayouts['mini-self'] || { x: miniSelfAnchorX, y: miniSelfAnchorY };
+    const fullSelfLayout = fullMarkerLayouts['full-self'] || { x: fullSelfAnchorX, y: fullSelfAnchorY };
 
     const renderMarkerConnector = (anchorX: number, anchorY: number, x: number, y: number, color: string, thickness = 1) => {
       const dx = x - anchorX;
@@ -5626,6 +5650,21 @@ Be creative and concise.`;
                 </React.Fragment>
               );
             })}
+            <React.Fragment>
+              {renderMarkerConnector(miniSelfAnchorX, miniSelfAnchorY, miniSelfLayout.x, miniSelfLayout.y, 'rgba(34, 197, 94, 0.85)', 1.2)}
+              <div
+                className="absolute rounded-full border border-white/90 bg-duo-green shadow-sm pointer-events-none"
+                style={{ left: miniSelfAnchorX, top: miniSelfAnchorY, width: 4, height: 4, transform: 'translate(-50%, -50%)' }}
+              />
+              <div
+                className="absolute flex flex-col items-center pointer-events-none transition-all duration-300 ease-out"
+                style={{ left: miniSelfLayout.x, top: miniSelfLayout.y, transform: 'translate(-50%, -50%)' }}
+              >
+                <span className="rounded-full border border-white/80 bg-duo-green px-1.5 py-[1px] text-[4px] font-black uppercase tracking-[0.16em] text-white shadow-sm whitespace-nowrap">
+                  {localPlayerLabel}
+                </span>
+              </div>
+            </React.Fragment>
             </div>
             {/* Compass */}
             <span className="absolute top-0.5 left-1/2 -translate-x-1/2 text-[8px] font-black text-red-400/80 pointer-events-none">N</span>
@@ -5858,6 +5897,21 @@ Be creative and concise.`;
                     </React.Fragment>
                   );
                 })}
+                <React.Fragment>
+                  {renderMarkerConnector(fullSelfAnchorX, fullSelfAnchorY, fullSelfLayout.x, fullSelfLayout.y, 'rgba(34, 197, 94, 0.9)', 2)}
+                  <div
+                    className="absolute rounded-full border-2 border-white bg-duo-green shadow-lg"
+                    style={{ left: fullSelfAnchorX, top: fullSelfAnchorY, width: 8, height: 8, transform: 'translate(-50%, -50%)' }}
+                  />
+                  <div
+                    className="absolute flex flex-col items-center pointer-events-none transition-all duration-300 ease-out"
+                    style={{ left: fullSelfLayout.x, top: fullSelfLayout.y, transform: 'translate(-50%, -50%)' }}
+                  >
+                    <span className="rounded-full border border-white/80 bg-duo-green px-2 py-0.5 text-[9px] font-black uppercase tracking-[0.18em] text-white shadow-lg whitespace-nowrap">
+                      {localPlayerLabel}
+                    </span>
+                  </div>
+                </React.Fragment>
               </div>
               <div className="absolute bottom-2 left-2 text-[10px] font-bold text-white/50">Scroll to zoom · Drag to pan</div>
               {/* Compass rose */}
