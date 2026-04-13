@@ -3191,6 +3191,12 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
       io.to(roomId).emit('roomSettingsUpdated', room.modelSettings);
     });
 
+    socket.on("battleRetryStatus", (data: { attempt: number; label?: string; delay?: number; statusCode?: number; statusText?: string }) => {
+      const roomId = players[socket.id]?.room;
+      if (!roomId) return;
+      io.to(roomId).emit("battleRetryStatus", data);
+    });
+
     socket.on("playerAction", (payload) => {
       const roomId = players[socket.id]?.room;
       if (!roomId) return;

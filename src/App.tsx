@@ -462,6 +462,7 @@ interface MapMarkerLayoutInput {
   anchorY: number;
   width: number;
   height: number;
+  fixed?: boolean;
 }
 
 interface MapMarkerLayoutPosition {
@@ -650,6 +651,7 @@ const layoutRepelledMarkers = (
     ...marker,
     x: marker.anchorX,
     y: marker.anchorY,
+    fixed: !!marker.fixed,
   }));
 
   for (let iteration = 0; iteration < 36; iteration++) {
@@ -681,6 +683,12 @@ const layoutRepelledMarkers = (
     }
 
     positions.forEach((marker, index) => {
+      if (marker.fixed) {
+        marker.x = marker.anchorX;
+        marker.y = marker.anchorY;
+        return;
+      }
+
       forces[index].x += (marker.anchorX - marker.x) * 0.12;
       forces[index].y += (marker.anchorY - marker.y) * 0.12;
 
@@ -752,7 +760,7 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [settingsPage, setSettingsPage] = useState<'general' | 'debug'>('general');
   const settingsRef = useRef(settings);
-  const settingsHydratedRef = useRef(false);
+  const [settingsHydrated, setSettingsHydrated] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -775,7 +783,7 @@ export default function App() {
         console.warn('Failed to load shared settings', error);
       } finally {
         if (!cancelled) {
-          settingsHydratedRef.current = true;
+          setSettingsHydrated(true);
         }
       }
     };
@@ -990,10 +998,15 @@ export default function App() {
   const [showGoalsModal, setShowGoalsModal] = useState(false);
   const [showAllGoals, setShowAllGoals] = useState(false);
   const [showFullMap, setShowFullMap] = useState(false);
+  const [spawnMarker, setSpawnMarker] = useState<{ locationId: string; x: number; y: number } | null>(null);
   const [mapZoom, setMapZoom] = useState(1);
   const [mapPan, setMapPan] = useState({ x: 0, y: 0 });
   const mapZoomRef = useRef(1);
   const mapDragRef = useRef<{ dragging: boolean; lastX: number; lastY: number }>({ dragging: false, lastX: 0, lastY: 0 });
+  const closeFullMap = useCallback(() => {
+    mapDragRef.current = { dragging: false, lastX: 0, lastY: 0 };
+    setShowFullMap(false);
+  }, []);
   const [showInventory, setShowInventory] = useState(false);
   const [showCharImage, setShowCharImage] = useState(false);
   const [isGeneratingCharImage, setIsGeneratingCharImage] = useState(false);
@@ -1067,7 +1080,7 @@ export default function App() {
       socket.emit('updateRoomSettings', modelSettingsPayload);
     }
 
-    if (!settingsHydratedRef.current) {
+    if (!settingsHydrated) {
       return;
     }
 
@@ -1078,7 +1091,7 @@ export default function App() {
     }).catch((error) => {
       console.warn('Failed to persist shared settings', error);
     });
-  }, [roomId, settings]);
+  }, [roomId, settings, settingsHydrated]);
 
   const [players, setPlayers] = useState<Record<string, any>>({});
   const playersRef = useRef<Record<string, any>>({});
@@ -1340,6 +1353,7 @@ export default function App() {
 
     const handleCharacterSynced = () => setIsSynced(true);
     const handleDisconnect = (reason: string) => {
+      closeFullMap();
       setIsSynced(false);
       if (reason === 'io server disconnect') {
         reconnectRecoveryRef.current = false;
@@ -1414,7 +1428,7 @@ export default function App() {
       socket.io.off('reconnect_error', handleReconnectError);
       socket.io.off('reconnect_failed', handleReconnectFailed);
     };
-  }, [clearConnectionPhaseTimeout]);
+  }, [clearConnectionPhaseTimeout, closeFullMap]);
 
   useEffect(() => {
     const sync = () => {
@@ -1864,6 +1878,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     });
 
     socket.on('sessionResumed', (payload: any) => {
+      closeFullMap();
       reconnectRecoveryRef.current = false;
 
       const roomSnapshot = payload?.room;
@@ -1942,6 +1957,10 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
 
       if (explorationSnapshot) {
         const nextState = explorationSnapshot.state || {};
+        const resumedSpawnLocationId = typeof nextState.locationId === 'string' && Array.isArray(nextState.discoveredLocations) && nextState.discoveredLocations.length > 0
+          ? nextState.discoveredLocations[0]
+          : null;
+        const resumedSpawnLocation = resumedSpawnLocationId ? getWorldLocationById(worldDataRef.current, resumedSpawnLocationId) : null;
         setRoomId(null);
         setArenaPreparation(null);
         syncBattleMapState(null);
@@ -1963,6 +1982,13 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         mergeWorldPlayers(explorationSnapshot.worldPlayers || []);
         setWorldNpcs(explorationSnapshot.npcStates || []);
         setExplorationLockStatus(explorationSnapshot.lockStatus || []);
+        if (resumedSpawnLocationId && resumedSpawnLocation) {
+          setSpawnMarker({
+            locationId: resumedSpawnLocationId,
+            x: resumedSpawnLocation.x,
+            y: resumedSpawnLocation.y,
+          });
+        }
         setIsExplorationLockedIn(false);
         setIsExplorationProcessing(false);
         setGameState('exploration');
@@ -2152,6 +2178,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         try {
           while (true) {
             if (signal.aborted) break;
+            resetBattleStallTimer();
             const responseStream = await aiClient.models.generateContentStream({
               model: settingsRef.current.battleModel,
               contents: contents,
@@ -2290,6 +2317,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
                 clearBattleStatusLog('battle-retry');
                 setRetryAttempt(0);
                 setBattle503RetryAttempt(0);
+                socket.emit('battleRetryStatus', { attempt: 0 });
                 setBattleError(null);
                 return;
               }
@@ -2340,6 +2368,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
               clearBattleStatusLog('battle-retry');
               setRetryAttempt(0);
               setBattle503RetryAttempt(0);
+              socket.emit('battleRetryStatus', { attempt: 0 });
               setBattleError(null);
               return;
             }
@@ -2357,6 +2386,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
             const delay = getAIRetryDelaySeconds(attempts);
             setRetryAttempt(attempts);
             setBattle503RetryAttempt(0);
+            socket.emit('battleRetryStatus', { attempt: 0 });
             setBattleError(`Model stream stalled. Retrying in ${delay}s...`);
             upsertBattleStatusLog('battle-retry', `⚠️ Model stream stalled. Retrying in **${delay}s**. Attempt **#${attempts}**...`);
             await new Promise(resolve => setTimeout(resolve, delay * 1000));
@@ -2364,6 +2394,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
           }
           if (error.name === 'AbortError') {
             setBattle503RetryAttempt(0);
+            socket.emit('battleRetryStatus', { attempt: 0 });
             return;
           }
           console.error("Error resolving turn:", error);
@@ -2379,12 +2410,16 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
               upsertBattleStatusLog('battle-retry', `⚠️ Gave up after ${attempts} attempts: ${formattedError}`);
               setRetryAttempt(0);
               setBattle503RetryAttempt(0);
+              socket.emit('battleRetryStatus', { attempt: 0 });
               break;
             }
             const delay = getAIRetryDelaySeconds(attempts, errorInfo.suggestedRetrySeconds);
             const delaySec = Math.round(delay);
             setRetryAttempt(attempts);
             setBattle503RetryAttempt(isServiceUnavailableRetry(errorInfo) ? attempts : 0);
+            socket.emit('battleRetryStatus', isServiceUnavailableRetry(errorInfo)
+              ? { attempt: attempts, label: errorInfo.label, delay: delaySec, statusCode: errorInfo.statusCode, statusText: errorInfo.statusText }
+              : { attempt: 0 });
             setBattleError(`${errorInfo.label}. Retrying in ${delaySec}s...`);
             upsertBattleStatusLog('battle-retry', `⚠️ ${errorInfo.label}. Retrying in **${delaySec}s**. Attempt **#${attempts}**...`);
             await new Promise(resolve => setTimeout(resolve, delay * 1000));
@@ -2397,6 +2432,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
           upsertBattleStatusLog('battle-retry', `⚠️ Battle resolution error: ${formattedError}`);
           setRetryAttempt(0);
           setBattle503RetryAttempt(0);
+          socket.emit('battleRetryStatus', { attempt: 0 });
           break;
         }
       }
@@ -2405,6 +2441,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     socket.on('turnResolved', (data) => {
       setHasVisualizedThisTurn(false);
       clearBattleStatusLog('battle-resync');
+      setBattle503RetryAttempt(0);
       if (connectionPhaseRef.current === 'resyncing') {
         flashConnectionPhase('reconnected');
       }
@@ -2480,6 +2517,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       setBattleLogs(prev => [...removePendingBattleActionLogs(removeBattleStreamPlaceholders(prev)), data.log]);
       setBattleError(null);
       setRetryAttempt(0);
+      setBattle503RetryAttempt(0);
       setIsLockedIn(false);
       setTurnTimerRemaining(null);
       setRoomId(null);
@@ -2498,6 +2536,10 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
 
     socket.on('streamTurnResolutionStart', () => {
       setBattleLogs(prev => ensureBattleStreamPlaceholders(prev));
+    });
+
+    socket.on('battleRetryStatus', (data: { attempt: number; statusCode?: number; statusText?: string }) => {
+      setBattle503RetryAttempt(isServiceUnavailableRetry(data) ? data.attempt : 0);
     });
 
     socket.on('streamTurnResolutionChunk', (data: { type: 'thought' | 'answer' | 'tool', text: string }) => {
@@ -2578,6 +2620,8 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     });
 
     socket.on('opponentDisconnected', () => {
+      closeFullMap();
+      setBattle503RetryAttempt(0);
       setBattleLogs(prev => [...prev, '**Opponent disconnected.** You win by default!']);
       if (abortControllerRef.current) {
         abortControllerRef.current.abort();
@@ -2615,6 +2659,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
           discoveredLocations: newDiscovered,
         };
       });
+      setSpawnMarker({ locationId: data.locationId, x: data.x, y: data.y });
       mergeWorldPlayers(data.worldPlayers || []);
       setWorldNpcs(data.npcStates || []);
     });
@@ -2923,6 +2968,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       socket.off('requestTurnResolution');
       socket.off('turnResolved');
       socket.off('battleEndedByInactivity');
+      socket.off('battleRetryStatus');
       socket.off('opponentDisconnected');
       socket.off('battleImageShared');
       socket.off('turnTimerTick');
@@ -4991,6 +5037,17 @@ Be creative and concise.`;
     };
     const activeLocationId = activePosition.locationId ?? explorationState.locationId;
     const currentLoc = worldData.locations.find((loc: WorldLocation) => loc.id === activeLocationId) ?? getCurrentLocation();
+    const spawnLocationId = !isBattleMap
+      ? spawnMarker?.locationId || explorationState.discoveredLocations[0] || null
+      : null;
+    const fallbackSpawnLocation = spawnLocationId ? getWorldLocationById(worldData, spawnLocationId) : null;
+    const effectiveSpawnMarker = !isBattleMap && spawnLocationId
+      ? {
+          locationId: spawnLocationId,
+          x: spawnMarker?.x ?? fallbackSpawnLocation?.x ?? 0,
+          y: spawnMarker?.y ?? fallbackSpawnLocation?.y ?? 0,
+        }
+      : null;
     const gridSize = worldData.meta.gridSize;
     const mapW = 140;
     const mapH = 140;
@@ -5050,6 +5107,38 @@ Be creative and concise.`;
         width: estimateMarkerLabelWidth(player.name, 20, 58, 3.8),
         height: 14,
       })),
+      ...discoveredLocations.map((loc: WorldLocation) => ({
+        id: `mini-loc-obstacle-${loc.id}`,
+        anchorX: loc.x * miniScaleX,
+        anchorY: loc.y * miniScaleY,
+        width: loc.id === spawnLocationId ? 12 : 8,
+        height: loc.id === spawnLocationId ? 12 : 8,
+        fixed: true,
+      })),
+      ...visibleNpcs.map(npc => ({
+        id: `mini-npc-obstacle-${npc.id}`,
+        anchorX: npc.x * miniScaleX,
+        anchorY: npc.y * miniScaleY,
+        width: 8,
+        height: 8,
+        fixed: true,
+      })),
+      ...visiblePlayers.map(player => ({
+        id: `mini-player-obstacle-${player.id}`,
+        anchorX: player.x * miniScaleX,
+        anchorY: player.y * miniScaleY,
+        width: 8,
+        height: 8,
+        fixed: true,
+      })),
+      ...(effectiveSpawnMarker ? [{
+        id: 'mini-spawn-target-obstacle',
+        anchorX: effectiveSpawnMarker.x * miniScaleX,
+        anchorY: effectiveSpawnMarker.y * miniScaleY - 6,
+        width: 12,
+        height: 12,
+        fixed: true,
+      }] : []),
     ], { width: mapW, height: mapH });
 
     const fullMarkerLayouts = layoutRepelledMarkers([
@@ -5074,6 +5163,38 @@ Be creative and concise.`;
         width: estimateMarkerLabelWidth(player.name, 36, 120, 6.1),
         height: 20,
       })),
+      ...discoveredLocations.map((loc: WorldLocation) => ({
+        id: `full-loc-obstacle-${loc.id}`,
+        anchorX: loc.x * fullScaleX,
+        anchorY: loc.y * fullScaleY,
+        width: loc.id === spawnLocationId ? 18 : 12,
+        height: loc.id === spawnLocationId ? 18 : 12,
+        fixed: true,
+      })),
+      ...visibleNpcs.map(npc => ({
+        id: `full-npc-obstacle-${npc.id}`,
+        anchorX: npc.x * fullScaleX,
+        anchorY: npc.y * fullScaleY,
+        width: 12,
+        height: 12,
+        fixed: true,
+      })),
+      ...visiblePlayers.map(player => ({
+        id: `full-player-obstacle-${player.id}`,
+        anchorX: player.x * fullScaleX,
+        anchorY: player.y * fullScaleY,
+        width: 12,
+        height: 12,
+        fixed: true,
+      })),
+      ...(effectiveSpawnMarker ? [{
+        id: 'full-spawn-target-obstacle',
+        anchorX: effectiveSpawnMarker.x * fullScaleX,
+        anchorY: effectiveSpawnMarker.y * fullScaleY - 20,
+        width: 22,
+        height: 22,
+        fixed: true,
+      }] : []),
     ], { width: fullMapW, height: fullMapH });
 
     const renderMarkerConnector = (anchorX: number, anchorY: number, x: number, y: number, color: string, thickness = 1) => {
@@ -5132,12 +5253,13 @@ Be creative and concise.`;
               const anchorY = loc.y * miniScaleY;
               const layout = miniMarkerLayouts[`mini-loc-${loc.id}`] || { x: anchorX, y: anchorY };
               const isCurrent = loc.id === activeLocationId;
+              const isSpawn = loc.id === spawnLocationId;
               return (
                 <React.Fragment key={loc.id}>
-                  {renderMarkerConnector(anchorX, anchorY, layout.x, layout.y, isCurrent ? 'rgba(34, 197, 94, 0.75)' : 'rgba(255, 255, 255, 0.45)')}
+                  {renderMarkerConnector(anchorX, anchorY, layout.x, layout.y, isCurrent ? 'rgba(250, 204, 21, 0.75)' : 'rgba(255, 255, 255, 0.45)')}
                   <div
-                    className={`absolute rounded-full pointer-events-none ${isCurrent ? 'bg-duo-green animate-pulse' : 'bg-white/70'}`}
-                    style={{ left: anchorX, top: anchorY, width: isCurrent ? 4 : 3, height: isCurrent ? 4 : 3, transform: 'translate(-50%, -50%)' }}
+                    className={`absolute rounded-full pointer-events-none ${isCurrent ? 'bg-yellow-400' : 'bg-white/70'}`}
+                    style={{ left: anchorX, top: anchorY, width: isSpawn ? 4 : 3, height: isSpawn ? 4 : 3, transform: 'translate(-50%, -50%)' }}
                   />
                   <div
                     className="absolute flex flex-col items-center pointer-events-none transition-all duration-300 ease-out"
@@ -5145,11 +5267,21 @@ Be creative and concise.`;
                     title={loc.name}
                   >
                     <span className="text-[5px] leading-none">{getLocationMarkerGlyph(loc.type)}</span>
-                    <span className={`text-[4px] font-black whitespace-nowrap ${isCurrent ? 'text-duo-green' : 'text-white/80'}`}>{loc.name}</span>
+                    <span className="text-[4px] font-black whitespace-nowrap text-white/80">{loc.name}</span>
                   </div>
                 </React.Fragment>
               );
             })}
+            {effectiveSpawnMarker && (
+              <Target
+                className="absolute w-3 h-3 text-duo-green pointer-events-none"
+                style={{
+                  left: effectiveSpawnMarker.x * miniScaleX,
+                  top: effectiveSpawnMarker.y * miniScaleY - 6,
+                  transform: 'translate(-50%, -50%)',
+                }}
+              />
+            )}
             {visibleNpcs.map(npc => {
               const anchorX = npc.x * miniScaleX;
               const anchorY = npc.y * miniScaleY;
@@ -5194,8 +5326,6 @@ Be creative and concise.`;
               );
             })}
             </div>
-            {/* Center dot for player position */}
-            <div className="absolute rounded-full bg-duo-green shadow-[0_0_10px_rgba(34,197,94,0.75)]" style={{ left: mapW / 2 - 2, top: mapH / 2 - 2, width: 4, height: 4, pointerEvents: 'none' }} />
             {/* Compass */}
             <span className="absolute top-0.5 left-1/2 -translate-x-1/2 text-[8px] font-black text-red-400/80 pointer-events-none">N</span>
             <span className="absolute bottom-0.5 left-1/2 -translate-x-1/2 text-[8px] font-black text-white/50 pointer-events-none">S</span>
@@ -5209,7 +5339,7 @@ Be creative and concise.`;
 
         {/* Full-screen map overlay */}
         {showFullMap && (
-          <div className="fixed inset-0 z-50 bg-black/60" onClick={() => setShowFullMap(false)}>
+          <div className="fixed inset-0 z-50 bg-black/60" onClick={closeFullMap}>
             <div 
               className="absolute inset-4 bg-blue-900/95 rounded-3xl border-2 border-duo-gray overflow-hidden"
               style={{ touchAction: 'none' }}
@@ -5327,7 +5457,7 @@ Be creative and concise.`;
                   <Target className="w-3 h-3" /> Center
                 </button>
               </div>
-              <button onClick={() => setShowFullMap(false)} className="absolute top-2 right-2 z-10 bg-white rounded-full p-1.5 shadow">
+              <button onClick={closeFullMap} className="absolute top-2 right-2 z-10 bg-white rounded-full p-1.5 shadow">
                 <X className="w-4 h-4" />
               </button>
               {/* Pannable/zoomable content */}
@@ -5349,17 +5479,18 @@ Be creative and concise.`;
                   const anchorY = loc.y * fullScaleY;
                   const layout = fullMarkerLayouts[`full-loc-${loc.id}`] || { x: anchorX, y: anchorY };
                   const isCurrent = loc.id === activeLocationId;
+                  const isSpawn = loc.id === spawnLocationId;
                   const isConnected = connectedLocationIds.has(loc.id);
                   return (
                     <React.Fragment key={loc.id}>
-                      {renderMarkerConnector(anchorX, anchorY, layout.x, layout.y, isCurrent ? 'rgba(34, 197, 94, 0.8)' : 'rgba(255, 255, 255, 0.4)', 1.5)}
+                      {renderMarkerConnector(anchorX, anchorY, layout.x, layout.y, isCurrent || isConnected ? 'rgba(250, 204, 21, 0.75)' : 'rgba(255, 255, 255, 0.4)', 1.5)}
                       <div className="absolute" style={{ left: anchorX, top: anchorY, transform: 'translate(-50%, -50%)' }}>
-                        {isCurrent && (
+                        {isSpawn && (
                           <Target className="w-5 h-5 text-duo-green animate-pulse mb-0.5 -translate-x-1/2 -translate-y-full absolute left-1/2 top-0" />
                         )}
                         <div
-                          className={`rounded-full cursor-pointer transition-all ${isCurrent ? 'bg-duo-green ring-2 ring-duo-green/50' : isConnected ? 'bg-yellow-400 hover:bg-yellow-300' : 'bg-white/60'}`}
-                          style={{ width: isCurrent ? 12 : 8, height: isCurrent ? 12 : 8 }}
+                          className={`rounded-full cursor-pointer transition-all ${isCurrent || isConnected ? 'bg-yellow-400 hover:bg-yellow-300' : 'bg-white/60'}`}
+                          style={{ width: isSpawn ? 10 : 8, height: isSpawn ? 10 : 8 }}
                           onClick={() => {
                             if (!isCurrent && isConnected) {
                               if (isBattleMap) {
@@ -5367,13 +5498,13 @@ Be creative and concise.`;
                               } else {
                                 handleExplorationMove(loc.id);
                               }
-                              setShowFullMap(false);
+                              closeFullMap();
                             }
                           }}
                         />
                       </div>
                       <div className="absolute flex flex-col items-center pointer-events-none transition-all duration-300 ease-out" style={{ left: layout.x, top: layout.y, transform: 'translate(-50%, -50%)' }}>
-                        <span className={`text-[8px] font-bold whitespace-nowrap ${isCurrent ? 'text-duo-green' : 'text-white/80'}`}>
+                        <span className="text-[8px] font-bold whitespace-nowrap text-white/80">
                           {getLocationMarkerGlyph(loc.type)} {loc.name}
                         </span>
                         {(loc.npcs?.length > 0 || loc.enemies?.length > 0) && (
@@ -5386,6 +5517,16 @@ Be creative and concise.`;
                     </React.Fragment>
                   );
                 })}
+                {effectiveSpawnMarker && (
+                  <Target
+                    className="absolute w-5 h-5 text-duo-green animate-pulse pointer-events-none"
+                    style={{
+                      left: effectiveSpawnMarker.x * fullScaleX,
+                      top: effectiveSpawnMarker.y * fullScaleY - 20,
+                      transform: 'translate(-50%, -50%)',
+                    }}
+                  />
+                )}
                 {visibleNpcs.map(npc => {
                   const anchorX = npc.x * fullScaleX;
                   const anchorY = npc.y * fullScaleY;
@@ -5401,13 +5542,6 @@ Be creative and concise.`;
                     </React.Fragment>
                   );
                 })}
-                <div
-                  className="absolute flex flex-col items-center pointer-events-none transition-all duration-300 ease-out"
-                  style={{ left: currentMapX * fullScaleX, top: currentMapY * fullScaleY, transform: 'translate(-50%, -50%)' }}
-                >
-                  <div className="rounded-full bg-duo-green ring-4 ring-duo-green/25 shadow-[0_0_18px_rgba(34,197,94,0.65)]" style={{ width: 10, height: 10 }} />
-                  <span className="text-[8px] font-black text-duo-green mt-1 whitespace-nowrap">You</span>
-                </div>
                 {visiblePlayers.map(player => {
                   const anchorX = player.x * fullScaleX;
                   const anchorY = player.y * fullScaleY;
