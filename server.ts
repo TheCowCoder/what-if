@@ -501,7 +501,12 @@ async function startServer() {
 
   app.post('/api/ai/generate', async (req, res) => {
     const abortController = new AbortController();
-    req.on('close', () => abortController.abort());
+    req.on('aborted', () => abortController.abort());
+    res.on('close', () => {
+      if (!res.writableEnded) {
+        abortController.abort();
+      }
+    });
 
     try {
       const response = await generateContentWithRetryWindow(req.body, abortController.signal);
@@ -523,25 +528,94 @@ async function startServer() {
     }
 
     const abortController = new AbortController();
-    req.on('close', () => abortController.abort());
+    req.on('aborted', () => abortController.abort());
+    res.on('close', () => {
+      if (!res.writableEnded) {
+        abortController.abort();
+      }
+    });
 
     res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
 
     try {
+      const debugLabel = typeof req.body?.config?.debugLabel === 'string' && req.body.config.debugLabel.trim()
+        ? req.body.config.debugLabel.trim()
+        : 'ai-generate-stream';
+      console.log('[AI Stream]', {
+        event: 'start',
+        debugLabel,
+        model: req.body?.model,
+      });
       const aiClient = createAIClient(apiKey);
       const requestPayload = buildAIRequestPayload(req.body, abortController.signal);
       const response = await aiClient.models.generateContentStream(requestPayload as any);
+      let chunkCount = 0;
+      let thoughtPartCount = 0;
+      let textPartCount = 0;
+      let functionCallCount = 0;
+      let loggedThoughtOnlyChunk = false;
+      let loggedVisibleChunk = false;
       for await (const chunk of response as any) {
         if (abortController.signal.aborted) {
           break;
         }
+        chunkCount += 1;
+        const parts = chunk?.candidates?.[0]?.content?.parts || [];
+        const thoughtParts = parts.filter((part: any) => !!part?.thought).length;
+        const textParts = parts.filter((part: any) => typeof part?.text === 'string' && part.text.trim()).length;
+        const toolParts = parts.filter((part: any) => !!part?.functionCall).length;
+        thoughtPartCount += thoughtParts;
+        textPartCount += textParts;
+        functionCallCount += toolParts;
+        if (!loggedThoughtOnlyChunk && thoughtParts > 0 && textParts === 0 && toolParts === 0) {
+          loggedThoughtOnlyChunk = true;
+          console.log('[AI Stream]', {
+            event: 'thought_only_chunk',
+            debugLabel,
+            model: req.body?.model,
+            chunkCount,
+          });
+        }
+        if (!loggedVisibleChunk && (textParts > 0 || toolParts > 0)) {
+          loggedVisibleChunk = true;
+          console.log('[AI Stream]', {
+            event: 'first_visible_chunk',
+            debugLabel,
+            model: req.body?.model,
+            chunkCount,
+            textParts,
+            toolParts,
+          });
+        }
         res.write(`${JSON.stringify({ candidates: chunk?.candidates || [] })}\n`);
       }
+      console.log('[AI Stream]', {
+        event: 'end',
+        debugLabel,
+        model: req.body?.model,
+        chunkCount,
+        thoughtPartCount,
+        textPartCount,
+        functionCallCount,
+        aborted: abortController.signal.aborted,
+      });
       res.end();
     } catch (error) {
       const payload = serializeAIError(error);
+      const debugLabel = typeof req.body?.config?.debugLabel === 'string' && req.body.config.debugLabel.trim()
+        ? req.body.config.debugLabel.trim()
+        : 'ai-generate-stream';
+      console.error('[AI Stream]', {
+        event: 'error',
+        debugLabel,
+        model: req.body?.model,
+        statusCode: payload.statusCode,
+        statusText: payload.statusText,
+        error: payload.error,
+        detail: payload.detail,
+      });
       res.write(`${JSON.stringify({ error: payload })}\n`);
       res.end();
     }
@@ -681,7 +755,15 @@ async function startServer() {
   }
 
   function emitBattleActionsSubmitted(roomId: string, room: { players: Record<string, any> }) {
-    const log = Object.keys(room.players)
+    const playerIds = Object.keys(room.players);
+    const orderedPlayerIds = [...playerIds].sort((leftId, rightId) => {
+      const leftSequence = room.players[leftId]?.actionSequence ?? Number.MAX_SAFE_INTEGER;
+      const rightSequence = room.players[rightId]?.actionSequence ?? Number.MAX_SAFE_INTEGER;
+      if (leftSequence !== rightSequence) return leftSequence - rightSequence;
+      return playerIds.indexOf(leftId) - playerIds.indexOf(rightId);
+    });
+
+    const log = orderedPlayerIds
       .map(pid => `**${room.players[pid].character.name}:** ${room.players[pid].action}`)
       .join("\n\n");
 
@@ -753,6 +835,8 @@ async function startServer() {
         room.players[pid].lockedIn = true;
         room.players[pid].autoLockedThisTurn = true;
         room.players[pid].action = `${room.players[pid].character.name} hesitates and takes a defensive stance, bracing for impact.`;
+        room.battleActionSequence = (room.battleActionSequence || 0) + 1;
+        room.players[pid].actionSequence = room.battleActionSequence;
         io.to(roomId).emit("playerLockedIn", pid);
         io.to(roomId).emit("turnTimerAutoLocked", { playerId: pid, playerName: room.players[pid].character.name });
         appendRoomHistory(roomId, `⏰ **${room.players[pid].character.name}** ran out of time and took a defensive stance!`);
@@ -1117,6 +1201,78 @@ async function startServer() {
     && log !== '**Match Found!** The battle begins.'
   )).slice(-2);
 
+  const renderPromptTemplate = (template: string, values: Record<string, string>) => (
+    template.replace(/\{\{([A-Z0-9_]+)\}\}/g, (_match, key) => values[key] ?? '')
+  );
+
+  const buildInlineImagePartFromDataUrl = (imageUrl?: string | null) => {
+    if (!imageUrl || !imageUrl.startsWith('data:image/')) return null;
+
+    const match = imageUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+    if (!match) return null;
+
+    return {
+      inlineData: {
+        mimeType: match[1],
+        data: match[2],
+      },
+    };
+  };
+
+  const extractInlineImageFrames = (parts: any[]): string[] => parts.flatMap(part => {
+    if (!(part as any)?.inlineData) return [];
+    const imageData = (part as any).inlineData;
+    return [`data:${imageData.mimeType};base64,${imageData.data}`];
+  });
+
+  const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  const extractTransformationCueForCombatant = (narrative: string, combatantName: string): string | null => {
+    const trimmedNarrative = narrative.trim();
+    const trimmedName = combatantName.trim();
+    if (!trimmedNarrative || !trimmedName) return null;
+
+    const escapedName = escapeRegExp(trimmedName);
+    const patterns = [
+      new RegExp(`${escapedName}[^.!?\n]{0,160}\\b(?:turns?|turned|becomes?|became|transforms?|transformed|morphs?|morphed|shapeshifts?|shapeshifted|mutates?|mutated|changes?|changed|polymorphs?|polymorphed)\\b[^.!?\n]{0,180}`, 'i'),
+      new RegExp(`${escapedName}[^.!?\n]{0,160}\\b(?:into|as)\\b[^.!?\n]{0,180}\\b(?:fish|goldfish|frog|toad|wolf|dragon|serpent|bird|eagle|beast|monster|blob|slime|ooze|creature|form)\\b[^.!?\n]{0,120}`, 'i'),
+    ];
+
+    for (const pattern of patterns) {
+      const match = trimmedNarrative.match(pattern);
+      if (match?.[0]) {
+        return match[0].replace(/\s+/g, ' ').trim();
+      }
+    }
+
+    return null;
+  };
+
+  const buildTransformationRenderDirective = (combatantName: string, cue: string) => {
+    const loweredCue = cue.toLowerCase();
+
+    if (loweredCue.includes('goldfish')) {
+      return `- ${combatantName}: ${cue}. Mandatory rendering: show a literal goldfish with fins, scales, tail, gills, fish eyes, and true fish anatomy. Not a humanoid, god-form, blob, or abstract magical being.`;
+    }
+    if (loweredCue.includes('fish')) {
+      return `- ${combatantName}: ${cue}. Mandatory rendering: show a literal fish with fins, scales, tail, gills, fish eyes, and true fish anatomy. Not a humanoid, god-form, blob, or abstract magical being.`;
+    }
+    if (loweredCue.includes('frog') || loweredCue.includes('toad')) {
+      return `- ${combatantName}: ${cue}. Mandatory rendering: show a literal frog or toad with amphibian anatomy, limbs, skin texture, and true creature proportions. Not a humanoid, blob, or abstract magical being.`;
+    }
+    if (loweredCue.includes('wolf')) {
+      return `- ${combatantName}: ${cue}. Mandatory rendering: show a literal wolf with canine anatomy, fur, muzzle, paws, and tail. Not a humanoid, blob, or abstract magical being.`;
+    }
+    if (loweredCue.includes('dragon') || loweredCue.includes('serpent')) {
+      return `- ${combatantName}: ${cue}. Mandatory rendering: show the named creature with true monster anatomy. Not a humanoid, blob, or abstract magical being.`;
+    }
+    if (loweredCue.includes('blob') || loweredCue.includes('slime') || loweredCue.includes('ooze')) {
+      return `- ${combatantName}: ${cue}. Mandatory rendering: show the named amorphous form literally, but still make the creature readable and specific instead of turning it into a generic glowing mass.`;
+    }
+
+    return `- ${combatantName}: ${cue}. Mandatory rendering: show the named transformed form literally, not ${combatantName}'s original body and not a vague blob, godlike figure, or abstract magical being.`;
+  };
+
   const buildBattleMapContext = (mapState?: BattleMapState, roomPlayers?: Record<string, any>) => {
     if (!worldData || !mapState || mapState.players.length === 0) return '';
 
@@ -1234,29 +1390,55 @@ async function startServer() {
     delete room.resolutionRequestNonce;
     delete room.battleRetryWindowStartedAt;
     room.battleRetryRestartAvailable = false;
+    room.battleImageSharedThisTurn = false;
+    room.battleActionSequence = 0;
 
     const newState = data.state;
+
+    const resolvedTurnActions = Object.values(room.players || {})
+      .map((player: any) => {
+        const actionText = typeof player?.action === 'string' ? player.action.trim() : '';
+        if (!actionText) return null;
+        return `${player.character?.name || 'Combatant'}: ${actionText}`;
+      })
+      .filter((entry): entry is string => !!entry);
 
     if (newState) {
       for (const pid of Object.keys(room.players)) {
         const charName = room.players[pid].character.name;
         const stateData = newState[charName] || Object.values(newState).find((s: any) => s && typeof s === 'object' && s.name === charName);
 
-        if (stateData) {
-          room.players[pid].character.hp = stateData.hp ?? room.players[pid].character.hp;
-          room.players[pid].character.mana = stateData.mana ?? room.players[pid].character.mana;
-          if (stateData.profileMarkdown) {
-            room.players[pid].character.profileMarkdown = stateData.profileMarkdown;
+        const applyResolvedCharacterState = (incomingState: any) => {
+          if (!incomingState || typeof incomingState !== 'object') return;
+          const nextCharacter = {
+            ...room.players[pid].character,
+          } as Record<string, any>;
+
+          for (const [key, value] of Object.entries(incomingState)) {
+            if (value === undefined || value === null || key === 'imageUrl') continue;
+            nextCharacter[key] = value;
           }
+
+          if (typeof nextCharacter.name === 'string' && nextCharacter.name.trim()) {
+            nextCharacter.name = nextCharacter.name.trim();
+          } else {
+            nextCharacter.name = room.players[pid].character.name;
+          }
+
+          if (!nextCharacter.profileMarkdown) {
+            nextCharacter.profileMarkdown = room.players[pid].character.profileMarkdown;
+          }
+
+          room.players[pid].character = nextCharacter;
+        };
+
+        if (stateData) {
+          applyResolvedCharacterState(stateData);
         } else {
           const pIndex = Object.keys(room.players).indexOf(pid) + 1;
           const fallbackData = newState[`Player${pIndex}`];
           if (fallbackData) {
-            room.players[pid].character.hp = fallbackData.hp ?? room.players[pid].character.hp;
-            room.players[pid].character.mana = fallbackData.mana ?? room.players[pid].character.mana;
-            if (fallbackData.profileMarkdown) {
-              room.players[pid].character.profileMarkdown = fallbackData.profileMarkdown;
-            }
+            applyResolvedCharacterState(fallbackData);
           }
         }
       }
@@ -1270,6 +1452,7 @@ async function startServer() {
       room.players[pid].lockedIn = false;
       room.players[pid].autoLockedThisTurn = false;
       room.players[pid].action = '';
+      delete room.players[pid].actionSequence;
     }
 
     const historyEntries: string[] = [];
@@ -1295,6 +1478,17 @@ async function startServer() {
       historyEntries.push(`**GAME OVER!** ${winner ? winner.character.name : 'No one'} is victorious!`);
     }
     appendRoomHistory(roomId, historyEntries);
+    if (historyEntries.length > 0) {
+      room.battleImageRequestNonce = (room.battleImageRequestNonce || 0) + 1;
+      room.pendingBattleImageRequest = {
+        requestNonce: room.battleImageRequestNonce,
+        turnLog: typeof data.log === 'string' ? data.log : '',
+        actionSummaries: resolvedTurnActions,
+      };
+      if (!room.battleImageTaskActive) {
+        void generateBattleImageForRoom(roomId);
+      }
+    }
 
     if (alivePlayers.length > 1) {
       room.pendingReadyPlayers = new Set(Object.keys(room.players).filter(pid => alivePlayers.some((a: any) => a === room.players[pid])));
@@ -1368,6 +1562,181 @@ async function startServer() {
     io.to(roomId).emit('streamTurnResolutionChunk', { type: 'tool', text });
   };
 
+  async function generateBattleImageForRoom(roomId: string) {
+    const room = rooms[roomId];
+    if (!room || room.battleImageTaskActive || room.battleImageSharedThisTurn || !room.pendingBattleImageRequest) return;
+
+    const apiKey = getBattleResolutionApiKey(room);
+    if (!apiKey) return;
+
+    const imageRequest = room.pendingBattleImageRequest;
+    room.pendingBattleImageRequest = null;
+    room.battleImageTaskActive = true;
+    room.activeBattleImageRequestNonce = imageRequest.requestNonce;
+
+    try {
+      const imageNarrativeLogs = extractRecentBattleNarrative(sanitizeBattleHistoryForJudge(Array.isArray(room.history) ? room.history : []));
+      const latestTurnNarrative = typeof imageRequest?.turnLog === 'string' && imageRequest.turnLog.trim()
+        ? imageRequest.turnLog.trim()
+        : (imageNarrativeLogs[imageNarrativeLogs.length - 1] || imageNarrativeLogs.join('\n\n') || '');
+      const latestTurnActions = Array.isArray(imageRequest?.actionSummaries)
+        ? imageRequest.actionSummaries.filter((entry: unknown): entry is string => typeof entry === 'string' && !!entry.trim()).map((entry: string) => entry.trim())
+        : [];
+      const recentLogs = [
+        latestTurnNarrative || 'The battle has just begun.',
+        latestTurnActions.length > 0
+          ? `Current submitted actions for this resolved turn:\n${latestTurnActions.map((action: string) => `- ${action}`).join('\n')}`
+          : '',
+      ].filter(Boolean).join('\n\n').substring(0, 1200);
+      const playerNames = Object.values(room.players || {}).map((player: any) => player.character?.name || 'Combatant').join(' vs ');
+      const battleMapImageContext = buildBattleMapContext(room.mapState, room.players)
+        .replace('BATTLE MAP STATE:\n', '')
+        .substring(0, 1200);
+      const battleLocationSummary = (room.mapState?.players || []).map((player: any) => {
+        const location = getWorldLocation(player.locationId);
+        const island = getWorldIsland(location?.islandId);
+        const playerName = room.players?.[player.id]?.character?.name || player.name;
+        return `${playerName} is on ${island?.name || location?.islandId || 'an unknown island'}, near ${location?.name || player.locationId} at (${player.x.toFixed(1)}, ${player.y.toFixed(1)})`;
+      }).join('; ');
+
+      const orderedCombatants = Object.values(room.players || {})
+        .filter((player: any) => !player.character?.isNpcAlly)
+        .slice(0, 2);
+      if (orderedCombatants.length === 0) return;
+
+      const combatantAnchors = orderedCombatants.map((participant: any, idx: number) => {
+        const mapPlayer = room.mapState?.players?.find((entry: any) => entry.id === participant.id);
+        const location = getWorldLocation(mapPlayer?.locationId);
+        const island = getWorldIsland(location?.islandId);
+
+        return {
+          side: idx === 0 ? 'LEFT' : 'RIGHT',
+          name: participant.character?.name || `Combatant ${idx + 1}`,
+          locationId: mapPlayer?.locationId || null,
+          locationName: location?.name || mapPlayer?.locationId || 'unknown location',
+          islandId: island?.id || location?.islandId || null,
+          islandName: island?.name || location?.islandId || 'unknown island',
+        };
+      });
+      const leftLocationId = combatantAnchors[0]?.locationId || null;
+      const rightLocationId = combatantAnchors[1]?.locationId || null;
+      const combatantHopDistance = leftLocationId && rightLocationId
+        ? getLocationHopDistance(leftLocationId, rightLocationId)
+        : Number.POSITIVE_INFINITY;
+      const separatedIslands = !!combatantAnchors[0]?.islandId && !!combatantAnchors[1]?.islandId && combatantAnchors[0].islandId !== combatantAnchors[1].islandId;
+      const compositionDirective = separatedIslands
+        ? `COMPOSITION MODE: split view or a wide establishing shot with both islands visible. ${combatantAnchors[0]?.name || 'Combatant 1'} must remain on ${combatantAnchors[0]?.islandName || 'their island'} and ${combatantAnchors[1]?.name || 'Combatant 2'} must remain on ${combatantAnchors[1]?.islandName || 'their island'}. Show visible ocean, distance, or distinct landmasses between them. Do NOT place both fighters on the same ground plane, beach, bridge, arena floor, or cliff.`
+        : combatantHopDistance > 0
+          ? `COMPOSITION MODE: single-island wide view. Both fighters are on ${combatantAnchors[0]?.islandName || 'the same island'} but separated across the terrain. Preserve that distance with a broad island view instead of staging them shoulder-to-shoulder.`
+          : 'COMPOSITION MODE: shared close battlefield. A tighter duel frame is allowed because the combatants are currently close together.';
+      const combatantAnchorSummary = combatantAnchors
+        .map(anchor => `- ${anchor.side}: ${anchor.name} is on ${anchor.islandName} near ${anchor.locationName}.`)
+        .join('\n');
+      const transformationCuesByName = new Map(orderedCombatants.map((participant: any) => {
+        const participantName = participant.character?.name || 'Combatant';
+        return [participantName, extractTransformationCueForCombatant(latestTurnNarrative || recentLogs, participantName)];
+      }));
+      const transformationSummary = orderedCombatants
+        .map((participant: any) => {
+          const participantName = participant.character?.name || 'Combatant';
+          const cue = transformationCuesByName.get(participantName);
+          return cue ? buildTransformationRenderDirective(participantName, cue) : null;
+        })
+        .filter(Boolean)
+        .join('\n');
+
+      const avatarReferenceParts = orderedCombatants.flatMap((participant: any, idx: number) => {
+        const participantName = participant.character?.name || 'Combatant';
+        const transformationCue = transformationCuesByName.get(participantName);
+        if (transformationCue) {
+          return [{ text: buildTransformationRenderDirective(participantName, transformationCue) }];
+        }
+
+        const avatarPart = buildInlineImagePartFromDataUrl(participant.character?.imageUrl);
+        if (!avatarPart) return [];
+        const side = idx === 0 ? 'LEFT side' : 'RIGHT side';
+        return [
+          { text: `Reference avatar for ${participantName} — use for identity, colors, and face continuity on the ${side} of the image and bottom panel. If the narrative says this character transformed, the transformed form overrides this portrait's anatomy.` },
+          avatarPart,
+        ];
+      });
+
+      const leftName = (orderedCombatants[0] as any)?.character?.name || 'Combatant 1';
+      const rightName = (orderedCombatants[1] as any)?.character?.name || 'Combatant 2';
+      const posterLayoutDirective = [
+        '- Build the artwork as a fresh original battle poster for this turn only.',
+        '- Put a bold comic-style headline at the top, but choose a new framing and scene composition from the current narrative instead of imitating any stock layout.',
+        '- Add at least one small floating location callout tied to a real battlefield position from this turn.',
+        `- Add a bottom split result banner with ${leftName} locked on the LEFT and ${rightName} locked on the RIGHT. Each side must show the character name, a strong icon, the move name, and a short outcome.`,
+        '- Keep typography readable and energetic, but do not let the text treatment force repeated camera angles, repeated horizons, or repeated combatant poses.',
+      ].join('\n');
+      const prompt = renderPromptTemplate(getPrompt('battle_image.txt'), {
+        PLAYER_NAMES: playerNames,
+        RECENT_LOGS: recentLogs || 'The battle has just begun.',
+        BATTLE_LOCATION_SUMMARY: battleLocationSummary || 'Use the active battlefield state.',
+        BATTLE_MAP_CONTEXT: battleMapImageContext || 'Use the active battlefield state.',
+        LEFT_NAME: leftName,
+        RIGHT_NAME: rightName,
+        TRANSFORMATION_SUMMARY: transformationSummary || '- No explicit transformation override detected in the latest narrative.',
+        COMPOSITION_DIRECTIVE: compositionDirective,
+        COMBATANT_ANCHOR_SUMMARY: combatantAnchorSummary || '- Use the authoritative battlefield state to anchor each fighter.',
+        POSTER_LAYOUT_DIRECTIVE: posterLayoutDirective,
+      });
+
+      logBattleServerDebug('battle_image_prompt_context', {
+        roomId,
+        latestTurnNarrative: latestTurnNarrative.substring(0, 240),
+        latestTurnActions,
+        playerNames,
+      });
+
+      const response = await generateContentWithRetryWindow({
+        apiKey,
+        model: 'gemini-2.5-flash-image',
+        contents: [{ role: 'user', parts: [{ text: prompt }, ...avatarReferenceParts] }],
+        config: {
+          responseModalities: ['IMAGE', 'TEXT'],
+        },
+      }, new AbortController().signal);
+
+      const parts = (response as any)?.candidates?.[0]?.content?.parts || [];
+      const imageFrames = extractInlineImageFrames(parts);
+      const imageUrl = imageFrames[imageFrames.length - 1];
+      if (!imageUrl) return;
+
+      const activeRoom = rooms[roomId];
+      if (!activeRoom || activeRoom.battleImageSharedThisTurn) return;
+      if (activeRoom.activeBattleImageRequestNonce !== imageRequest.requestNonce) {
+        logBattleServerDebug('battle_image_generation_discarded_stale', {
+          roomId,
+          requestNonce: imageRequest.requestNonce,
+          activeBattleImageRequestNonce: activeRoom.activeBattleImageRequestNonce,
+          pendingBattleImageRequestNonce: activeRoom.pendingBattleImageRequest?.requestNonce || null,
+        });
+        return;
+      }
+      activeRoom.battleImageSharedThisTurn = true;
+      appendBattleMediaLogs(roomId, 'Arena', imageUrl);
+      io.to(roomId).emit('battleImageShared', {
+        fromName: 'Arena',
+        imageUrl,
+      });
+    } catch (error) {
+      logBattleServerDebug('battle_image_generation_failed', {
+        roomId,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      if (rooms[roomId]) {
+        rooms[roomId].battleImageTaskActive = false;
+        delete rooms[roomId].activeBattleImageRequestNonce;
+        if (rooms[roomId].pendingBattleImageRequest && !rooms[roomId].battleImageSharedThisTurn) {
+          void generateBattleImageForRoom(roomId);
+        }
+      }
+    }
+  }
+
   const runBattleTurnResolution = async (roomId: string, options?: { reissue?: boolean }) => {
     const room = rooms[roomId];
     if (!room || room.battleResolutionTaskActive) return;
@@ -1387,7 +1756,13 @@ async function startServer() {
         return;
       }
 
-      const playerIds = Object.keys(room.players || {});
+      const unsortedPlayerIds = Object.keys(room.players || {});
+      const playerIds = [...unsortedPlayerIds].sort((leftId, rightId) => {
+        const leftSequence = room.players[leftId]?.actionSequence ?? Number.MAX_SAFE_INTEGER;
+        const rightSequence = room.players[rightId]?.actionSequence ?? Number.MAX_SAFE_INTEGER;
+        if (leftSequence !== rightSequence) return leftSequence - rightSequence;
+        return unsortedPlayerIds.indexOf(leftId) - unsortedPlayerIds.indexOf(rightId);
+      });
       if (playerIds.length === 0) return;
 
       const baseLogs = sanitizeBattleHistoryForJudge(Array.isArray(room.history) ? room.history : []);
@@ -1461,8 +1836,12 @@ async function startServer() {
       let finalAnswer = '';
       let displayedThoughts = '';
       let displayedAnswer = '';
+      let suppressThoughtStreamAfterRecovery = false;
       let attempts = 0;
       let lastRetryError: any = null;
+      const hasVisibleBattleStreamOutput = () => (
+        displayedThoughts.trim().length > 0 || displayedAnswer.trim().length > 0
+      );
 
       io.to(roomId).emit('battleRetryStatus', { attempt: 0, restartAvailable: false });
       room.battleRetryRestartAvailable = false;
@@ -1524,6 +1903,7 @@ async function startServer() {
               }
 
               if (isThought) {
+                if (suppressThoughtStreamAfterRecovery) return;
                 streamedThoughts += text;
               } else {
                 streamedAnswer += text;
@@ -1572,6 +1952,9 @@ async function startServer() {
               }
 
               const streamErrorInfo = classifyAIError(streamError);
+              if (hasVisibleBattleStreamOutput()) {
+                suppressThoughtStreamAfterRecovery = true;
+              }
               const fallbackRes = await aiClient.models.generateContent({
                 ...apiConfig,
                 model: get503FallbackBattleModel(model, streamErrorInfo, attempts + 1),
@@ -1705,17 +2088,23 @@ async function startServer() {
           }
         } catch (error: any) {
           clearBattleStallTimer();
+          const hadVisibleStreamOutput = hasVisibleBattleStreamOutput();
+          if (hadVisibleStreamOutput) {
+            suppressThoughtStreamAfterRecovery = true;
+          }
 
           if (error?.name === 'AbortError' && battleStallAborted) {
             attempts += 1;
             lastRetryError = { label: 'Model stream stalled' };
             const retryDelay = getAIRetryDelaySeconds(attempts);
-            io.to(roomId).emit('battleRetryStatus', {
-              attempt: 0,
-              label: 'Model stream stalled',
-              delay: Math.round(retryDelay),
-              restartAvailable: false,
-            });
+            if (!hadVisibleStreamOutput) {
+              io.to(roomId).emit('battleRetryStatus', {
+                attempt: attempts,
+                label: 'Model stream stalled',
+                delay: Math.round(retryDelay),
+                restartAvailable: false,
+              });
+            }
             await new Promise(resolve => setTimeout(resolve, retryDelay * 1000));
             continue;
           }
@@ -1750,7 +2139,7 @@ async function startServer() {
           if (remainingMs <= 0) {
             activeRoom.battleRetryRestartAvailable = true;
             io.to(roomId).emit('battleRetryStatus', {
-              attempt: attempts,
+              attempt: hadVisibleStreamOutput ? 0 : attempts,
               label: errorInfo.label,
               statusCode: errorInfo.statusCode,
               statusText: errorInfo.statusText,
@@ -1765,14 +2154,16 @@ async function startServer() {
             Math.max(1, remainingMs / 1000),
           );
           activeRoom.battleRetryRestartAvailable = false;
-          io.to(roomId).emit('battleRetryStatus', {
-            attempt: attempts,
-            label: errorInfo.label,
-            delay: Math.round(retryDelay),
-            statusCode: errorInfo.statusCode,
-            statusText: errorInfo.statusText,
-            restartAvailable: false,
-          });
+          if (!hadVisibleStreamOutput) {
+            io.to(roomId).emit('battleRetryStatus', {
+              attempt: attempts,
+              label: errorInfo.label,
+              delay: Math.round(retryDelay),
+              statusCode: errorInfo.statusCode,
+              statusText: errorInfo.statusText,
+              restartAvailable: false,
+            });
+          }
           await new Promise(resolve => setTimeout(resolve, retryDelay * 1000));
           continue;
         }
@@ -1988,6 +2379,8 @@ async function startServer() {
     room.players[playerId].lockedIn = true;
     room.players[playerId].autoLockedThisTurn = false;
     room.players[playerId].action = actionText;
+    room.battleActionSequence = (room.battleActionSequence || 0) + 1;
+    room.players[playerId].actionSequence = room.battleActionSequence;
     io.to(roomId).emit("playerLockedIn", playerId);
 
     if (options?.emitNpcAction) {
@@ -2201,11 +2594,14 @@ async function startServer() {
     delete room.activeBattleStream;
     room.history = ['**Match Found!** The battle begins.'];
     room.battleMediaLogs = [];
+    room.battleImageSharedThisTurn = false;
+    room.battleActionSequence = 0;
     for (const playerId of Object.keys(room.players)) {
       room.players[playerId].lockedIn = false;
       room.players[playerId].action = "";
       room.players[playerId].autoLockedThisTurn = false;
       room.players[playerId].prepSkippedPreview = false;
+      delete room.players[playerId].actionSequence;
     }
     emitTypingStatus(`room:${roomId}`);
     io.to(roomId).emit('matchFound', {
@@ -3699,6 +4095,10 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
       const p = players[socket.id];
       if (!p) return;
       const room = rooms[data.roomId];
+      if (room?.battleImageSharedThisTurn) return;
+      if (room) {
+        room.battleImageSharedThisTurn = true;
+      }
       const actorName = room?.players?.[socket.id]?.character?.name || p.character?.name || 'Someone';
       appendBattleMediaLogs(data.roomId, actorName, data.imageUrl);
       logBattleServerDebug('battle_image_shared', {
@@ -3707,7 +4107,7 @@ ${npcsAtLocation.map((n: any) => `NPC PROFILE - ${n?.name}:\n${n?.profileMarkdow
         fromName: actorName,
         imageUrlLength: data.imageUrl?.length || 0,
       });
-      socket.to(data.roomId).emit("battleImageShared", {
+      io.to(data.roomId).emit("battleImageShared", {
         fromName: actorName,
         imageUrl: data.imageUrl,
       });

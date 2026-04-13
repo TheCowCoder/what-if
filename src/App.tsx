@@ -286,6 +286,10 @@ const buildInlineImagePartFromDataUrl = (imageUrl?: string | null) => {
   };
 };
 
+const renderPromptTemplate = (template: string, values: Record<string, string>) => (
+  template.replace(/\{\{([A-Z0-9_]+)\}\}/g, (_match, key) => values[key] ?? '')
+);
+
 const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 const extractTransformationCueForCombatant = (narrative: string, combatantName: string): string | null => {
@@ -307,6 +311,31 @@ const extractTransformationCueForCombatant = (narrative: string, combatantName: 
   }
 
   return null;
+};
+
+const buildTransformationRenderDirective = (combatantName: string, cue: string) => {
+  const loweredCue = cue.toLowerCase();
+
+  if (loweredCue.includes('goldfish')) {
+    return `- ${combatantName}: ${cue}. Mandatory rendering: show a literal goldfish with fins, scales, tail, gills, fish eyes, and true fish anatomy. Not a humanoid, god-form, blob, or abstract magical being.`;
+  }
+  if (loweredCue.includes('fish')) {
+    return `- ${combatantName}: ${cue}. Mandatory rendering: show a literal fish with fins, scales, tail, gills, fish eyes, and true fish anatomy. Not a humanoid, god-form, blob, or abstract magical being.`;
+  }
+  if (loweredCue.includes('frog') || loweredCue.includes('toad')) {
+    return `- ${combatantName}: ${cue}. Mandatory rendering: show a literal frog or toad with amphibian anatomy, limbs, skin texture, and true creature proportions. Not a humanoid, blob, or abstract magical being.`;
+  }
+  if (loweredCue.includes('wolf')) {
+    return `- ${combatantName}: ${cue}. Mandatory rendering: show a literal wolf with canine anatomy, fur, muzzle, paws, and tail. Not a humanoid, blob, or abstract magical being.`;
+  }
+  if (loweredCue.includes('dragon') || loweredCue.includes('serpent')) {
+    return `- ${combatantName}: ${cue}. Mandatory rendering: show the named creature with true monster anatomy. Not a humanoid, blob, or abstract magical being.`;
+  }
+  if (loweredCue.includes('blob') || loweredCue.includes('slime') || loweredCue.includes('ooze')) {
+    return `- ${combatantName}: ${cue}. Mandatory rendering: show the named amorphous form literally, but still make the creature readable and specific instead of turning it into a generic glowing mass.`;
+  }
+
+  return `- ${combatantName}: ${cue}. Mandatory rendering: show the named transformed form literally, not ${combatantName}'s original body and not a vague blob, godlike figure, or abstract magical being.`;
 };
 
 const appendBattleLogIfMissing = (logs: string[], entry: string): string[] => (
@@ -992,6 +1021,20 @@ export default function App() {
     };
   }, []);
 
+  const getPromptTemplate = useCallback(async (filename: string) => {
+    const cached = promptTemplateCacheRef.current[filename];
+    if (cached) return cached;
+
+    const response = await fetch(`/api/prompts/${filename}`);
+    if (!response.ok) {
+      throw new Error(`Prompt not found: ${filename}`);
+    }
+
+    const template = await response.text();
+    promptTemplateCacheRef.current[filename] = template;
+    return template;
+  }, []);
+
   const clearRetryRestartButton = useCallback((key: string) => {
     delete retryRestartHandlersRef.current[key];
     setLocalRetryRestartButtons(prev => {
@@ -1082,10 +1125,11 @@ export default function App() {
     }
   }, []);
 
-  const showBattleImagePendingStatus = useCallback(() => {
+  const showBattleImagePendingStatus = useCallback((retryCount = 0) => {
     setBattleImageSkipHintVisible(false);
     clearBattleStatusLog('battle-image-complete');
-    upsertBattleStatusLog('battle-image-pending', 'Generating image... server retries automatically if Gemini is busy.');
+    const retryText = retryCount > 0 ? ` Retried ${retryCount} time${retryCount === 1 ? '' : 's'}.` : '';
+    upsertBattleStatusLog('battle-image-pending', `Generating image...${retryText} Server retries automatically if Gemini is busy.`);
   }, [clearBattleStatusLog, upsertBattleStatusLog]);
 
   const showBattleImageCompleteStatus = useCallback((text: string) => {
@@ -1126,6 +1170,7 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputText, setInputText] = useState('');
   const [isWaitingForChar, setIsWaitingForChar] = useState(false);
+  const [charModelStreamStarted, setCharModelStreamStarted] = useState(false);
   const [connectionPhase, setConnectionPhase] = useState<ConnectionPhase>('online');
   const connectionPhaseRef = useRef<ConnectionPhase>('online');
   const [participantConnectionNotice, setParticipantConnectionNotice] = useState<{ text: string; tone: 'amber' | 'green' | 'blue' } | null>(null);
@@ -1321,18 +1366,25 @@ export default function App() {
   const [isBotMatch, setIsBotMatch] = useState(false);
   const [isGeneratingBattleImage, setIsGeneratingBattleImage] = useState(false);
   const [hasVisualizedThisTurn, setHasVisualizedThisTurn] = useState(false);
+  const hasVisualizedThisTurnRef = useRef(false);
+  const battleImageTurnNonceRef = useRef(0);
   const [battleImageSkipHintVisible, setBattleImageSkipHintVisible] = useState(false);
   const [turnTimerRemaining, setTurnTimerRemaining] = useState<number | null>(null);
   const [isVisualizingScene, setIsVisualizingScene] = useState(false);
   const isBotMatchRef = useRef(false);
   const [showProfileModal, setShowProfileModal] = useState(false);
   const [profileToView, setProfileToView] = useState<string | null>(null);
+  const closeProfileModal = useCallback(() => {
+    setShowProfileModal(false);
+    setProfileToView(null);
+  }, []);
   const [showBattleMeta, setShowBattleMeta] = useState(false);
   const [showExplorationMeta, setShowExplorationMeta] = useState(false);
   const [showExplorationNearby, setShowExplorationNearby] = useState(false);
   useEffect(() => { isBotMatchRef.current = isBotMatch; }, [isBotMatch]);
   const difficultyLabels = ['Easy', 'Medium', 'Hard', 'Superintelligent'];
   const avatarSyncKeysRef = useRef<Record<string, string>>({});
+  const promptTemplateCacheRef = useRef<Record<string, string>>({});
 
   const appendBattleTraceEvent = useCallback((event: string, details: Record<string, unknown> = {}) => {
     if (!battleTraceRecordingRef.current) return;
@@ -1851,6 +1903,10 @@ export default function App() {
   }, [battleLogs]);
 
   useEffect(() => {
+    hasVisualizedThisTurnRef.current = hasVisualizedThisTurn;
+  }, [hasVisualizedThisTurn]);
+
+  useEffect(() => {
     const snapshot = {
       count: battleLogs.length,
       imageStatusCount: battleLogs.filter(log => log.startsWith('STATUS_IMAGE::')).length,
@@ -1907,13 +1963,13 @@ export default function App() {
       return;
     }
 
-    setShowProfileModal(false);
+    closeProfileModal();
     setMessages([{ role: 'model', text: 'You have one rewrite window before the duel. Refine your legend now.' }]);
     setInputText('');
     setCharCreatorError(null);
     setCharCreatorRetryAttempt(0);
     clearChatStatusMessage('char-creator-retry');
-  }, [arenaPreparation, clearChatStatusMessage, clearTypingPresence, gameState]);
+  }, [arenaPreparation, clearChatStatusMessage, clearTypingPresence, closeProfileModal, gameState]);
 
   useEffect(() => {
     if (!arenaPreparation) {
@@ -2276,6 +2332,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         setRoomTypingIds([]);
         setLocalRoomTypingIds([]);
         setAllyActedIds([]);
+        battleImageTurnNonceRef.current += 1;
         setHasVisualizedThisTurn(false);
         setGameState(roomSnapshot.phase === 'preview' || roomSnapshot.phase === 'tweak' ? 'arena_prep' : 'battle');
 
@@ -2390,7 +2447,9 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       setAllyActedIds([]);
       setBattleLogs(prev => {
         const nextLogs = removePendingBattleActionLogs(prev);
-        return nextLogs[nextLogs.length - 1] === data.log ? nextLogs : [...nextLogs, data.log];
+        const resolvedLogs = nextLogs[nextLogs.length - 1] === data.log ? nextLogs : [...nextLogs, data.log];
+        battleLogsRef.current = resolvedLogs;
+        return resolvedLogs;
       });
     });
 
@@ -2428,17 +2487,23 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         logLength: typeof data.log === 'string' ? data.log.length : 0,
         thoughtsLength: typeof data.thoughts === 'string' ? data.thoughts.length : 0,
       });
+      const battleImageTurnNonce = battleImageTurnNonceRef.current + 1;
+      battleImageTurnNonceRef.current = battleImageTurnNonce;
       setHasVisualizedThisTurn(false);
       clearBattleStatusLog('battle-resync');
+      clearBattleStatusLog('battle-retry');
       setBattle503RetryAttempt(0);
       setBattleRetryRestartAvailable(false);
+      setBattleError(null);
       if (connectionPhaseRef.current === 'resyncing') {
         flashConnectionPhase('reconnected');
       }
       setBattleLogs(prev => {
         const filtered = removePendingBattleActionLogs(removeBattleStreamPlaceholders(prev));
         const thoughts = data.thoughts || "";
-        return [...filtered, `> **Judge's Thoughts:**\n> ${thoughts.replace(/\n/g, '\n> ')}`, data.log];
+        const resolvedLogs = [...filtered, `> **Judge's Thoughts:**\n> ${thoughts.replace(/\n/g, '\n> ')}`, data.log];
+        battleLogsRef.current = resolvedLogs;
+        return resolvedLogs;
       });
       if (data.players) {
         setPlayers(data.players);
@@ -2456,7 +2521,11 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
           clearBattleImageTimers();
           clearBattleStatusLog('battle-image-pending');
           clearBattleStatusLog('battle-image-complete');
-          setBattleLogs(prev => [...prev, `**GAME OVER!** ${winnerName} is victorious!`]);
+          setBattleLogs(prev => {
+            const resolvedLogs = [...prev, `**GAME OVER!** ${winnerName} is victorious!`];
+            battleLogsRef.current = resolvedLogs;
+            return resolvedLogs;
+          });
         } else {
           battleImageSkipRef.current = false;
           clearBattleImageTimers();
@@ -2474,28 +2543,18 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
           }
         }
       setIsLockedIn(false);
-      // Auto-generate battle scene image after turn resolution (only resolver generates)
       const playerIds = Object.keys(data.players);
-      const isFirstPlayer = playerIds[0] === socket.id;
       logBattleDebug('turn_resolved_post_processing', {
         roomId: roomIdRef.current,
         playerIds,
         alivePlayerNames: alivePlayers.map((player: any) => player.character.name),
-        isFirstPlayer,
+          battleImageSource: 'server',
         isBotMatch: isBotMatchRef.current,
       });
-      if (isFirstPlayer) {
-        logBattleDebug('image_generation_scheduled', {
-          roomId: roomIdRef.current,
-          delayMs: 500,
-        });
-        setTimeout(() => handleGenerateBattleImageRef.current?.(), 500);
-      } else {
-        logBattleDebug('image_generation_waiting_for_remote', {
+        logBattleDebug('image_generation_waiting_for_backend', {
           roomId: roomIdRef.current,
           awaitingSharedImage: true,
         });
-      }
     });
 
     socket.on('battleEndedByInactivity', (data: { log: string }) => {
@@ -2529,6 +2588,10 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       appendBattleTraceEvent('stream_start_received', {
         roomId: roomIdRef.current,
       });
+      clearBattleStatusLog('battle-retry');
+      setBattle503RetryAttempt(0);
+      setBattleRetryRestartAvailable(false);
+      setBattleError(null);
       setBattleLogs(prev => ensureBattleStreamPlaceholders(prev));
     });
 
@@ -2542,8 +2605,20 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       });
       setBattle503RetryAttempt(isServiceUnavailableRetry(data) ? data.attempt : 0);
       setBattleRetryRestartAvailable(!!data.restartAvailable);
+      const retryStatusText = data.restartAvailable
+        ? `${data.label || 'Gemini is temporarily unavailable'}. Retry window expired.`
+        : data.attempt > 0
+          ? `Battle retry #${data.attempt}${data.delay ? ` in ${Math.max(1, data.delay)}s` : ''}. ${data.label || 'Retrying turn resolution.'}`
+          : '';
+      if (retryStatusText) {
+        upsertBattleStatusLog('battle-retry', retryStatusText);
+      } else {
+        clearBattleStatusLog('battle-retry');
+      }
       if (data.restartAvailable) {
         setBattleError(`${data.label || 'Gemini is temporarily unavailable'}. Retry window expired. Start a new 2-minute retry session when ready.`);
+      } else {
+        setBattleError(null);
       }
     });
 
@@ -2557,6 +2632,12 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
           isRefresh: data.text.startsWith('REFRESH:'),
           textLength: data.text.length,
         });
+      }
+      if (data.type !== 'tool') {
+        clearBattleStatusLog('battle-retry');
+        setBattle503RetryAttempt(0);
+        setBattleRetryRestartAvailable(false);
+        setBattleError(null);
       }
       setBattleLogs(prev => {
         if (data.type === 'tool') {
@@ -2601,6 +2682,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         fromName: data.fromName || null,
         imageUrlLength: data.imageUrl.length,
       });
+      setHasVisualizedThisTurn(true);
       setBattleImageRetryAttempt(0);
       logBattleDebug('battle_image_shared_received', {
         roomId: roomIdRef.current,
@@ -3167,6 +3249,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     setInputText('');
     if (charInputRef.current) charInputRef.current.style.height = 'auto';
     setIsWaitingForChar(true);
+    setCharModelStreamStarted(false);
     setCharCreatorError(null);
     setCharCreatorRetryAttempt(0);
     clearChatStatusMessage('char-creator-retry');
@@ -3206,6 +3289,11 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     // Format history for Gemini
     const contents = newMessages.map(m => `${m.role === 'user' ? 'User' : 'Model'}: ${m.text}`).join('\n');
     const aiClient = getAIClient();
+    const charDebugLabel = gameStateRef.current === 'arena_prep' ? 'arena-prep-char-tweaker' : 'main-menu-char-creator';
+    const charResponseStreamId = `char-response-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const logCharStream = (event: string, details: Record<string, unknown> = {}) => {
+      console.log('[CharStream]', { event, scope: charDebugLabel, ...details });
+    };
 
     const charApiConfig = {
       model: settingsRef.current.charModel,
@@ -3213,57 +3301,128 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
       config: {
         systemInstruction: fullSysPrompt,
         temperature: 0.7,
-        thinkingConfig: { includeThoughts: true },
+        debugLabel: charDebugLabel,
         tools: [{ functionDeclarations: [saveCharacterTool as any] }]
       },
     };
 
     let attempts = 0;
-    const charAbort = new AbortController();
     const CHAR_STREAM_STALL_MS = 60_000;
+    const CHAR_VISIBLE_OUTPUT_TIMEOUT_MS = 45_000;
     const retryWindowStartedAt = Date.now();
+    const characterThinkingPlaceholder = 'Thinking...';
     setCharCreator503RetryAttempt(0);
 
+    const ensureCharThinkingMessage = () => {
+      setCharModelStreamStarted(true);
+      setMessages(prev => {
+        const next = [...prev];
+        const existingIndex = next.findIndex(message => message.streamId === charResponseStreamId);
+        if (existingIndex >= 0) {
+          if (next[existingIndex].role === 'model' && next[existingIndex].text && next[existingIndex].text !== characterThinkingPlaceholder) {
+            return prev;
+          }
+          if (next[existingIndex].role === 'model' && next[existingIndex].text === characterThinkingPlaceholder) {
+            return prev;
+          }
+          next[existingIndex] = { role: 'model', text: characterThinkingPlaceholder, streamId: charResponseStreamId };
+          return next;
+        }
+        return [...prev, { role: 'model', text: characterThinkingPlaceholder, streamId: charResponseStreamId }];
+      });
+    };
+
     while (true) {
-      if (charAbort.signal.aborted) break;
       setCharCreatorError(null);
       setCharCreatorRetryAttempt(attempts);
 
+      const attemptNumber = attempts + 1;
+      const attemptAbort = new AbortController();
+
       let charStallTimer: ReturnType<typeof setTimeout> | null = null;
+      let charVisibleOutputTimer: ReturnType<typeof setTimeout> | null = null;
+      let streamStallTimedOut = false;
+      let visibleOutputTimedOut = false;
+      let sawAnyChunk = false;
+      let sawThoughtChunk = false;
+      let sawVisibleOutput = false;
+      let sawFunctionCall = false;
       const clearCharStallTimer = () => { if (charStallTimer) { clearTimeout(charStallTimer); charStallTimer = null; } };
+      const clearCharVisibleOutputTimer = () => { if (charVisibleOutputTimer) { clearTimeout(charVisibleOutputTimer); charVisibleOutputTimer = null; } };
+      const clearCharAttemptTimers = () => {
+        clearCharStallTimer();
+        clearCharVisibleOutputTimer();
+      };
       const resetCharStallTimer = () => {
         clearCharStallTimer();
         charStallTimer = setTimeout(() => {
+          streamStallTimedOut = true;
           console.warn('[CharStream] No chunk received in 60s — aborting stalled stream');
-          charAbort.abort();
+          attemptAbort.abort();
         }, CHAR_STREAM_STALL_MS);
+      };
+      const startCharVisibleOutputTimer = () => {
+        clearCharVisibleOutputTimer();
+        charVisibleOutputTimer = setTimeout(() => {
+          visibleOutputTimedOut = true;
+          console.warn('[CharStream] No visible output received in 45s — aborting hidden-thought stream');
+          attemptAbort.abort();
+        }, CHAR_VISIBLE_OUTPUT_TIMEOUT_MS);
       };
 
       try {
+        logCharStream('attempt_start', {
+          attempt: attemptNumber,
+          stage: arenaPreparation?.stage || null,
+          hasCharacter: !!character,
+          promptLength: sentText.length,
+        });
         resetCharStallTimer();
+        startCharVisibleOutputTimer();
         const responseStream = await aiClient.models.generateContentStream({
           ...charApiConfig,
-          config: { ...charApiConfig.config, abortSignal: charAbort.signal },
+          config: { ...charApiConfig.config, abortSignal: attemptAbort.signal },
         });
         
         let fullText = "";
         let currentModelMessage = "";
         let toolCallData: any = null;
         
-        // Add a placeholder for the model's response
-        setMessages(prev => [...prev, { role: 'model', text: "" }]);
-        
         for await (const chunk of responseStream) {
           resetCharStallTimer();
-          if (charAbort.signal.aborted) break;
+          sawAnyChunk = true;
+          if (attemptAbort.signal.aborted) break;
           const parts = chunk.candidates?.[0]?.content?.parts || [];
+          if (parts.length > 0) {
+            ensureCharThinkingMessage();
+          }
           for (const part of parts) {
             if (part.functionCall) {
               toolCallData = part.functionCall;
+              if (!sawFunctionCall) {
+                sawFunctionCall = true;
+                clearCharVisibleOutputTimer();
+                logCharStream('first_tool_call', {
+                  attempt: attemptNumber,
+                  name: part.functionCall.name || 'unknown',
+                });
+              }
             } else if ((part as any).thought) {
-              // Skip thought parts
+              if (!sawThoughtChunk) {
+                sawThoughtChunk = true;
+                logCharStream('first_thought_chunk', { attempt: attemptNumber });
+              }
             } else {
-              fullText += (part as any).text || "";
+              const partText = (part as any).text || "";
+              fullText += partText;
+              if (partText.trim() && !sawVisibleOutput) {
+                sawVisibleOutput = true;
+                clearCharVisibleOutputTimer();
+                logCharStream('first_visible_text', {
+                  attempt: attemptNumber,
+                  length: partText.trim().length,
+                });
+              }
             }
           }
           
@@ -3272,10 +3431,76 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
             currentModelMessage = displayText;
             setMessages(prev => {
               const newMsgs = [...prev];
-              newMsgs[newMsgs.length - 1] = { role: 'model', text: displayText };
-              return newMsgs;
+              const responseIndex = newMsgs.findIndex(message => message.streamId === charResponseStreamId);
+              if (responseIndex >= 0) {
+                newMsgs[responseIndex] = { role: 'model', text: displayText, streamId: charResponseStreamId };
+                return newMsgs;
+              }
+              return [...newMsgs, { role: 'model', text: displayText, streamId: charResponseStreamId }];
             });
           }
+        }
+
+        logCharStream('stream_completed', {
+          attempt: attemptNumber,
+          sawAnyChunk,
+          sawThoughtChunk,
+          sawVisibleOutput,
+          sawFunctionCall,
+          textLength: fullText.trim().length,
+        });
+
+        if (!fullText.trim() && !toolCallData && !attemptAbort.signal.aborted) {
+          logCharStream('fallback_generate_start', { attempt: attemptNumber });
+          ensureCharThinkingMessage();
+          const fallbackResponse = await aiClient.models.generateContent({
+            ...charApiConfig,
+            config: { ...charApiConfig.config, abortSignal: attemptAbort.signal },
+          });
+          const fallbackParts = fallbackResponse.candidates?.[0]?.content?.parts || [];
+          for (const part of fallbackParts) {
+            if (part.functionCall) {
+              toolCallData = part.functionCall;
+              if (!sawFunctionCall) {
+                sawFunctionCall = true;
+                logCharStream('fallback_tool_call', {
+                  attempt: attemptNumber,
+                  name: part.functionCall.name || 'unknown',
+                });
+              }
+            } else if ((part as any).thought) {
+              // Skip thought parts
+            } else {
+              const partText = (part as any).text || "";
+              fullText += partText;
+              if (partText.trim() && !sawVisibleOutput) {
+                sawVisibleOutput = true;
+                logCharStream('fallback_visible_text', {
+                  attempt: attemptNumber,
+                  length: partText.trim().length,
+                });
+              }
+            }
+          }
+          logCharStream('fallback_generate_completed', {
+            attempt: attemptNumber,
+            textLength: fullText.trim().length,
+            hasToolCall: !!toolCallData,
+          });
+        }
+
+        const finalDisplayText = fullText.trim();
+        if (finalDisplayText && finalDisplayText !== currentModelMessage) {
+          currentModelMessage = finalDisplayText;
+          setMessages(prev => {
+            const newMsgs = [...prev];
+            const responseIndex = newMsgs.findIndex(message => message.streamId === charResponseStreamId);
+            if (responseIndex >= 0) {
+              newMsgs[responseIndex] = { role: 'model', text: finalDisplayText, streamId: charResponseStreamId };
+              return newMsgs;
+            }
+            return [...newMsgs, { role: 'model', text: finalDisplayText, streamId: charResponseStreamId }];
+          });
         }
         
         // Handle tool call (native function calling)
@@ -3303,38 +3528,101 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
           }
         }
 
+        if (!fullText.trim() && toolCallData?.name === 'save_character') {
+          const confirmationText = character ? 'Legend updated.' : 'Legend saved.';
+          setMessages(prev => {
+            const newMsgs = [...prev];
+            const responseIndex = newMsgs.findIndex(message => message.streamId === charResponseStreamId);
+            if (responseIndex >= 0) {
+              newMsgs[responseIndex] = { role: 'model', text: confirmationText, streamId: charResponseStreamId };
+              return newMsgs;
+            }
+            return [...newMsgs, { role: 'model', text: confirmationText, streamId: charResponseStreamId }];
+          });
+        } else if (!fullText.trim() && !toolCallData) {
+          setMessages(prev => {
+            const newMsgs = [...prev];
+            const fallbackText = 'I could not produce a usable legend reply. Try sending that again.';
+            const responseIndex = newMsgs.findIndex(message => message.streamId === charResponseStreamId);
+            if (responseIndex >= 0) {
+              newMsgs[responseIndex] = { role: 'model', text: fallbackText, streamId: charResponseStreamId };
+              return newMsgs;
+            }
+            return [...newMsgs, { role: 'model', text: fallbackText, streamId: charResponseStreamId }];
+          });
+        }
+
         // Success
-        clearCharStallTimer();
+        clearCharAttemptTimers();
         clearChatStatusMessage('char-creator-retry');
         setCharCreatorRetryAttempt(0);
         setCharCreator503RetryAttempt(0);
         setCharCreatorError(null);
+        setCharModelStreamStarted(false);
+        logCharStream('attempt_succeeded', {
+          attempt: attemptNumber,
+          textLength: fullText.trim().length,
+          hasToolCall: !!toolCallData,
+        });
         break;
 
       } catch (error: any) {
-        clearCharStallTimer();
-        if (error.name === 'AbortError' || charAbort.signal.aborted) {
+        clearCharAttemptTimers();
+
+        let errorInfo: ReturnType<typeof classifyAIError> | {
+          label: string;
+          detail: string;
+          retryable: boolean;
+          statusCode?: number;
+          statusText?: string;
+          suggestedRetrySeconds?: number;
+        };
+
+        if ((error.name === 'AbortError' || attemptAbort.signal.aborted) && (streamStallTimedOut || visibleOutputTimedOut)) {
+          errorInfo = {
+            label: visibleOutputTimedOut ? 'Character rewrite stalled before a visible reply' : 'Character rewrite stream stalled',
+            detail: visibleOutputTimedOut
+              ? 'Gemini kept thinking without visible text or a tool call.'
+              : 'No stream chunks arrived before the stall timeout.',
+            retryable: true,
+            statusCode: 408,
+            statusText: 'TIMEOUT',
+            suggestedRetrySeconds: 2,
+          };
+          logCharStream('attempt_timeout', {
+            attempt: attemptNumber,
+            sawAnyChunk,
+            sawThoughtChunk,
+            sawVisibleOutput,
+            sawFunctionCall,
+            visibleOutputTimedOut,
+            streamStallTimedOut,
+          });
+        } else if (error.name === 'AbortError' || attemptAbort.signal.aborted) {
           setCharCreator503RetryAttempt(0);
+          setCharModelStreamStarted(false);
           console.warn('Character creator stream aborted (timeout or cleanup)');
           setMessages(prev => {
             const newMsgs = [...prev];
-            if (newMsgs.length > 0 && newMsgs[newMsgs.length - 1].role === 'model' && !newMsgs[newMsgs.length - 1].text) {
-              newMsgs.pop();
+            const responseIndex = newMsgs.findIndex(message => message.streamId === charResponseStreamId);
+            if (responseIndex >= 0 && (!newMsgs[responseIndex].text || newMsgs[responseIndex].text === characterThinkingPlaceholder)) {
+              newMsgs.splice(responseIndex, 1);
             }
             return [...newMsgs, { role: 'system', text: '⚠️ Character creator timed out. Try sending your message again.' }];
           });
           break;
+        } else {
+          console.error("Error creating character:", error);
+          errorInfo = classifyAIError(error);
         }
-        console.error("Error creating character:", error);
-
-        const errorInfo = classifyAIError(error);
 
         if (errorInfo.retryable) {
           // Remove the empty model placeholder from failed attempt
           setMessages(prev => {
             const newMsgs = [...prev];
-            if (newMsgs.length > 0 && newMsgs[newMsgs.length - 1].role === 'model' && !newMsgs[newMsgs.length - 1].text) {
-              newMsgs.pop();
+            const responseIndex = newMsgs.findIndex(message => message.streamId === charResponseStreamId);
+            if (responseIndex >= 0 && (!newMsgs[responseIndex].text || newMsgs[responseIndex].text === characterThinkingPlaceholder)) {
+              newMsgs.splice(responseIndex, 1);
             }
             return newMsgs;
           });
@@ -3351,6 +3639,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
             setCharCreatorRetryAttempt(0);
             setCharCreator503RetryAttempt(0);
             setCharCreatorError(`${errorInfo.label}. Retry window expired. Start a new 2-minute retry session when ready.`);
+            setCharModelStreamStarted(false);
             upsertChatStatusMessage('char-creator-retry', `⚠️ ${errorInfo.label}. Retry window expired. Start a new 2-minute retry session when ready.`);
             break;
           }
@@ -3359,6 +3648,14 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
             Math.max(1, remainingMs / 1000),
           );
           const delaySec = Math.round(delay);
+          logCharStream('retry_scheduled', {
+            attempt: attemptNumber,
+            nextAttempt: attempts + 1,
+            label: errorInfo.label,
+            delaySec,
+            statusCode: errorInfo.statusCode,
+            statusText: errorInfo.statusText,
+          });
           setCharCreatorRetryAttempt(attempts);
           setCharCreator503RetryAttempt(isServiceUnavailableRetry(errorInfo) ? attempts : 0);
           setCharCreatorError(`${errorInfo.label}. Retrying in ${delaySec}s...`);
@@ -3371,20 +3668,23 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         const errorMsg = `[SYSTEM ERROR]: Failed to generate response using model ${settingsRef.current.charModel}. ${formattedError}`;
         setMessages(prev => {
           const newMsgs = [...prev];
-          if (newMsgs.length > 0 && newMsgs[newMsgs.length - 1].role === 'model' && !newMsgs[newMsgs.length - 1].text) {
-            newMsgs.pop();
+          const responseIndex = newMsgs.findIndex(message => message.streamId === charResponseStreamId);
+          if (responseIndex >= 0 && (!newMsgs[responseIndex].text || newMsgs[responseIndex].text === characterThinkingPlaceholder)) {
+            newMsgs.splice(responseIndex, 1);
           }
           return [...newMsgs, { role: 'system', text: errorMsg }];
         });
         setCharCreatorRetryAttempt(0);
         setCharCreator503RetryAttempt(0);
         setCharCreatorError(formattedError);
+        setCharModelStreamStarted(false);
         upsertChatStatusMessage('char-creator-retry', `⚠️ Character creator error: ${formattedError}`);
         break;
       }
     }
 
     setIsWaitingForChar(false);
+    setCharModelStreamStarted(false);
   };
 
   // ============ EXPLORATION HANDLERS ============
@@ -3585,7 +3885,11 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     setMessages(prev => [...prev, { role: 'system', text: '🎨 Generating portrait... server retries automatically if Gemini is busy.', streamId: generationMessageId }]);
     try {
       const aiClient = getAIClient();
-      const prompt = `Generate a fantasy character portrait for: ${character.name}. ${character.profileMarkdown.substring(0, 500)}. Style: detailed digital art, fantasy RPG character portrait, vibrant colors.`;
+      const promptTemplate = await getPromptTemplate('avatar_image.txt');
+      const prompt = renderPromptTemplate(promptTemplate, {
+        CHARACTER_NAME: character.name,
+        PROFILE_SNIPPET: character.profileMarkdown.substring(0, 500),
+      });
       
       console.log("[Portrait] Sending request to gemini-3.1-pro-image-preview");
       const response = await aiClient.models.generateContent({
@@ -3722,7 +4026,8 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
     };
     try {
       const aiClient = getAIClient();
-      const imageNarrativeLogs = extractRecentBattleNarrative(sanitizeBattleHistoryForJudge(battleLogs));
+      const latestBattleLogs = battleLogsRef.current;
+      const imageNarrativeLogs = extractRecentBattleNarrative(sanitizeBattleHistoryForJudge(latestBattleLogs));
       const recentLogs = imageNarrativeLogs.join('\n\n').substring(0, 900);
       const playerNames = Object.values(players).map((p: any) => p.character.name).join(' vs ');
       const battleMapImageContext = buildBattleMapContext(worldDataRef.current, battleMapState, players)
@@ -3773,7 +4078,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         .map((participant: any) => {
           const participantName = participant.character?.name || 'Combatant';
           const cue = transformationCuesByName.get(participantName);
-          return cue ? `- ${participantName}: ${cue}` : null;
+          return cue ? buildTransformationRenderDirective(participantName, cue) : null;
         })
         .filter(Boolean)
         .join('\n');
@@ -3782,7 +4087,7 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
           const participantName = participant.character?.name || 'Combatant';
           const transformationCue = transformationCuesByName.get(participantName);
           if (transformationCue) {
-            return [{ text: `${participantName} transformed this turn: ${transformationCue}. The transformed form overrides the portrait anatomy and silhouette. Keep identity and side placement, but render the new form literally.` }];
+            return [{ text: buildTransformationRenderDirective(participantName, transformationCue) }];
           }
           const avatarPart = buildInlineImagePartFromDataUrl(participant.character?.imageUrl);
           if (!avatarPart) return [];
@@ -3802,40 +4107,25 @@ What is your action? Keep it short and tactical. Remember, you are ${p2Data.char
         `- Add a bottom split result banner with ${leftName} locked on the LEFT and ${rightName} locked on the RIGHT. Each side must show the character name, a strong icon, the move name, and a short outcome.`,
         '- Keep typography readable and energetic, but do not let the text treatment force repeated camera angles, repeated horizons, or repeated combatant poses.',
       ].join('\n');
-      const prompt = `Generate a dynamic battle scene illustration for ${playerNames}. This must be a NEW poster image for the CURRENT turn, not an edit, continuation, repaint, variation, or touch-up of any previous turn image. Create the scene from scratch for this turn only. Latest resolved battle narrative: ${recentLogs || 'The battle has just begun.'}. Current positions: ${battleLocationSummary || 'Use the active battlefield state.'}. Authoritative battlefield state: ${battleMapImageContext || 'Use the active battlefield state.'}. Style: fantasy RPG battle poster art, dramatic action poses, magical effects, vibrant colors.
-
-This battle image must ALWAYS include cinematic UI text overlays integrated into the art:
-- A bold top headline announcing the battle beat.
-- Small location label text for at least one relevant battlefield location.
-- A bottom split result panel: ${leftName} on the LEFT, ${rightName} on the RIGHT. Each side shows the character's name, a cool icon, the move name, and a short outcome. Match each character to their reference avatar — do NOT swap them.
-
-    Fresh-scene rules:
-    - Render a fresh composition from scratch every turn.
-    - Do NOT reuse the previous turn's camera angle, crop, pose, lighting, background, horizon line, or character staging unless the latest narrative independently requires a similar view.
-    - Do NOT behave like an image editor making small edits to an earlier frame.
-    - Do NOT imitate or trace a stock poster sample, prior turn image, or any fixed scene template.
-
-    Transformation rules:
-    - If the latest narrative says a fighter transformed, polymorphed, mutated, or became a creature/object, render the transformed form literally.
-    - In those cases, the portrait reference only preserves identity cues such as side placement, palette, or facial motifs. It must NOT force the old humanoid anatomy, armor silhouette, or body plan.
-    ${transformationSummary || '- No explicit transformation override detected in the latest narrative.'}
-
-Spatial composition requirements:
-${compositionDirective}
-${combatantAnchorSummary || '- Use the authoritative battlefield state to anchor each fighter.'}
-
-Poster layout requirements:
-${posterLayoutDirective}
-
-Update all scene content, labels, move names, and locations to reflect THIS turn's narrative and current battlefield positions. Show each character's current equipment and weapons as described in the battle narrative — if a character just acquired a new weapon, they must be holding it.
-
-  Do not invent terrain interactions that are not supported by the latest narrative or authoritative battlefield state. Do not place a combatant in water, waist-deep surf, or shoreline action unless the narrative or current map state explicitly puts them there. If one fighter is farther from the water or behind cover, keep that staging accurate instead of moving them for composition. If the fighters are on different islands, the artwork must clearly show separate islands or a split view; never collapse them onto the same patch of land.`;
+      const promptTemplate = await getPromptTemplate('battle_image.txt');
+      const prompt = renderPromptTemplate(promptTemplate, {
+        PLAYER_NAMES: playerNames,
+        RECENT_LOGS: recentLogs || 'The battle has just begun.',
+        BATTLE_LOCATION_SUMMARY: battleLocationSummary || 'Use the active battlefield state.',
+        BATTLE_MAP_CONTEXT: battleMapImageContext || 'Use the active battlefield state.',
+        LEFT_NAME: leftName,
+        RIGHT_NAME: rightName,
+        TRANSFORMATION_SUMMARY: transformationSummary || '- No explicit transformation override detected in the latest narrative.',
+        COMPOSITION_DIRECTIVE: compositionDirective,
+        COMBATANT_ANCHOR_SUMMARY: combatantAnchorSummary || '- Use the authoritative battlefield state to anchor each fighter.',
+        POSTER_LAYOUT_DIRECTIVE: posterLayoutDirective,
+      });
 
       logBattleDebug('image_generation_start', {
         roomId,
         playerNames,
         playerIds: Object.keys(players),
-        battleLogCount: battleLogs.length,
+        battleLogCount: latestBattleLogs.length,
         recentLogsPreview: recentLogs,
         battleLocationSummary,
         battleMapImageContext,
@@ -3849,7 +4139,7 @@ Update all scene content, labels, move names, and locations to reflect THIS turn
       const requestParts: any[] = [{ text: prompt }];
       requestParts.push(...avatarReferenceParts);
       let attempt = 0;
-      while (!battleImageSkipRef.current && (!activeImageRoomId || roomIdRef.current === activeImageRoomId)) {
+      while (!battleImageSkipRef.current && !hasVisualizedThisTurnRef.current && (!activeImageRoomId || roomIdRef.current === activeImageRoomId)) {
         try {
           const response = await aiClient.models.generateContent({
             model: 'gemini-2.5-flash-image',
@@ -3894,7 +4184,7 @@ Update all scene content, labels, move names, and locations to reflect THIS turn
               skipped: battleImageSkipRef.current,
             });
 
-            if (battleImageSkipRef.current) {
+            if (battleImageSkipRef.current || hasVisualizedThisTurnRef.current) {
               return;
             }
 
@@ -3902,17 +4192,20 @@ Update all scene content, labels, move names, and locations to reflect THIS turn
             if (!readyScheduled) {
               readyReason = 'image_generation_success';
             }
-            setBattleLogs(prev => appendBattleImageResultLogs(prev, character?.name || 'You', imageUrl, completionLabel));
-            setHasVisualizedThisTurn(true);
             if (roomIdRef.current) {
+              setHasVisualizedThisTurn(true);
               socket.emit('shareBattleImage', { roomId: roomIdRef.current, imageUrl });
+            } else {
+              setBattleLogs(prev => appendBattleImageResultLogs(prev, character?.name || 'You', imageUrl, completionLabel));
+              setHasVisualizedThisTurn(true);
             }
             return;
           }
 
           attempt += 1;
           setBattleImageRetryAttempt(attempt);
-          continueWithoutBlocking('image_generation_background_retry');
+          showBattleImagePendingStatus(attempt);
+          continueWithoutBlocking('image_generation_background_retry', `Continuing while image retries (Retried ${attempt} time${attempt === 1 ? '' : 's'})`);
           const delay = getAIRetryDelaySeconds(attempt);
           const delaySec = Math.round(delay);
           appendBattleTraceEvent('battle_image_retry_scheduled', {
@@ -3937,7 +4230,8 @@ Update all scene content, labels, move names, and locations to reflect THIS turn
           const errorInfo = classifyAIError(error);
           attempt += 1;
           setBattleImageRetryAttempt(attempt);
-          continueWithoutBlocking('image_generation_background_retry');
+          showBattleImagePendingStatus(attempt);
+          continueWithoutBlocking('image_generation_background_retry', `Continuing while image retries (Retried ${attempt} time${attempt === 1 ? '' : 's'})`);
           const delay = getAIRetryDelaySeconds(attempt, errorInfo.suggestedRetrySeconds);
           const delaySec = Math.round(delay);
           console.error("Battle image error:", error);
@@ -4204,12 +4498,20 @@ Update all scene content, labels, move names, and locations to reflect THIS turn
                         <span>{p.character.hp} HP</span>
                       </div>
                     </div>
-                    <div className="h-2 bg-duo-gray rounded-full overflow-hidden">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setProfileToView(p.character.profileMarkdown);
+                        setShowProfileModal(true);
+                      }}
+                      className="block w-full h-2 bg-duo-gray rounded-full overflow-hidden hover:ring-2 hover:ring-duo-blue/30 transition"
+                      title={`View ${isMe ? 'your' : `${p.character.name}'s`} legend`}
+                    >
                       <div 
                           className={`h-full transition-all duration-500 ${getHealthBarFillClass(p.character.hp, p.character.maxHp)}`}
                           style={{ width: `${Math.max(0, Math.min(100, (p.character.hp / Math.max(1, p.character.maxHp || 1)) * 100))}%` }} 
                       />
-                    </div>
+                    </button>
                   </div>
                 );
               })}
@@ -4229,11 +4531,10 @@ Update all scene content, labels, move names, and locations to reflect THIS turn
       battleImageRetryAttempt > 0 ? { key: 'battle-image', label: 'Image', attempt: battleImageRetryAttempt } : null,
       charCreator503RetryAttempt > 0 ? { key: 'char-creator', label: '503 Character', attempt: charCreator503RetryAttempt } : null,
       exploration503RetryAttempt > 0 ? { key: 'exploration', label: '503 Explore', attempt: exploration503RetryAttempt } : null,
-      battle503RetryAttempt > 0 ? { key: 'battle', label: '503 Battle', attempt: battle503RetryAttempt } : null,
       bot503RetryAttempt > 0 ? { key: 'bot', label: '503 Bot', attempt: bot503RetryAttempt } : null,
     ].filter(Boolean) as Array<{ key: string; label: string; attempt: number }>;
 
-    if (pills.length === 0 && !battleRetryRestartAvailable && restartEntries.length === 0) return null;
+    if (pills.length === 0 && restartEntries.length === 0) return null;
 
     return (
       <div className="px-2 pt-2 flex flex-wrap justify-end gap-1.5 bg-white">
@@ -4245,20 +4546,6 @@ Update all scene content, labels, move names, and locations to reflect THIS turn
             {pill.label} Retry #{pill.attempt}
           </span>
         ))}
-        {battleRetryRestartAvailable && roomId && (
-          <button
-            type="button"
-            onClick={() => {
-              setBattleRetryRestartAvailable(false);
-              setBattle503RetryAttempt(0);
-              setBattleError(null);
-              socket.emit('restartBattleRetryWindow');
-            }}
-            className="inline-flex items-center rounded-full border border-amber-500 bg-amber-200 px-3 py-1 text-[10px] font-black uppercase text-amber-950 shadow-sm"
-          >
-            Retry Battle For 2m
-          </button>
-        )}
         {restartEntries.map(([key, label]) => (
           <button
             key={key}
@@ -4573,6 +4860,33 @@ Be creative and concise.`;
     </div>
   );
 
+  const renderCharWaitingState = () => {
+    if (!isWaitingForChar) return null;
+
+    if (!charModelStreamStarted) {
+      return (
+        <div className="flex justify-start px-1">
+          <div className="flex items-center gap-2 text-sm font-bold text-black">
+            <span>Waiting for model</span>
+            <TypingDots dotClassName="h-1.5 w-1.5" />
+          </div>
+        </div>
+      );
+    }
+
+    if (messages.length === 0 || messages[messages.length - 1].role === 'user' || !messages[messages.length - 1].text) {
+      return (
+        <div className="flex justify-start">
+          <div className="chat-bubble-them flex items-center gap-2">
+            <span className="font-bold text-sm">Thinking...</span>
+          </div>
+        </div>
+      );
+    }
+
+    return null;
+  };
+
   const renderCharCreation = () => (
     <div className="flex-1 flex flex-col bg-gray-50 overflow-hidden">
       <div className="p-3 bg-white border-b border-duo-gray flex justify-between items-center gap-3">
@@ -4618,14 +4932,7 @@ Be creative and concise.`;
               </div>
             );
           })}
-          {isWaitingForChar && (messages.length === 0 || messages[messages.length - 1].role === 'user' || !messages[messages.length - 1].text) && (
-            <div className="flex justify-start">
-              <div className="chat-bubble-them flex items-center gap-2">
-                <Loader2 className="w-4 h-4 animate-spin" />
-                <span className="font-bold text-sm">Thinking...</span>
-              </div>
-            </div>
-          )}
+          {renderCharWaitingState()}
           <div ref={chatEndRef} />
         </div>
         {!charAutoScroll && (
@@ -4840,14 +5147,7 @@ Be creative and concise.`;
                     </div>
                   );
                 })}
-                {isWaitingForChar && (messages.length === 0 || messages[messages.length - 1].role === 'user' || !messages[messages.length - 1].text) && (
-                  <div className="flex justify-start">
-                    <div className="chat-bubble-them flex items-center gap-2">
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                      <span className="font-bold text-sm">Rewriting your legend...</span>
-                    </div>
-                  </div>
-                )}
+                {renderCharWaitingState()}
                 <div ref={chatEndRef} />
               </div>
               {!charAutoScroll && (
@@ -5037,6 +5337,7 @@ Be creative and concise.`;
             const isThoughts = log.startsWith("> **Judge's Thoughts:**") || isStreamingThoughts;
             const isStatusLog = log.startsWith('STATUS_');
             const isToolStatus = log.startsWith('STATUS_TOOL::');
+            const isBattleRetryStatus = log.startsWith('STATUS_battle-retry::');
             const isImagePendingStatus = log.startsWith('STATUS_battle-image-pending::');
             const isImageCompleteStatus = log.startsWith('STATUS_battle-image-complete::');
             const isImageUrl = log.startsWith('STATUS_IMAGE_URL::');
@@ -5069,6 +5370,32 @@ Be creative and concise.`;
                   <div className="flex items-start gap-2">
                     <Info className="w-4 h-4 mt-0.5 flex-shrink-0" />
                     <div className="font-semibold leading-relaxed">{content}</div>
+                  </div>
+                </div>
+              );
+            }
+
+            if (isBattleRetryStatus) {
+              return (
+                <div key={i} className="flex justify-center">
+                  <div className="inline-flex max-w-full flex-wrap items-center justify-center gap-2 rounded-full border border-amber-300 bg-amber-100 px-3 py-2 text-[10px] text-amber-900 shadow-sm">
+                    <span className="font-black uppercase tracking-[0.16em]">Battle Retry</span>
+                    <span className="font-semibold normal-case">{content}</span>
+                    {battleRetryRestartAvailable && roomId && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setBattleRetryRestartAvailable(false);
+                          setBattle503RetryAttempt(0);
+                          setBattleError(null);
+                          clearBattleStatusLog('battle-retry');
+                          socket.emit('restartBattleRetryWindow');
+                        }}
+                        className="inline-flex items-center rounded-full border border-amber-500 bg-amber-200 px-2.5 py-1 font-black uppercase text-amber-950 shadow-sm"
+                      >
+                        Retry Battle For 2m
+                      </button>
+                    )}
                   </div>
                 </div>
               );
@@ -5179,11 +5506,11 @@ Be creative and concise.`;
             if (isPendingPlayerAction) {
               return (
                 <div key={i} className="flex justify-end w-full">
-                  <div className="flex items-start gap-2 w-full max-w-full flex-row-reverse">
+                  <div className="flex items-start gap-2 w-[82%] max-w-[82%] flex-row-reverse">
                     <div className="w-7 h-7 rounded-full bg-duo-green flex items-center justify-center text-white text-[10px] font-black flex-shrink-0 overflow-hidden">
                       {character?.imageUrl ? <img src={character.imageUrl} className="w-full h-full object-cover" /> : character?.name?.charAt(0).toUpperCase() || '?'}
                     </div>
-                    <div className="w-full">
+                    <div className="w-full min-w-0">
                       <span className="text-[10px] font-bold text-duo-gray-dark block text-right">Queued Action</span>
                       <div className="chat-bubble-me w-full">
                         <div className="markdown-body text-sm">
@@ -5208,13 +5535,13 @@ Be creative and concise.`;
                     const isMyAction = pName === character?.name;
                     return (
                       <div key={j} className={`flex ${isMyAction ? 'justify-end' : 'justify-start'}`}>
-                        <div className={`flex items-start gap-2 max-w-[80%] ${isMyAction ? 'flex-row-reverse' : ''}`}>
+                        <div className={`flex items-start gap-2 w-[82%] max-w-[82%] ${isMyAction ? 'flex-row-reverse' : ''}`}>
                           <div className={`w-7 h-7 rounded-full flex items-center justify-center text-white text-[10px] font-black flex-shrink-0 ${isMyAction ? 'bg-duo-green' : 'bg-duo-blue'}`}>
                             {isMyAction && character?.imageUrl ? <img src={character.imageUrl} className="w-full h-full rounded-full object-cover" /> : pName.charAt(0).toUpperCase()}
                           </div>
-                          <div>
+                          <div className="w-full min-w-0">
                             {!isMyAction && <span className="text-[10px] font-bold text-duo-gray-dark">{pName}</span>}
-                            <div className={isMyAction ? 'chat-bubble-me' : 'chat-bubble-them'}>
+                            <div className={isMyAction ? 'chat-bubble-me w-full' : 'chat-bubble-them w-full'}>
                               <div className="markdown-body text-sm">
                                 <SafeMarkdown>{pAction}</SafeMarkdown>
                               </div>
@@ -6774,12 +7101,12 @@ Be creative and concise.`;
         )}
       </div>
       {showProfileModal && profileToView && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-[100] p-4 backdrop-blur-sm">
-          <div className="bg-white rounded-3xl w-full max-w-2xl max-h-[80vh] flex flex-col shadow-2xl border-b-8 border-duo-gray overflow-hidden">
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-[100] p-4 backdrop-blur-sm" onClick={closeProfileModal}>
+          <div className="bg-white rounded-3xl w-full max-w-2xl max-h-[80vh] flex flex-col shadow-2xl border-b-8 border-duo-gray overflow-hidden" onClick={(event) => event.stopPropagation()}>
             <div className="p-4 border-b-2 border-duo-gray flex justify-between items-center bg-duo-blue text-white">
               <h3 className="text-xl font-black tracking-tight">Legend Profile</h3>
               <button 
-                onClick={() => setShowProfileModal(false)}
+                onClick={closeProfileModal}
                 className="p-2 hover:bg-white/20 rounded-full transition-colors"
               >
                 <ArrowLeft className="w-6 h-6 rotate-180" />
@@ -6792,7 +7119,7 @@ Be creative and concise.`;
             </div>
             <div className="p-4 border-t-2 border-duo-gray bg-gray-50 flex justify-end">
               <button 
-                onClick={() => setShowProfileModal(false)}
+                onClick={closeProfileModal}
                 className="duo-btn duo-btn-blue px-8 py-2"
               >
                 Close

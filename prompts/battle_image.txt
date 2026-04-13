@@ -1,0 +1,29 @@
+Generate a dynamic battle scene illustration for {{PLAYER_NAMES}}. This must be a NEW poster image for the CURRENT turn, not an edit, continuation, repaint, variation, or touch-up of any previous turn image. Create the scene from scratch for this turn only. Latest resolved battle narrative: {{RECENT_LOGS}}. Current positions: {{BATTLE_LOCATION_SUMMARY}}. Authoritative battlefield state: {{BATTLE_MAP_CONTEXT}}. Style: fantasy RPG battle poster art, dramatic action poses, magical effects, vibrant colors.
+
+This battle image must ALWAYS include cinematic UI text overlays integrated into the art:
+- A bold top headline announcing the battle beat.
+- Small location label text for at least one relevant battlefield location.
+- A bottom split result panel: {{LEFT_NAME}} on the LEFT, {{RIGHT_NAME}} on the RIGHT. Each side shows the character's name, a cool icon, the move name, and a short outcome. Match each character to their reference avatar — do NOT swap them.
+
+Fresh-scene rules:
+- Render a fresh composition from scratch every turn.
+- Do NOT reuse the previous turn's camera angle, crop, pose, lighting, background, horizon line, or character staging unless the latest narrative independently requires a similar view.
+- Do NOT behave like an image editor making small edits to an earlier frame.
+- Do NOT imitate or trace a stock poster sample, prior turn image, or any fixed scene template.
+
+Transformation rules:
+- If the latest narrative says a fighter transformed, polymorphed, mutated, or became a creature or object, render the transformed form literally.
+- In those cases, the portrait reference only preserves identity cues such as side placement, palette, or facial motifs. It must NOT force the old humanoid anatomy, armor silhouette, or body plan.
+- Never turn a named transformed creature or object into a vague blob, orb, or abstract magical mass unless the narrative explicitly says blob, ooze, slime, smoke, or pure energy.
+{{TRANSFORMATION_SUMMARY}}
+
+Spatial composition requirements:
+{{COMPOSITION_DIRECTIVE}}
+{{COMBATANT_ANCHOR_SUMMARY}}
+
+Poster layout requirements:
+{{POSTER_LAYOUT_DIRECTIVE}}
+
+Update all scene content, labels, move names, and locations to reflect THIS turn's narrative and current battlefield positions. Show each character's current equipment and weapons as described in the battle narrative — if a character just acquired a new weapon, they must be holding it.
+
+Do not invent terrain interactions that are not supported by the latest narrative or authoritative battlefield state. Do not place a combatant in water, waist-deep surf, or shoreline action unless the narrative or current map state explicitly puts them there. If one fighter is farther from the water or behind cover, keep that staging accurate instead of moving them for composition. If the fighters are on different islands, the artwork must clearly show separate islands or a split view; never collapse them onto the same patch of land.

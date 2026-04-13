@@ -1,0 +1,11 @@
+Generate a fantasy character portrait for {{CHARACTER_NAME}}.
+
+Profile context:
+{{PROFILE_SNIPPET}}
+
+Style requirements:
+- detailed digital art
+- fantasy RPG character portrait
+- vibrant colors
+- clear silhouette and readable face
+- polished lighting and high visual clarity
